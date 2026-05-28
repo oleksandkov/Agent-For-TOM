@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agent_for_TOM: Генератор навчально-методичних матеріалів</title>
+    <!-- Premium Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="glow-bg"></div>
+    <div class="app-container">
+        
+        <!-- Header -->
+        <header class="app-header">
+            <div class="brand">
+                <span class="brand-logo">🤖</span>
+                <div class="brand-text">
+                    <h1>Agent_for_TOM</h1>
+                    <p>Розумний генератор ДСТУ-документів</p>
+                </div>
+            </div>
+            <div class="header-actions">
+                <span class="mode-badge" id="mode-badge">Mock Mode (Без API-ключа)</span>
+            </div>
+        </header>
+
+        <!-- Main Body -->
+        <main class="app-main">
+            <!-- Navigation Sidebar (Steps Indicator) -->
+            <aside class="steps-sidebar">
+                <div class="step-indicator active" data-step="1">
+                    <div class="step-num">1</div>
+                    <div class="step-desc">
+                        <h3>Профіль та Ключ</h3>
+                        <p>Налаштування ВНЗ та API</p>
+                    </div>
+                </div>
+                <div class="step-indicator" data-step="2">
+                    <div class="step-num">2</div>
+                    <div class="step-desc">
+                        <h3>Параметри документа</h3>
+                        <p>Дисципліна та теми лаб</p>
+                    </div>
+                </div>
+                <div class="step-indicator" data-step="3">
+                    <div class="step-num">3</div>
+                    <div class="step-desc">
+                        <h3>Генерація</h3>
+                        <p>AI-синтез та збірка DOCX</p>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- Form Content -->
+            <section class="form-container">
+                
+                <!-- STEP 1: Profile & Key -->
+                <div class="wizard-step active" id="step-1-content">
+                    <h2 class="step-title">Налаштування профілю викладача</h2>
+                    <p class="step-subtitle">Введіть свої академічні реквізити. Вони збережуться локально для майбутніх запусків.</p>
+                    
+                    <div class="form-group-grid">
+                        <div class="form-group col-full">
+                            <label for="university">Університет (повна назва)</label>
+                            <input type="text" id="university" placeholder="Наприклад, Харківський національний університет радіоелектроніки" required>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="department">Кафедра</label>
+                            <input type="text" id="department" placeholder="Наприклад, Програмної інженерії" required>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="discipline">Навчальна дисципліна</label>
+                            <input type="text" id="discipline" placeholder="Наприклад, Алгоритми та структури даних" required>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="authors">Автори (через кому)</label>
+                            <input type="text" id="authors" placeholder="Наприклад, Іванов І.І., Петров П.П." required>
+                        </div>
+
+                        <div class="form-group-row">
+                            <div class="form-group">
+                                <label for="city">Місто</label>
+                                <input type="text" id="city" placeholder="Харків" required>
+                            </div>
+                            <div class="form-group">
+                                <label for="year">Рік видання</label>
+                                <input type="number" id="year" value="2026" required>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="divider"></div>
+
+                    <h2 class="step-title mt-4">API Ключ (Gemini)</h2>
+                    <p class="step-subtitle">Потрібен для повноцінної роботи AI. Якщо залишити порожнім, застосунок запуститься у <strong>Mock-режимі</strong> для тестування дизайну.</p>
+                    
+                    <div class="form-group">
+                        <label for="api_key">Gemini API Key</label>
+                        <input type="password" id="api_key" placeholder="AIzaSy...">
+                    </div>
+
+                    <div class="step-buttons">
+                        <div></div> <!-- spacer -->
+                        <button type="button" class="btn btn-primary" onclick="goToStep(2)">Далі ➔</button>
+                    </div>
+                </div>
+
+                <!-- STEP 2: Document Requirements -->
+                <div class="wizard-step" id="step-2-content">
+                    <h2 class="step-title">Вимоги до контенту лабораторних робіт</h2>
+                    <p class="step-subtitle">Опишіть коротко теми та вимоги до кожної лабораторної роботи. Штучний інтелект наповнить їх теоретичними даними, завданнями та питаннями.</p>
+                    
+                    <div class="form-group">
+                        <label for="persona">Стиль викладу контенту (Персона автора)</label>
+                        <div class="custom-select-wrapper">
+                            <select id="persona">
+                                <option value="formal_academic">Формальний академічний (пасивний стан, строгий тон)</option>
+                                <option value="practical_oriented" selected>Практично-орієнтований (більше прикладів та описів коду)</option>
+                                <option value="detailed_explanatory">Детальний пояснювальний (для початківців, з аналогіями)</option>
+                                <option value="concise_technical">Стислий технічний (короткі списки, мінімум опису)</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="content_requirements">Перелік тем та вимоги до лабораторних робіт</label>
+                        <textarea id="content_requirements" rows="10" placeholder="Вкажіть теми лабораторних робіт. Наприклад:&#10;Робота 1: Побудова API на FastAPI, створення перших маршрутів.&#10;Робота 2: Робота з базою даних SQLAlchemy та Pydantic валідація.&#10;Робота 3: Авторизація користувачів (JWT токени)."></textarea>
+                        <div class="textarea-tip">Підказка: ви можете скопіювати сюди робочу програму чи короткий конспект — AI сам виділить завдання та розпише теорію.</div>
+                    </div>
+
+                    <div class="step-buttons">
+                        <button type="button" class="btn btn-secondary" onclick="goToStep(1)">⬅ Назад</button>
+                        <button type="button" class="btn btn-primary" onclick="goToStep(3)">Далі ➔</button>
+                    </div>
+                </div>
+
+                <!-- STEP 3: Generation & Summary -->
+                <div class="wizard-step" id="step-3-content">
+                    <h2 class="step-title">Огляд та запуск генерації</h2>
+                    <p class="step-subtitle">Будь ласка, перевірте параметри перед запуском процесу.</p>
+                    
+                    <div class="summary-card">
+                        <div class="summary-item">
+                            <span class="label">Дисципліна:</span>
+                            <span class="value" id="sum-discipline">—</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="label">Автори:</span>
+                            <span class="value" id="sum-authors">—</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="label">Університет:</span>
+                            <span class="value" id="sum-university">—</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="label">Режим генерації:</span>
+                            <span class="value highlight" id="sum-mode">—</span>
+                        </div>
+                    </div>
+
+                    <div class="generate-zone">
+                        <button type="button" class="btn btn-generate" id="btn-generate" onclick="startGeneration()">
+                            <span class="btn-text">ЗГЕНЕРУВАТИ ДОКУМЕНТ (.DOCX)</span>
+                            <div class="spinner" id="btn-spinner"></div>
+                        </button>
+                    </div>
+
+                    <!-- Progress/Console Block -->
+                    <div class="console-box" id="console-box">
+                        <div class="console-line text-muted">Очікування запуску...</div>
+                    </div>
+
+                    <!-- Output Download Card -->
+                    <div class="download-card" id="download-card">
+                        <div class="success-icon">✓</div>
+                        <div class="download-info">
+                            <h3>Документ успішно створено!</h3>
+                            <p id="download-filename">lab_guidelines.docx</p>
+                            <span class="badge" id="download-mode-badge">Mock Mode</span>
+                        </div>
+                        <a href="#" class="btn btn-download" id="download-link" download>Завантажити файл</a>
+                    </div>
+
+                    <div class="step-buttons" id="step-3-navigation">
+                        <button type="button" class="btn btn-secondary" onclick="goToStep(2)">⬅ Назад</button>
+                        <div></div>
+                    </div>
+                </div>
+
+            </section>
+        </main>
+        
+        <!-- Footer -->
+        <footer class="app-footer-bar">
+            <p>&copy; 2026 Agent_for_TOM. Продукт розроблено відповідно до ДСТУ 3008:2015.</p>
+        </footer>
+    </div>
+
+    <!-- Toast Notifications -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <script src="app.js"></script>
+</body>
+</html>

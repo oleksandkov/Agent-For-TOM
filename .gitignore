@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# docx
+
+*.docx
+
+
+# Html
+
+.html
+
+!app/frontend/index.html
