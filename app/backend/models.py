@@ -1,31 +1,41 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Literal
+
 
 class DocumentMetadata(BaseModel):
-    university: str = Field(..., description="Назва університету")
-    department: str = Field(..., description="Назва кафедри")
-    discipline: str = Field(..., description="Назва навчальної дисципліни")
-    authors: List[str] = Field(..., description="Список авторів (ПІБ)")
-    city: str = Field(..., description="Місто")
-    year: int = Field(..., description="Рік видання")
+    university: str
+    department: str
+    discipline: str
+    authors: List[str]
+    city: str
+    year: int
+
 
 class GenerateRequest(BaseModel):
-    api_key: Optional[str] = Field(None, description="API-ключ Gemini. Якщо порожній, запускається Mock-режим.")
+    api_key: Optional[str] = Field(None)
+    ai_provider: Optional[str] = Field(None, description="'huggingface' or 'gemini' (legacy). Auto-detected from token format if None.")
+    ai_model: Optional[str] = Field(None, description="Override the default AI model id (HuggingFace only).")
+    output_format: Literal["pdf", "docx", "both"] = Field("both", description="Output file format(s).")
     metadata: DocumentMetadata
-    content_requirements: str = Field(..., description="Вимоги користувача до контенту лабораторних робіт")
-    persona: str = Field("formal_academic", description="Стиль автора")
+    content_requirements: str
+    persona: str = Field("formal_academic")
 
-# Pydantic schema for AI Output Validation
+
 class LabWork(BaseModel):
+    """Single lab work entry, aligned with the structure of LMV_LabRob.pdf sample."""
     topic: str = Field(..., description="Тема лабораторної роботи")
-    objective: str = Field(..., description="Мета роботи, 1-2 речення")
-    theory: str = Field(..., description="Короткі теоретичні відомості, 2-3 абзаци")
-    tasks: List[str] = Field(..., description="Завдання для виконання (3-5 завдань)")
-    procedure: List[str] = Field(..., description="Покроковий порядок виконання роботи")
-    questions: List[str] = Field(..., description="Контрольні запитання (4-6 питань)")
-    report_requirements: str = Field(..., description="Вимоги до звіту")
+    objective: str = Field(..., description="Мета роботи — 1-2 речення")
+    theory: str = Field(..., description="Методичні / теоретичні відомості — 2-3 розгорнуті абзаци")
+    procedure: List[str] = Field(default_factory=list, description="Хід роботи — 4-7 кроків виконання")
+    questions: List[str] = Field(default_factory=list, description="Контрольні запитання — 4-6 питань")
+    tasks: List[str] = Field(default_factory=list, description="Завдання — 4-10 конкретних завдань для виконання")
+    variants: List[str] = Field(default_factory=list, description="Варіанти — 3-10 варіантів завдань (зазвичай номери)")
+    report_sections: List[str] = Field(default_factory=list, description="Зміст звіту — перелік розділів звіту (4-8 пунктів)")
+    references: List[str] = Field(default_factory=list, description="Література — 2-5 джерел у форматі ДСТУ 8302:2015")
+
 
 class LabGuidelinesContent(BaseModel):
-    introduction: str = Field(..., description="Вступ до циклу лабораторних робіт (актуальність, цілі, 2-3 абзаци)")
-    lab_works: List[LabWork] = Field(..., description="Список лабораторних робіт")
-    references: List[str] = Field(..., description="Список рекомендованих джерел (3-5 джерел у форматі ДСТУ 8302:2015)")
+    """Full document payload produced by the AI and validated by Pydantic before rendering."""
+    introduction: Optional[str] = Field("", description="Необов'язковий вступ (одна чи більше абзаців). Пропускається, якщо порожній.")
+    lab_works: List[LabWork]
+    references: Optional[List[str]] = Field(default_factory=list, description="Необов'язковий глобальний список джерел наприкінці документа.")

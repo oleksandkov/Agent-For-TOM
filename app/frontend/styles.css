@@ -366,6 +366,48 @@ body {
     cursor: pointer;
 }
 
+.custom-select-wrapper select:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Inline label button (e.g. refresh) */
+.btn-mini {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-card);
+    border: 1px solid var(--bg-card-border);
+    color: var(--text-main);
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    font-size: 13px;
+    margin-left: 8px;
+    cursor: pointer;
+    transition: var(--transition-smooth);
+    vertical-align: middle;
+}
+.btn-mini:hover {
+    background: rgba(37, 99, 235, 0.15);
+    border-color: var(--primary);
+    transform: translateY(-1px);
+}
+.btn-mini:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+.btn-mini.spinning {
+    animation: spin 1s linear infinite;
+}
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+label .btn-mini {
+    vertical-align: middle;
+}
+
 /* Step 3 Styling */
 .summary-card {
     background-color: rgba(255, 255, 255, 0.02);
@@ -530,6 +572,79 @@ body {
 .btn-download:hover {
     background-color: #059669;
     box-shadow: 0 0 15px rgba(16, 185, 129, 0.4);
+}
+
+.download-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    align-items: flex-end;
+}
+
+.download-actions .btn {
+    min-width: 140px;
+    justify-content: center;
+}
+
+/* Inline link inside subtitle */
+.link {
+    color: #93c5fd;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+.link:hover {
+    color: #bfdbfe;
+}
+
+/* Section label for radio group */
+.section-label {
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+    display: block;
+}
+
+/* Radio pill group (output format selector) */
+.radio-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.radio-pill {
+    cursor: pointer;
+    user-select: none;
+    background-color: rgba(0, 0, 0, 0.25);
+    border: 1px solid var(--bg-card-border);
+    color: var(--text-muted);
+    padding: 10px 16px;
+    border-radius: 50px;
+    font-size: 0.9rem;
+    font-weight: 500;
+    transition: var(--transition-smooth);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.radio-pill input {
+    display: none;
+}
+
+.radio-pill:hover {
+    border-color: var(--primary);
+    color: var(--text-main);
+}
+
+.radio-pill:has(input:checked) {
+    background: linear-gradient(135deg, rgba(37, 99, 235, 0.25), rgba(99, 102, 241, 0.18));
+    border-color: var(--primary);
+    color: #fff;
+    box-shadow: 0 0 12px var(--primary-glow);
 }
 
 /* Toast Notifications */

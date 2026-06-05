@@ -1,11 +1,15 @@
 {
-  "university": "Вінницький національний технічний університет",
-  "department": "Програмного забезпечення",
-  "discipline": "Інженерія програмнго забезпечення",
+  "university": "Національний технічний університет \"ХПІ\"",
+  "department": "Програмної інженерії",
+  "discipline": "Людино-машинна взаємодія",
   "authors": [
-    "your name"
+    "Іванов І. І.",
+    "Петров П. П."
   ],
-  "city": "Вінниця",
+  "city": "Харків",
   "year": 2026,
-  "api_key": "api key"
+  "api_key": "REPLACE_WITH_HUGGINGFACE_TOKEN",
+  "output_format": "docx",
+  "ai_provider": "cerebras",
+  "ai_model": "openai/gpt-oss-120b"
 }
