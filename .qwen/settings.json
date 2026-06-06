@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Skill(qc-helper)"
-    ]
-  },
-  "$version": 4
-}
