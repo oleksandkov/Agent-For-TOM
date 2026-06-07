@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent-For-TOM — UI Concept Preview</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
+<style>
+:root {
+  --surface-base: #FAFAF9; --surface-1: #FFFFFF; --surface-2: #F4F4F2; --surface-3: #ECECE8;
+  --border-subtle: #E7E5E0; --border-strong: #D6D3CC;
+  --text-primary: #1C1917; --text-secondary: #57534E; --text-tertiary: #A8A29E;
+  --accent: #0F766E; --accent-hover: #115E59; --accent-soft: #CCFBF1; --accent-soft-2: #F0FDFA;
+  --success: #15803D; --success-soft: #DCFCE7; --warning: #B45309; --warning-soft: #FEF3C7;
+  --danger: #B91C1C; --danger-soft: #FEE2E2;
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 20px;
+  --space-6: 24px; --space-8: 32px; --space-10: 40px; --space-12: 48px;
+  --radius-sm: 4px; --radius-md: 6px; --radius-lg: 8px; --radius-xl: 12px; --radius-full: 9999px;
+  --elevation-1: 0 1px 2px rgba(0,0,0,0.04), 0 1px 3px rgba(0,0,0,0.06);
+  --elevation-2: 0 2px 4px rgba(0,0,0,0.06), 0 4px 8px rgba(0,0,0,0.08);
+  --elevation-3: 0 4px 8px rgba(0,0,0,0.08), 0 8px 24px rgba(0,0,0,0.12);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Inter', system-ui, sans-serif; font-size: 14px; line-height: 1.5; color: var(--text-primary); background: var(--surface-base); -webkit-font-smoothing: antialiased; min-height: 100vh; }
+.mono { font-family: 'JetBrains Mono', monospace; }
+
+.page { max-width: 1200px; margin: 0 auto; padding: var(--space-12) var(--space-6) var(--space-10); }
+
+.hero { text-align: center; margin-bottom: var(--space-12); }
+.brand-pill { display: inline-flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-4); background: var(--surface-1); border: 1px solid var(--border-subtle); border-radius: var(--radius-full); font-size: 12px; color: var(--text-secondary); margin-bottom: var(--space-5); box-shadow: var(--elevation-1); }
+.brand-pill .dot { width: 6px; height: 6px; border-radius: var(--radius-full); background: var(--accent); animation: pulse-dot 2s ease-in-out infinite; }
+@keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.brand-pill svg { width: 14px; height: 14px; color: var(--accent); stroke-width: 1.5; }
+.hero h1 { font-size: 48px; font-weight: 700; letter-spacing: -0.025em; line-height: 1.1; color: var(--text-primary); margin-bottom: var(--space-4); }
+.hero h1 .accent { background: linear-gradient(135deg, var(--accent), #14B8A6); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.hero p { font-size: 18px; color: var(--text-secondary); max-width: 640px; margin: 0 auto var(--space-6); line-height: 1.6; }
+.hero-meta { display: inline-flex; gap: var(--space-3); flex-wrap: wrap; justify-content: center; }
+.meta-chip { display: inline-flex; align-items: center; gap: var(--space-2); padding: var(--space-1) var(--space-3); background: var(--surface-1); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); font-size: 12px; color: var(--text-secondary); }
+.meta-chip strong { color: var(--text-primary); font-weight: 600; }
+.meta-chip svg { width: 12px; height: 12px; stroke-width: 1.75; color: var(--accent); }
+
+.section-title { display: flex; align-items: center; gap: var(--space-3); font-size: 20px; font-weight: 600; color: var(--text-primary); margin-bottom: var(--space-2); }
+.section-title .num { width: 28px; height: 28px; border-radius: var(--radius-full); background: var(--accent-soft-2); color: var(--accent); display: grid; place-items: center; font-size: 13px; font-weight: 600; }
+.section-subtitle { color: var(--text-secondary); font-size: 14px; margin-bottom: var(--space-6); }
+
+.screens-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: var(--space-5); margin-bottom: var(--space-12); }
+.screen-card { background: var(--surface-1); border: 1px solid var(--border-subtle); border-radius: var(--radius-xl); overflow: hidden; transition: all 200ms ease-out; box-shadow: var(--elevation-1); display: flex; flex-direction: column; }
+.screen-card:hover { transform: translateY(-2px); box-shadow: var(--elevation-2); border-color: var(--accent); }
+.screen-preview { background: var(--surface-2); padding: var(--space-3); aspect-ratio: 4/3; position: relative; overflow: hidden; }
+.screen-preview::before { content: ''; position: absolute; inset: 0; background-image: linear-gradient(var(--border-subtle) 1px, transparent 1px), linear-gradient(90deg, var(--border-subtle) 1px, transparent 1px); background-size: 16px 16px; opacity: 0.4; }
+.screen-frame { background: var(--surface-1); border-radius: var(--radius-md); height: 100%; position: relative; overflow: hidden; border: 1px solid var(--border-subtle); box-shadow: 0 1px 0 rgba(0,0,0,0.04); }
+.screen-mini-sidebar { position: absolute; left: 0; top: 0; bottom: 0; width: 60px; background: var(--surface-2); border-right: 1px solid var(--border-subtle); }
+.screen-mini-topbar { position: absolute; left: 60px; right: 0; top: 0; height: 16px; background: var(--surface-1); border-bottom: 1px solid var(--border-subtle); }
+.screen-mini-content { position: absolute; left: 60px; right: 0; top: 16px; bottom: 0; padding: 8px; display: flex; flex-direction: column; gap: 4px; }
+.mini-line { height: 6px; background: var(--surface-3); border-radius: 2px; }
+.mini-line.title { width: 40%; height: 10px; background: var(--text-primary); }
+.mini-line.long { width: 80%; }
+.mini-line.med { width: 60%; }
+.mini-line.short { width: 30%; }
+.mini-block { background: var(--surface-1); border: 1px solid var(--border-subtle); border-radius: 4px; padding: 6px; display: flex; flex-direction: column; gap: 3px; }
+.mini-block.accent { background: var(--accent-soft-2); border-color: var(--accent); }
+.mini-block.success { border-left: 2px solid var(--success); }
+.mini-block-row { display: flex; gap: 4px; align-items: center; }
+.mini-circle { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
+.mini-circle.success { background: var(--success); }
+.mini-circle.warn { background: var(--warning); }
+.mini-circle.danger { background: var(--danger); }
+
+.screen-body { padding: var(--space-5); }
+.screen-meta { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); }
+.screen-num { font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 600; color: var(--text-tertiary); letter-spacing: 0.04em; }
+.screen-tag { padding: 2px 6px; background: var(--surface-2); color: var(--text-secondary); font-size: 10px; font-weight: 500; border-radius: var(--radius-sm); text-transform: uppercase; letter-spacing: 0.04em; }
+.screen-title { font-size: 18px; font-weight: 600; color: var(--text-primary); margin-bottom: var(--space-2); line-height: 1.3; }
+.screen-desc { font-size: 13px; color: var(--text-secondary); line-height: 1.5; margin-bottom: var(--space-4); }
+.screen-link { display: inline-flex; align-items: center; gap: var(--space-1); color: var(--accent); font-size: 13px; font-weight: 500; text-decoration: none; }
+.screen-link:hover { color: var(--accent-hover); }
+.screen-link svg { width: 14px; height: 14px; stroke-width: 2; transition: transform 150ms ease-out; }
+.screen-card:hover .screen-link svg { transform: translateX(2px); }
+
+.design-section { background: var(--surface-1); border: 1px solid var(--border-subtle); border-radius: var(--radius-xl); padding: var(--space-8); margin-bottom: var(--space-8); }
+.palette-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: var(--space-3); margin-top: var(--space-4); }
+.color-swatch { border: 1px solid var(--border-subtle); border-radius: var(--radius-md); overflow: hidden; }
+.swatch-color { height: 80px; }
+.swatch-info { padding: var(--space-2) var(--space-3); background: var(--surface-1); }
+.swatch-name { font-size: 12px; font-weight: 500; color: var(--text-primary); }
+.swatch-hex { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-tertiary); }
+
+.typography-row { display: flex; align-items: baseline; gap: var(--space-4); padding: var(--space-3) 0; border-bottom: 1px solid var(--border-subtle); }
+.typography-row:last-child { border-bottom: none; }
+.typo-label { width: 160px; font-size: 12px; color: var(--text-tertiary); font-family: 'JetBrains Mono', monospace; flex-shrink: 0; }
+.typo-sample { flex: 1; color: var(--text-primary); }
+.typo-meta { font-size: 11px; color: var(--text-tertiary); font-family: 'JetBrains Mono', monospace; flex-shrink: 0; }
+
+.flow-section { background: linear-gradient(135deg, var(--surface-1) 0%, var(--accent-soft-2) 100%); border: 1px solid var(--border-subtle); border-radius: var(--radius-xl); padding: var(--space-8); margin-bottom: var(--space-8); }
+.flow-grid { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: var(--space-4); align-items: center; margin-top: var(--space-6); }
+.flow-step { background: var(--surface-1); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: var(--space-4); text-align: center; }
+.flow-step-num { display: inline-block; font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 600; color: var(--accent); letter-spacing: 0.04em; margin-bottom: var(--space-1); }
+.flow-step-title { font-size: 14px; font-weight: 600; color: var(--text-primary); margin-bottom: var(--space-1); }
+.flow-step-desc { font-size: 12px; color: var(--text-secondary); line-height: 1.4; }
+.flow-arrow { color: var(--text-tertiary); }
+.flow-arrow svg { width: 20px; height: 20px; stroke-width: 1.5; }
+
+.footer { text-align: center; padding: var(--space-8) 0 var(--space-6); color: var(--text-tertiary); font-size: 12px; }
+.footer a { color: var(--accent); text-decoration: none; }
+.footer a:hover { text-decoration: underline; }
+
+@media (max-width: 768px) {
+  .hero h1 { font-size: 32px; }
+  .flow-grid { grid-template-columns: 1fr; }
+  .flow-arrow { transform: rotate(90deg); margin: 0 auto; }
+  .typo-label { width: 100px; font-size: 11px; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="hero">
+    <div class="brand-pill">
+      <span class="dot"></span>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7V4h16v3"/><path d="M9 20h6"/><path d="M12 4v16"/></svg>
+      Agent-For-TOM · UI Concept v1
+    </div>
+    <h1>Візуальна концепція<br><span class="accent">AI-асистента для академічних документів</span></h1>
+    <p>Desktop-додаток, що генерує DOCX та PDF за шаблонами ДСТУ 3008:2015 українською. PyQt6 + QML, single-user, SQLite, двопрохідний AI-pipeline.</p>
+    <div class="hero-meta">
+      <div class="meta-chip">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        <strong>7</strong>&nbsp;екранів
+      </div>
+      <div class="meta-chip">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <strong>2-pass</strong>&nbsp;pipeline
+      </div>
+      <div class="meta-chip">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+        <strong>5</strong>&nbsp;input elements
+      </div>
+      <div class="meta-chip">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+        <strong>3</strong>&nbsp;cache levels
+      </div>
+    </div>
+  </div>
+
+  <section>
+    <div class="section-title">
+      <span class="num">7</span> Екрани
+    </div>
+    <p class="section-subtitle">Кожен екран реалізує окремий етап pipeline або управління шаблонами / інструкціями.</p>
+
+    <div class="screens-grid">
+      <a href="sessions.html" class="screen-card" style="text-decoration: none; color: inherit;">
+        <div class="screen-preview">
+          <div class="screen-frame">
+            <div class="screen-mini-sidebar"></div>
+            <div class="screen-mini-topbar"></div>
+            <div class="screen-mini-content">
+              <div class="mini-line title"></div>
+              <div class="mini-line short"></div>
+              <div style="display: flex; gap: 4px; margin-top: 4px;">
+                <div class="mini-block" style="flex: 1; padding: 4px;"><div class="mini-line" style="height:4px;"></div><div class="mini-line short" style="height:4px;"></div></div>
+                <div class="mini-block" style="flex: 1; padding: 4px;"><div class="mini-line" style="height:4px;"></div><div class="mini-line short" style="height:4px;"></div></div>
+                <div class="mini-block" style="flex: 1; padding: 4px;"><div class="mini-line" style="height:4px;"></div><div class="mini-line short" style="height:4px;"></div></div>
+              </div>
+              <div class="mini-block" style="flex: 1; margin-top: 4px;">
+                <div class="mini-block-row"><div class="mini-circle success"></div><div class="mini-line long" style="height:4px;"></div></div>
+                <div class="mini-block-row"><div class="mini-circle accent"></div><div class="mini-line med" style="height:4px;"></div></div>
+                <div class="mini-block-row"><div class="mini-circle warn"></div><div class="mini-line med" style="height:4px;"></div></div>
+                <div class="mini-block-row"><div class="mini-circle danger"></div><div class="mini-line long" style="height:4px;"></div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="screen-body">
+          <div class="screen-meta">
+            <span class="screen-num">01 / 07</span>
+            <span class="screen-tag">Головна</span>
+          </div>
+          <div class="screen-title">Сесії</div>
+          <div class="screen-desc">Список усіх запусків генерації, фільтри по статусу, пошук, дублювання, видалення. Точка входу для нової сесії.</div>
+          <div class="screen-link">
+            Відкрити
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          </div>
+        </div>
+      </a>
+
+      <a href="new_session.html" class="screen-card" style="text-decoration: none; color: inherit;">
+        <div class="screen-preview">
+          <div class="screen-frame">
+            <div class="screen-mini-sidebar"></div>
+            <div class="screen-mini-topbar"></div>
+            <div class="screen-mini-content">
+              <div class="mini-line title"></div>
+              <div class="mini-block" style="flex: 0 0 auto; margin-top: 4px;">
+                <div class="mini-line med" style="height:4px;"></div>
+                <div class="mini-line short" style="height:4px;"></div>
+              </div>
+              <div class="mini-block" style="flex: 0 0 auto;">
+                <div class="mini-line long" style="height:4px;"></div>
+                <div class="mini-line med" style="height:4px;"></div>
+              </div>
+              <div class="mini-block" style="flex: 0 0 auto;">
+                <div class="mini-line" style="height:4px; background: var(--accent-soft); width: 50%;"></div>
+                <div class="mini-line" style="height:4px; background: var(--accent-soft); width: 50%;"></div>
+              </div>
+              <div class="mini-block accent" style="flex: 1;">
+                <div class="mini-line" style="height:4px;"></div>
+                <div class="mini-line" style="height:4px;"></div>
+                <div class="mini-line" style="height:4px;"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="screen-body">
+          <div class="screen-meta">
+            <span class="screen-num">02 / 07</span>
+            <span class="screen-tag">Форма</span>
+          </div>
+          <div class="screen-title">Нова сесія</div>
+          <div class="screen-desc">5-крокова форма: шаблон, основні дані, параметри (length/hardness/image_mode), файли, gaps. Auto-save кожні 3с.</div>
+          <div class="screen-link">
+            Відкрити
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          </div>
+        </div>
+      </a>
+
+      <a href="progress.html" class="screen-card" style="text-decoration: none; color: inherit;">
+        <div class="screen-preview">
+          <div class="screen-frame">
+            <div class="screen-mini-sidebar"></div>
+            <div class="screen-mini-topbar"></div>
+            <div class="screen-mini-content" style="align-items: center;">
+              <div style="width: 36px; height: 36px; border-radius: 50%; background: var(--accent-soft-2); border: 2px solid var(--accent); margin-top: 12px;"></div>
+              <div class="mini-line title" style="width: 50%;"></div>
+              <div style="width: 80%; height: 4px; background: var(--surface-3); border-radius: 2px; overflow: hidden; margin-top: 4px;">
+                <div style="width: 65%; height: 100%; background: var(--accent); border-radius: 2px;"></div>
+              </div>
+              <div class="mini-block" style="width: 100%; margin-top: 4px; flex: 1;">
+                <div class="mini-block-row"><div class="mini-circle success"></div><div class="mini-line long" style="height:4px;"></div></div>
+                <div class="mini-block-row"><div class="mini-circle success"></div><div class="mini-line med" style="height:4px;"></div></div>
+                <div class="mini-block-row"><div class="mini-circle accent" style="animation: pulse-dot 1s infinite;"></div><div class="mini-line med" style="height:4px; background: var(--accent-soft);"></div></div>
+                <div class="mini-block-row"><div class="mini-circle" style="background: var(--surface-3);"></div><div class="mini-line short" style="height:4px; background: var(--surface-3);"></div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="screen-body">
+          <div class="screen-meta">
+            <span class="screen-num">03 / 07</span>
+            <span class="screen-tag">Real-time</span>
+          </div>
+          <div class="screen-title">Pipeline прогрес</div>
+          <div class="screen-desc">6 кроків pipeline з real-time статусом, live log, можливість скасування. HARD FAIL → modal з traceback.</div>
+          <div class="screen-link">
+            Відкрити
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          </div>
+        </div>
+      </a>
+
+      <a href="result.html" class="screen-card" style="text-decoration: none; color: inherit;">
+        <div class="screen-preview">
+          <div class="screen-frame">
+            <div class="screen-mini-sidebar"></div>
+            <div class="screen-mini-topbar"></div>
+            <div class="screen-mini-content">
+              <div class="mini-block success" style="flex: 0 0 auto; border-left-width: 2px;">
+                <div class="mini-block-row">
+                  <div class="mini-circle success"></div>
+                  <div class="mini-line long" style="height:4px; background: var(--success-soft);"></div>
+                </div>
+              </div>
+              <div style="display: flex; gap: 2px; margin-top: 4px;">
+                <div class="mini-line" style="height: 3px; width: 30px; background: var(--accent); border-radius: 1px;"></div>
+                <div class="mini-line" style="height: 3px; width: 30px; background: var(--surface-3); border-radius: 1px;"></div>
+                <div class="mini-line" style="height: 3px; width: 30px; background: var(--surface-3); border-radius: 1px;"></div>
+              </div>
+              <div class="mini-block" style="flex: 1; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 6px;">
+                <div class="mini-line" style="height:3px; background: var(--text-primary); width: 60%;"></div>
+                <div class="mini-line" style="height:3px; background: var(--text-secondary); width: 90%;"></div>
+                <div class="mini-line" style="height:3px; background: var(--text-secondary); width: 85%;"></div>
+                <div class="mini-line" style="height:3px; background: var(--text-secondary); width: 75%;"></div>
+                <div style="margin: 4px 0; height: 24px; background: var(--accent-soft-2); border: 1px solid var(--accent); border-radius: 2px; display: grid; place-items: center; font-size: 7px; color: var(--accent);">Рис. 1</div>
+                <div class="mini-line" style="height:3px; background: var(--text-secondary); width: 90%;"></div>
+                <div class="mini-line" style="height:3px; background: var(--text-secondary); width: 70%;"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="screen-body">
+          <div class="screen-meta">
+            <span class="screen-num">04 / 07</span>
+            <span class="screen-tag">Результат</span>
+          </div>
+          <div class="screen-title">Перегляд і завантаження</div>
+          <div class="screen-desc">DOCX preview у A4 форматі, статистика (токени, кеш, word count), перегляд filled.py з syntax highlight.</div>
+          <div class="screen-link">
+            Відкрити
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          </div>
+        </div>
+      </a>
+
+      <a href="template_creator.html" class="screen-card" style="text-decoration: none; color: inherit;">
+        <div class="screen-preview">
+          <div class="screen-frame">
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; height: 100%;">
+              <div style="background: var(--surface-2); border-right: 1px solid var(--border-subtle); padding: 6px;">
+                <div class="mini-line" style="height:4px;"></div>
+                <div class="mini-line short" style="height:3px; margin-top: 4px;"></div>
+                <div class="mini-line" style="height:3px; margin-top: 4px; background: var(--surface-3);"></div>
+                <div class="mini-line long" style="height:3px; margin-top: 2px; background: var(--surface-3);"></div>
+                <div class="mini-line med" style="height:3px; margin-top: 2px; background: var(--surface-3);"></div>
+                <div class="mini-line" style="height:3px; margin-top: 4px; background: var(--surface-3);"></div>
+              </div>
+              <div style="background: var(--accent-soft-2); border-right: 1px solid var(--border-subtle); padding: 6px;">
+                <div class="mini-line" style="height:3px; background: var(--accent);"></div>
+                <div class="mini-line" style="height:3px; margin-top: 4px; background: var(--accent-soft);"></div>
+                <div class="mini-line long" style="height:3px; margin-top: 2px; background: var(--accent-soft);"></div>
+                <div class="mini-line med" style="height:3px; margin-top: 2px; background: var(--accent-soft);"></div>
+                <div class="mini-line" style="height:3px; margin-top: 4px; background: rgba(245, 158, 11, 0.2);"></div>
+                <div class="mini-line" style="height:3px; margin-top: 2px; background: rgba(245, 158, 11, 0.2);"></div>
+                <div class="mini-line" style="height:3px; margin-top: 4px; background: rgba(34, 197, 94, 0.2);"></div>
+              </div>
+              <div style="background: var(--surface-1); padding: 6px;">
+                <div class="mini-block" style="background: rgba(139, 92, 246, 0.1); border: 1px solid rgba(139, 92, 246, 0.3); margin-bottom: 4px;">
+                  <div class="mini-line" style="height:3px; background: rgba(139, 92, 246, 0.3); width: 50%;"></div>
+                </div>
+                <div class="mini-block" style="background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.3); margin-bottom: 4px;">
+                  <div class="mini-line" style="height:3px; background: rgba(59, 130, 246, 0.3); width: 50%;"></div>
+                </div>
+                <div class="mini-block" style="background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.3); margin-bottom: 4px;">
+                  <div class="mini-line" style="height:3px; background: rgba(245, 158, 11, 0.3); width: 50%;"></div>
+                </div>
+                <div class="mini-block" style="background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.3);">
+                  <div class="mini-line" style="height:3px; background: rgba(34, 197, 94, 0.3); width: 50%;"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="screen-body">
+          <div class="screen-meta">
+            <span class="screen-num">05 / 07</span>
+            <span class="screen-tag">3-pane</span>
+          </div>
+          <div class="screen-title">Template Creator</div>
+          <div class="screen-desc">3-pane: PDF/DOCX оригінал + анотації + 4 типи інструментів. Selection popup з 4 опціями. Annotation overlay.</div>
+          <div class="screen-link">
+            Відкрити
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          </div>
+        </div>
+      </a>
+
+      <a href="instructions_editor.html" class="screen-card" style="text-decoration: none; color: inherit;">
+        <div class="screen-preview">
+          <div class="screen-frame">
+            <div style="display: grid; grid-template-columns: 1fr 1fr; height: 100%;">
+              <div style="background: var(--surface-1); border-right: 1px solid var(--border-subtle); padding: 6px; font-family: 'JetBrains Mono', monospace;">
+                <div class="mini-line" style="height:3px; background: var(--text-primary); width: 60%;"></div>
+                <div class="mini-line" style="height:3px; background: var(--text-primary); width: 80%; margin-top: 2px;"></div>
+                <div class="mini-line" style="height:3px; background: var(--text-primary); width: 50%; margin-top: 2px;"></div>
+                <div class="mini-line" style="height:3px; background: var(--text-secondary); width: 70%; margin-top: 4px;"></div>
+                <div class="mini-line" style="height:3px; background: var(--text-secondary); width: 65%; margin-top: 2px;"></div>
+                <div class="mini-line" style="height:3px; background: var(--text-primary); width: 40%; margin-top: 4px;"></div>
+                <div class="mini-line" style="height:3px; background: var(--text-secondary); width: 75%; margin-top: 2px;"></div>
+              </div>
+              <div style="background: var(--surface-base); padding: 6px;">
+                <div class="mini-line" style="height:6px; background: var(--text-primary); width: 70%; margin-bottom: 4px;"></div>
+                <div class="mini-line" style="height:3px; background: var(--text-primary); width: 80%;"></div>
+                <div class="mini-line" style="height:3px; background: var(--text-primary); width: 75%; margin-top: 2px;"></div>
+                <div class="mini-line" style="height:3px; background: var(--text-secondary); width: 60%; margin-top: 2px;"></div>
+                <div class="mini-line" style="height:3px; background: var(--text-primary); width: 50%; margin-top: 4px;"></div>
+                <div class="mini-line" style="height:3px; background: var(--text-secondary); width: 70%; margin-top: 2px;"></div>
+                <div class="mini-line" style="height:3px; background: var(--text-secondary); width: 65%; margin-top: 2px;"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="screen-body">
+          <div class="screen-meta">
+            <span class="screen-num">06 / 07</span>
+            <span class="screen-tag">Markdown</span>
+          </div>
+          <div class="screen-title">Редактор інструкцій</div>
+          <div class="screen-desc">Markdown editor + live preview, версійність (v1, v2, v3...), diff між версіями, placeholder detector.</div>
+          <div class="screen-link">
+            Відкрити
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          </div>
+        </div>
+      </a>
+
+      <a href="instructions_manager.html" class="screen-card" style="text-decoration: none; color: inherit;">
+        <div class="screen-preview">
+          <div class="screen-frame">
+            <div class="screen-mini-sidebar"></div>
+            <div class="screen-mini-topbar"></div>
+            <div class="screen-mini-content">
+              <div class="mini-line title"></div>
+              <div style="display: flex; gap: 3px; margin-top: 4px;">
+                <div class="mini-block" style="flex: 0 0 auto; padding: 3px 6px; background: var(--accent-soft-2); color: var(--accent); font-size: 8px;">Усі</div>
+                <div class="mini-block" style="flex: 0 0 auto; padding: 3px 6px; background: var(--surface-2); color: var(--text-secondary); font-size: 8px;">Глобальні</div>
+                <div class="mini-block" style="flex: 0 0 auto; padding: 3px 6px; background: var(--surface-2); color: var(--text-secondary); font-size: 8px;">Per template</div>
+              </div>
+              <div class="mini-block" style="flex: 1; margin-top: 4px;">
+                <div class="mini-block-row"><div class="mini-line" style="height:3px; width: 30%;"></div><div class="mini-line" style="height:3px; width: 20%; background: var(--accent-soft);"></div></div>
+                <div class="mini-block-row"><div class="mini-line" style="height:3px; width: 30%; margin-top: 4px;"></div><div class="mini-line" style="height:3px; width: 20%; background: var(--success-soft);"></div></div>
+                <div class="mini-block-row"><div class="mini-line" style="height:3px; width: 30%; margin-top: 4px;"></div><div class="mini-line" style="height:3px; width: 20%; background: var(--surface-3);"></div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="screen-body">
+          <div class="screen-meta">
+            <span class="screen-num">07 / 07</span>
+            <span class="screen-tag">CRUD</span>
+          </div>
+          <div class="screen-title">Управління інструкціями</div>
+          <div class="screen-desc">Список всіх instructions з фільтрами (Global/Special/User created), attach/detach до шаблонів, історія версій.</div>
+          <div class="screen-link">
+            Відкрити
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          </div>
+        </div>
+      </a>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-title">
+      <span class="num">→</span> Pipeline Flow
+    </div>
+    <p class="section-subtitle">Двопрохідна архітектура: Text LLM → Image Processing Stage. 5 вхідних елементів → валідний DOCX + PDF.</p>
+
+    <div class="flow-section">
+      <div class="flow-grid">
+        <div class="flow-step">
+          <div class="flow-step-num">STEP 0</div>
+          <div class="flow-step-title">Конвертація файлів</div>
+          <div class="flow-step-desc">PDF/DOCX → текст, дедуплікація по SHA-256, стиснення якщо &gt; 4000 токенів</div>
+        </div>
+        <div class="flow-arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg></div>
+        <div class="flow-step">
+          <div class="flow-step-num">STEP 1</div>
+          <div class="flow-step-title">Text LLM (Pass 1)</div>
+          <div class="flow-step-desc">5 input elements → filled.py. Prefix-cache для повторюваних запусків</div>
+        </div>
+        <div class="flow-arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg></div>
+        <div class="flow-step">
+          <div class="flow-step-num">STEP 2</div>
+          <div class="flow-step-title">Валідація</div>
+          <div class="flow-step-desc">ast.parse + перевірка плейсхолдерів + word count. HARD FAIL → STOP</div>
+        </div>
+        <div class="flow-arrow" style="grid-column: 2;"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg></div>
+        <div class="flow-step" style="grid-column: 1;">
+          <div class="flow-step-num">STEP 5</div>
+          <div class="flow-step-title">Compose</div>
+          <div class="flow-step-desc">Вставка PNG у DOCX/PDF, заміна anchor-маркерів</div>
+        </div>
+        <div class="flow-step" style="grid-column: 3;">
+          <div class="flow-step-num">STEP 3</div>
+          <div class="flow-step-title">Image Gen</div>
+          <div class="flow-step-desc">Matplotlib (diagram) + HuggingFace (illustration). Cache по render_spec</div>
+        </div>
+        <div class="flow-step" style="grid-column: 5;">
+          <div class="flow-step-num">STEP 4</div>
+          <div class="flow-step-title">Execute</div>
+          <div class="flow-step-desc">subprocess.run filled.py (AST-validated, sandboxed) → DOCX + PDF</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-title">
+      <span class="num">●</span> Палітра
+    </div>
+    <p class="section-subtitle">Нейтральна Stone-база + Deep Teal accent. Повна light/dark mode підтримка.</p>
+
+    <div class="design-section">
+      <div class="palette-grid">
+        <div class="color-swatch"><div class="swatch-color" style="background: #FAFAF9; border: 1px solid var(--border-subtle);"></div><div class="swatch-info"><div class="swatch-name">Surface base</div><div class="swatch-hex">#FAFAF9</div></div></div>
+        <div class="color-swatch"><div class="swatch-color" style="background: #FFFFFF;"></div><div class="swatch-info"><div class="swatch-name">Surface 1</div><div class="swatch-hex">#FFFFFF</div></div></div>
+        <div class="color-swatch"><div class="swatch-color" style="background: #F4F4F2;"></div><div class="swatch-info"><div class="swatch-name">Surface 2</div><div class="swatch-hex">#F4F4F2</div></div></div>
+        <div class="color-swatch"><div class="swatch-color" style="background: #ECECE8;"></div><div class="swatch-info"><div class="swatch-name">Surface 3</div><div class="swatch-hex">#ECECE8</div></div></div>
+        <div class="color-swatch"><div class="swatch-color" style="background: #E7E5E0;"></div><div class="swatch-info"><div class="swatch-name">Border subtle</div><div class="swatch-hex">#E7E5E0</div></div></div>
+        <div class="color-swatch"><div class="swatch-color" style="background: #1C1917;"></div><div class="swatch-info"><div class="swatch-name">Text primary</div><div class="swatch-hex">#1C1917</div></div></div>
+        <div class="color-swatch"><div class="swatch-color" style="background: #57534E;"></div><div class="swatch-info"><div class="swatch-name">Text secondary</div><div class="swatch-hex">#57534E</div></div></div>
+        <div class="color-swatch"><div class="swatch-color" style="background: #0F766E;"></div><div class="swatch-info"><div class="swatch-name">Accent (Teal 700)</div><div class="swatch-hex">#0F766E</div></div></div>
+        <div class="color-swatch"><div class="swatch-color" style="background: #CCFBF1;"></div><div class="swatch-info"><div class="swatch-name">Accent soft</div><div class="swatch-hex">#CCFBF1</div></div></div>
+        <div class="color-swatch"><div class="swatch-color" style="background: #15803D;"></div><div class="swatch-info"><div class="swatch-name">Success</div><div class="swatch-hex">#15803D</div></div></div>
+        <div class="color-swatch"><div class="swatch-color" style="background: #B45309;"></div><div class="swatch-info"><div class="swatch-name">Warning</div><div class="swatch-hex">#B45309</div></div></div>
+        <div class="color-swatch"><div class="swatch-color" style="background: #B91C1C;"></div><div class="swatch-info"><div class="swatch-name">Danger</div><div class="swatch-hex">#B91C1C</div></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-title">
+      <span class="num">T</span> Типографіка
+    </div>
+    <p class="section-subtitle">Inter для UI (Cyrillic), JetBrains Mono для коду та числових даних.</p>
+
+    <div class="design-section">
+      <div class="typography-row">
+        <div class="typo-label">display-md / 24/32 600</div>
+        <div class="typo-sample" style="font-size: 24px; font-weight: 600; line-height: 1.33;">Сесії</div>
+        <div class="typo-meta">Screen titles</div>
+      </div>
+      <div class="typography-row">
+        <div class="typo-label">title-lg / 20/28 600</div>
+        <div class="typo-sample" style="font-size: 20px; font-weight: 600; line-height: 1.4;">Лабораторна №1 — сортування</div>
+        <div class="typo-meta">Card titles</div>
+      </div>
+      <div class="typography-row">
+        <div class="typo-label">body-lg / 16/24 400</div>
+        <div class="typo-sample" style="font-size: 16px; line-height: 1.5;">AI згенерує документ за шаблоном. Заповніть поля нижче.</div>
+        <div class="typo-meta">Default body</div>
+      </div>
+      <div class="typography-row">
+        <div class="typo-label">body-md / 14/20 400</div>
+        <div class="typo-sample" style="font-size: 14px;">Міністерство освіти і науки України</div>
+        <div class="typo-meta">UI chrome</div>
+      </div>
+      <div class="typography-row">
+        <div class="typo-label">label-md / 13/16 500</div>
+        <div class="typo-sample" style="font-size: 13px; font-weight: 500;">ЗГЕНЕРУВАТИ</div>
+        <div class="typo-meta">Buttons</div>
+      </div>
+      <div class="typography-row">
+        <div class="typo-label">code-md / 13/20 mono</div>
+        <div class="typo-sample mono" style="font-size: 13px;">doc.add_paragraph("Текст розділу {{SECTION_1}}")</div>
+        <div class="typo-meta">Code preview</div>
+      </div>
+      <div class="typography-row">
+        <div class="typo-label">mono tabular</div>
+        <div class="typo-sample mono" style="font-size: 14px; font-variant-numeric: tabular-nums;">4 821 · 2 103 · 3 200 (67%)</div>
+        <div class="typo-meta">Numbers</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="footer">
+    Повний концепт-дизайн: <a href="../app_concept.md">Combined/app_concept.md</a> · 17 секцій
+  </div>
+</div>
+
+<script>
+// Stagger animation on entry
+gsap.from('.brand-pill', { y: -10, opacity: 0, duration: 0.5, ease: 'power2.out' });
+gsap.from('.hero h1', { y: 20, opacity: 0, duration: 0.7, ease: 'power2.out', delay: 0.1 });
+gsap.from('.hero p', { y: 10, opacity: 0, duration: 0.6, ease: 'power2.out', delay: 0.3 });
+gsap.from('.hero-meta > *', { y: 8, opacity: 0, duration: 0.4, stagger: 0.06, ease: 'power2.out', delay: 0.5 });
+
+gsap.from('.section-title', { x: -10, opacity: 0, duration: 0.5, ease: 'power2.out', scrollTrigger: { trigger: '.section-title', start: 'top 85%' } });
+gsap.from('.screen-card', { y: 30, opacity: 0, duration: 0.5, stagger: 0.08, ease: 'power2.out', scrollTrigger: { trigger: '.screens-grid', start: 'top 80%' } });
+gsap.from('.flow-step', { y: 20, opacity: 0, duration: 0.4, stagger: 0.06, ease: 'power2.out', scrollTrigger: { trigger: '.flow-grid', start: 'top 80%' } });
+gsap.from('.color-swatch', { y: 12, opacity: 0, duration: 0.3, stagger: 0.03, ease: 'power2.out', scrollTrigger: { trigger: '.palette-grid', start: 'top 85%' } });
+
+// Parallax on hero brand
+window.addEventListener('scroll', () => {
+  const scrolled = window.scrollY;
+  const brand = document.querySelector('.brand-pill');
+  if (brand && scrolled < 400) {
+    brand.style.transform = `translateY(${scrolled * 0.2}px)`;
+  }
+});
+</script>
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/ScrollTrigger.min.js"></script>
+</body>
+</html>
