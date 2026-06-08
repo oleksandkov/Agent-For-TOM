@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/ScrollTrigger.min.js"></script>
 <style>
 :root {
   --surface-base: #FAFAF9; --surface-1: #FFFFFF; --surface-2: #F4F4F2; --surface-3: #ECECE8;
@@ -559,10 +560,19 @@ gsap.from('.hero h1', { y: 20, opacity: 0, duration: 0.7, ease: 'power2.out', de
 gsap.from('.hero p', { y: 10, opacity: 0, duration: 0.6, ease: 'power2.out', delay: 0.3 });
 gsap.from('.hero-meta > *', { y: 8, opacity: 0, duration: 0.4, stagger: 0.06, ease: 'power2.out', delay: 0.5 });
 
-gsap.from('.section-title', { x: -10, opacity: 0, duration: 0.5, ease: 'power2.out', scrollTrigger: { trigger: '.section-title', start: 'top 85%' } });
-gsap.from('.screen-card', { y: 30, opacity: 0, duration: 0.5, stagger: 0.08, ease: 'power2.out', scrollTrigger: { trigger: '.screens-grid', start: 'top 80%' } });
-gsap.from('.flow-step', { y: 20, opacity: 0, duration: 0.4, stagger: 0.06, ease: 'power2.out', scrollTrigger: { trigger: '.flow-grid', start: 'top 80%' } });
-gsap.from('.color-swatch', { y: 12, opacity: 0, duration: 0.3, stagger: 0.03, ease: 'power2.out', scrollTrigger: { trigger: '.palette-grid', start: 'top 85%' } });
+gsap.fromTo('.section-title', { x: -10, opacity: 0 }, { x: 0, opacity: 1, duration: 0.5, ease: 'power2.out', scrollTrigger: { trigger: '.section-title', start: 'top 85%' } });
+gsap.fromTo('.screen-card', { y: 30, opacity: 0 }, { y: 0, opacity: 1, duration: 0.5, stagger: 0.08, ease: 'power2.out', scrollTrigger: { trigger: '.screens-grid', start: 'top 80%' } });
+gsap.fromTo('.flow-step', { y: 20, opacity: 0 }, { y: 0, opacity: 1, duration: 0.4, stagger: 0.06, ease: 'power2.out', scrollTrigger: { trigger: '.flow-grid', start: 'top 80%' } });
+gsap.fromTo('.color-swatch', { y: 12, opacity: 0 }, { y: 0, opacity: 1, duration: 0.3, stagger: 0.03, ease: 'power2.out', scrollTrigger: { trigger: '.palette-grid', start: 'top 85%' } });
+
+// Failsafe: if ScrollTrigger never fires for any animated selector, reveal them after 1.2s
+setTimeout(() => {
+  document.querySelectorAll('.screen-card, .flow-step, .color-swatch, .section-title').forEach(c => {
+    if (parseFloat(getComputedStyle(c).opacity) < 0.5) {
+      gsap.to(c, { y: 0, x: 0, opacity: 1, duration: 0.4, ease: 'power2.out', overwrite: true });
+    }
+  });
+}, 1200);
 
 // Parallax on hero brand
 window.addEventListener('scroll', () => {
@@ -573,6 +583,5 @@ window.addEventListener('scroll', () => {
   }
 });
 </script>
-<script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/ScrollTrigger.min.js"></script>
 </body>
 </html>
