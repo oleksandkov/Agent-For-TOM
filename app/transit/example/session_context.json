@@ -1,0 +1,33 @@
+{
+  "id": "550e8400-e29b-41d4-a716-446655440001",
+  "name": "Лаба 1 — алгоритми сортування",
+  "template_id": "lab1",
+  "status": "draft",
+  "input_snapshot": {
+    "template_id": "lab1",
+    "name": "Лаба 1 — алгоритми сортування",
+    "theme": "Алгоритми сортування: аналіз ефективності",
+    "goal": "Дослідити та порівняти ефективність алгоритмів сортування різними методами.",
+    "length": "middle",
+    "hardness": "university_1",
+    "image_mode": "none",
+    "include_special_instructions": true,
+    "include_user_style": false,
+    "user_input": "Створити лабораторну роботу з алгоритмів сортування. Використовуйте теоретичний матеріал з прикладеного файлу LMV_LabRob.pdf як джерело.",
+    "attached_files": [
+      "7759902650cd7be2050feb61986a6f167f32e69aa8ce102c184f794f1c000dd9"
+    ],
+    "global_instructions_hash": "389b40c8b814dc417023bd61689a88c1e2c00ac35a1b932457adae46a439fc03",
+    "style_hash": "f01a374e9c81e3db89b3a42940c4d6a5447684986a1296e42bf13f196eed6295",
+    "gap_values_ref": "lab1_params.json"
+  },
+  "file_refs": {
+    "global_instructions": "general_instructions.md",
+    "template_instructions": "lab1_fill.md",
+    "template_params": "lab1_params.json",
+    "context": "context.json",
+    "library_files": "library_files.json",
+    "attached": "attached/"
+  },
+  "created_at": "2026-06-12T16:38:19.259066+00:00"
+}

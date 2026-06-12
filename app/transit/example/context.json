@@ -1,0 +1,16 @@
+{
+  "files": [
+    {
+      "file_hash": "7759902650cd7be2050feb61986a6f167f32e69aa8ce102c184f794f1c000dd9",
+      "original_name": "LMV_LabRob.pdf",
+      "original_type": "application/pdf",
+      "original_sha256": "b2e376b1c2921727f7d34c37762205ffb1e176e3ebd12a4e5d40e2852c9c2062",
+      "converted_text_path": "attached/7759902650cd7be2050feb61986a6f167f32e69aa8ce102c184f794f1c000dd9.txt",
+      "token_count": 16200,
+      "was_summarized": false
+    }
+  ],
+  "merged_text_preview": "===== Page 1 =====\nЛАБОРАТОРНА РОБОТА № 1\nЗ курсу Алгоритми та структури даних\nТема: Алгоритми сортування: аналіз ефективності\n...",
+  "total_tokens": 16200,
+  "cache_key": "7759902650cd7be2050feb61986a6f167f32e69aa8ce102c184f794f1c000dd9"
+}
