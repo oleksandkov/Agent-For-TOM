@@ -234,3 +234,5 @@ __marimo__/
 
 *none ai/*
 .qwen/
+.env.example
+*/backendPlan/*
