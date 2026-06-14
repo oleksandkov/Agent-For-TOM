@@ -69,7 +69,13 @@ In priority order (later overrides earlier):
 
 ### 2-pass pipeline
 
-- **Pass 1 — Text LLM.** Reads the 5 input elements, fills every `[Вставте ...]` placeholder in the template's Python scaffold, and (if `image_mode=full`) appends an `image_manifest.json` block separated by `<!--IMAGE_MANIFEST-->`.
+- **Pass 1 — Text LLM.** Tries the 5-tier synthesis chain: (1) Google
+  Gemini 2.5 Flash, (2) OpenRouter (free model), (3) Groq, (4) local
+  Qwen 2.5 1.5B GGUF, (5) pass-through of the user's typed values.
+  Within Tier 1, the order is set by `REMOTE_LLM_PROVIDER` in `.env`
+  (default: `gemini,openrouter,groq`). The first provider that
+  returns JSON matching the schema wins; missing API keys are
+  skipped, not failed.
 - **Pass 2 — Image & document stage.** Deterministic code: AST-validates the Python, runs it in a sandboxed subprocess to produce DOCX + PDF, then generates PNGs for every `[[ANCHOR:...]]` and embeds them at the matching marker. Failed image generation becomes a placeholder, never breaks the run.
 
 ### Image modes

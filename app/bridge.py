@@ -3,15 +3,33 @@ AppBridge — QObject that exposes Python slots and signals to QML.
 Handles: session listing, template listing, navigation, mock generation.
 """
 import json
+import os
+import shutil
+import sys
+import threading
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 # pyrefly: ignore [missing-import]
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, pyqtProperty, QTimer, QUrl
 # pyrefly: ignore [missing-import]
 from PyQt6.QtWidgets import QFileDialog
-import os
-import shutil
+
+# Make sure `app.backend.*` is importable when the bridge is loaded
+# outside the normal `python main.py` launcher (e.g. by tests).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from app.backend.pipeline import (  # noqa: E402
+    TRANSIT_DIR,
+    get_hf_token,
+    load_env,
+)
+from app.backend.pipeline.bridge_adapter import (  # noqa: E402
+    BridgePipelineAdapter,
+)
 
 
 # ─── Mock data ───────────────────────────────────────────────────────────────
@@ -135,6 +153,10 @@ class AppBridge(QObject):
         self._is_sidebar_collapsed = False
         self._is_big_font = False
         self._session_payload_json = "{}"
+        # Real pipeline state (replaces the previous mock timer).
+        self._active_session_id: str | None = None
+        self._pipeline_adapter: "BridgePipelineAdapter | None" = None
+        self._pipeline_thread = None
         self._load_preferences()
         self._load_user_input()
 
@@ -499,38 +521,326 @@ class AppBridge(QObject):
         self.filesUpdated.emit(json.dumps(self._uploaded_files, ensure_ascii=False))
 
     # ─── Pipeline simulation ──────────────────────────────────────────────────
+    #
+    # NOTE: The previous block (mock _PIPELINE_STEPS, _LOG_MESSAGES,
+    # _run_step, _complete_step) has been replaced by a real
+    # implementation that delegates to `app.backend.pipeline.orchestrator`.
+    # The 6-step QML contract is preserved by emitting synthetic
+    # `pipelineStepDone` signals for steps 0..5 inside BridgePipelineAdapter.
 
-    _PIPELINE_STEPS = [
-        (0,  16, "Конвертація файлів",    "2 файли, хешування, кешування"),
-        (16, 33, "Text LLM (Pass 1)",     "5 вхідних елементів → filled.py"),
-        (33, 50, "Валідація",             "ast.parse + плейсхолдери + word count"),
-        (50, 75, "Генерація зображень",   "Matplotlib + HuggingFace FLUX"),
-        (75, 90, "Виконання + Compose",   "subprocess filled.py → DOCX + PNG"),
-        (90, 100, "PDF компіляція",       "DOCX → PDF через reportlab"),
-    ]
+    # ─── Pipeline helpers ─────────────────────────────────────────────────────
 
-    _LOG_MESSAGES = [
-        (0,  "[convert] Перевірка хешів файлів…"),
-        (1,  "[convert] Сортування_методичка.pdf → 2 314 tokens"),
-        (2,  "[convert] lecture_sorting.pptx → 2 507 tokens"),
-        (3,  "[llm] Збірка контексту: global + special + user files"),
-        (4,  "[llm] POST /v1/chat/completions — input=4821"),
-        (5,  "[cache] Hit: 3 200 tokens (67% prefix match)"),
-        (6,  "[llm] output=2103 tokens, 12 плейсхолдерів заповнено"),
-        (7,  "[validate] ast.parse(filled.py) → OK"),
-        (8,  "[validate] ManifestValidator: 2 refs ✓"),
-        (9,  "[validate] Word count: 1 923 (target 1700–2500) ✓"),
-        (10, "[image] Generating fig1 (matplotlib, bubble sort diagram)"),
-        (11, "[image] fig1.png saved (24 KB)"),
-        (12, "[image] Generating fig2 (huggingface, quicksort schema)"),
-        (13, "[image] fig2.png saved (187 KB)"),
-        (14, "[execute] AST validation OK — no forbidden calls"),
-        (15, "[execute] subprocess.run(filled.py) → exit 0"),
-        (16, "[compose] Inserting fig1.png @ anchor [[IMAGE|diagram|…]]"),
-        (17, "[compose] Inserting fig2.png @ anchor [[IMAGE|schema|…]]"),
-        (18, "[pdf] reportlab → output.pdf (18 pages)"),
-        (19, "[done] Session completed successfully ✓"),
-    ]
+    def _build_pipeline_payload(
+        self,
+        session_name: str,
+        template_id: str,
+        length: str,
+        hardness: str,
+        image_mode: str,
+        goal: str,
+    ) -> dict:
+        """Merge the per-generation args with the cached `sessionPayloadJson`.
+
+        Returns a single dict ready to be written as
+        ``session_context.json`` inside a transit snapshot.
+        """
+        # Pull the cached UI payload (set via the `sessionPayloadJson` property).
+        cached: dict = {}
+        try:
+            if self._session_payload_json:
+                cached = json.loads(self._session_payload_json)
+        except (ValueError, TypeError):
+            cached = {}
+
+        # Map QML hardness values to internal canonical values.
+        hardness_map = {
+            "school": "school",
+            "bachelor": "bachelor",
+            "university_1": "university_1",
+            "university_2": "university_2",
+            "master": "master",
+        }
+        canonical_hardness = hardness_map.get(hardness, hardness or "university_1")
+
+        length_map = {
+            "short": "short",
+            "middle": "middle",
+            "long": "long",
+        }
+        canonical_length = length_map.get(length, length or "middle")
+
+        image_mode_map = {
+            "none": "none",
+            "references": "references",
+            "full": "full",
+        }
+        canonical_image_mode = image_mode_map.get(image_mode, image_mode or "none")
+
+        return {
+            "template_id": template_id or cached.get("template_id") or "lab1",
+            "name": session_name or cached.get("name") or "Нова сесія",
+            "theme": cached.get("theme") or session_name or "",
+            "goal": goal or cached.get("goal") or "",
+            "length": canonical_length,
+            "hardness": canonical_hardness,
+            "image_mode": canonical_image_mode,
+            "include_special_instructions": bool(
+                cached.get("include_special_instructions", True)
+            ),
+            "include_user_style": bool(cached.get("include_user_style", False)),
+            "user_input": cached.get("user_input") or "",
+            "uploaded_files": cached.get("uploadedFiles") or cached.get("uploaded_files") or [],
+            "gap_values": cached.get("gap_values") or {},
+        }
+
+    def _materialize_transit_snapshot(
+        self,
+        session_id: str,
+        payload: dict,
+    ) -> Path:
+        """Write a complete transit snapshot for the orchestrator to read.
+
+        Layout (under ``app/debug/transit/<session_id>/``):
+          - session_context.json
+          - general_instructions.md   (copied from app/instructions/)
+          - <template>_fill.md        (copied from app/instructions/template-ins/)
+          - <template>_params.json    (built from payload.gap_values)
+          - library_files.json        (one entry per uploaded file)
+          - context.json              (one entry per uploaded file)
+          - attached/<hash>.txt       (copied/moved from app/transit/)
+        """
+        # Resolve directories.
+        snap_dir = TRANSIT_DIR / session_id
+        attached_dir = snap_dir / "attached"
+        app_instructions_dir = Path(__file__).resolve().parent / "instructions"
+        app_template_ins_dir = app_instructions_dir / "template-ins"
+        app_transit_dir = Path(__file__).resolve().parent / "transit"
+        # Use a stable, relative path the rest of the app understands.
+        try:
+            from app.backend.pipeline.utils import REPO_ROOT  # noqa: WPS433
+        except Exception:
+            REPO_ROOT = Path(__file__).resolve().parent.parent
+
+        template_id = payload.get("template_id") or "lab1"
+        attached_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1) session_context.json
+        snapshot = dict(payload)
+        snapshot["created_at"] = datetime.utcnow().isoformat() + "+00:00"
+        snapshot["id"] = session_id
+        snapshot["status"] = "processing"
+        file_refs = {
+            "global_instructions": "general_instructions.md",
+            "template_instructions": f"{template_id}_fill.md",
+            "template_params": f"{template_id}_params.json",
+            "context": "context.json",
+            "library_files": "library_files.json",
+            "attached": "attached/",
+        }
+        # Build the gap_values_ref so stage1 picks up our params.
+        snapshot["gap_values_ref"] = f"{template_id}_params.json"
+        snapshot["global_instructions_hash"] = ""
+        snapshot["style_hash"] = ""
+        snapshot["attached_files"] = []  # populated below
+        session_ctx = {
+            "id": session_id,
+            "name": payload.get("name") or "Нова сесія",
+            "template_id": template_id,
+            "status": "processing",
+            "input_snapshot": snapshot,
+            "file_refs": file_refs,
+            "created_at": snapshot["created_at"],
+        }
+        (snap_dir / "session_context.json").write_text(
+            json.dumps(session_ctx, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        # 2) general_instructions.md
+        src_g = app_instructions_dir / "global_instructions.md"
+        if src_g.is_file():
+            shutil.copy2(src_g, snap_dir / "general_instructions.md")
+
+        # 3) template instructions
+        src_ti = app_template_ins_dir / f"{template_id}_fill.md"
+        if not src_ti.is_file():
+            # Fall back to lab1_fill.md if the requested template file is missing.
+            src_ti = app_template_ins_dir / "lab1_fill.md"
+        if src_ti.is_file():
+            shutil.copy2(src_ti, snap_dir / f"{template_id}_fill.md")
+
+        # 4) template params (gap_values, schema-aware)
+        gap_values = payload.get("gap_values") or self._fallback_gap_values(payload)
+        params_doc = {"gap_values": gap_values}
+        (snap_dir / f"{template_id}_params.json").write_text(
+            json.dumps(params_doc, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        # 5) user_style.md (optional)
+        if payload.get("include_user_style"):
+            us = app_instructions_dir / "user_style.md"
+            if us.is_file() and us.read_text(encoding="utf-8").strip():
+                shutil.copy2(us, snap_dir / "user_style.md")
+
+        # 6) uploaded files: move/copy from app/transit/ into attached/
+        uploaded = payload.get("uploaded_files") or []
+        library_files: list[dict] = []
+        context_files: list[dict] = []
+        attached_hashes: list[str] = []
+        for f_info in uploaded:
+            if not isinstance(f_info, dict):
+                continue
+            if f_info.get("status") not in (None, "done"):
+                continue
+            fname = f_info.get("name")
+            if not fname:
+                continue
+            src = app_transit_dir / fname
+            if not src.is_file():
+                # Try with the file_hash as the stored name.
+                fh = f_info.get("file_hash") or fname
+                src = app_transit_dir / fh
+            if not src.is_file():
+                continue
+            file_hash = f_info.get("file_hash") or self._hash_file(src)
+            dest = attached_dir / f"{file_hash}.txt"
+            try:
+                if dest.resolve() != src.resolve():
+                    shutil.copy2(src, dest)
+            except OSError as exc:
+                print(f"[bridge] could not copy attached file {fname}: {exc}")
+                continue
+            attached_hashes.append(file_hash)
+            original_type = f_info.get("type") or "text/plain"
+            library_files.append({
+                "id": f_info.get("id") or str(uuid.uuid4()),
+                "original_name": fname,
+                "original_type": original_type,
+                "file_hash": file_hash,
+                "original_sha256": file_hash,
+                "stored_path": str(
+                    (REPO_ROOT / "storage" / "library" / file_hash[:2] / f"{file_hash}.txt")
+                ).replace("\\", "/"),
+                "converted_text_path": f"attached/{file_hash}.txt",
+                "conversion_status": "done",
+                "file_size_bytes": src.stat().st_size if src.exists() else 0,
+                "converted_at": datetime.utcnow().isoformat() + "+00:00",
+                "created_at": datetime.utcnow().isoformat() + "+00:00",
+                "last_used_at": datetime.utcnow().isoformat() + "+00:00",
+            })
+            context_files.append({
+                "file_hash": file_hash,
+                "original_name": fname,
+                "original_type": original_type,
+                "original_sha256": file_hash,
+                "converted_text_path": f"attached/{file_hash}.txt",
+                "token_count": 0,
+                "was_summarized": False,
+            })
+        # Update snapshot with attached_files list now that we have it.
+        session_ctx["input_snapshot"]["attached_files"] = attached_hashes
+        (snap_dir / "session_context.json").write_text(
+            json.dumps(session_ctx, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        # 7) library_files.json + context.json
+        (snap_dir / "library_files.json").write_text(
+            json.dumps({"files": library_files}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (snap_dir / "context.json").write_text(
+            json.dumps(
+                {
+                    "files": context_files,
+                    "merged_text_preview": "",
+                    "total_tokens": 0,
+                    "cache_key": "",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return snap_dir
+
+    @staticmethod
+    def _hash_file(path: Path) -> str:
+        import hashlib
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    h.update(chunk)
+        except OSError:
+            pass
+        return h.hexdigest()
+
+    @staticmethod
+    def _fallback_gap_values(payload: dict) -> dict:
+        """Build a schema-aware `gap_values` block when the UI didn't provide one.
+
+        Mirrors the keys in ``app/instructions/template-ins/lab1_fill.md``
+        so that the gap_assembler can produce a real filled.py.
+        """
+        name = payload.get("name") or "Нова лабораторна робота"
+        theme = payload.get("theme") or name
+        goal = payload.get("goal") or "дослідити та проаналізувати поставлену задачу."
+        user_input = payload.get("user_input") or ""
+        return {
+            "lab_number": {"value": "1", "ai_accessible": False},
+            "work_title": {"value": theme, "ai_accessible": True},
+            "goal": {"value": goal, "ai_accessible": True},
+            "general_info": {
+                "value": user_input or f"{theme} — базові теоретичні відомості.",
+                "ai_accessible": True,
+            },
+            "tasks": {
+                "value": [
+                    "Реалізувати алгоритми відповідно до мети роботи.",
+                    "Продемонструвати їх роботу на тестових даних.",
+                    "Зробити висновки щодо отриманих результатів.",
+                ],
+                "ai_accessible": True,
+            },
+            "control_questions": {
+                "value": [
+                    "У чому полягає мета роботи?",
+                    "Які основні кроки виконаних алгоритмів?",
+                ],
+                "ai_accessible": True,
+            },
+            "bibliography": {
+                "value": [
+                    "Кнут, Д. Е. Мистецтво програмування. Т. 3 : Сортування і пошук. Київ : Вільямс, 2020. 824 с.",
+                ],
+                "ai_accessible": True,
+            },
+        }
+
+    def _update_session_from_run(self, run_dict: dict) -> None:
+        """Push the orchestrator's result back into ``self._sessions``."""
+        if not self._active_session_id:
+            return
+        index = run_dict.get("index") or {}
+        status = index.get("status") or "completed"
+        # Map orchestrator status to UI status vocabulary.
+        ui_status = {
+            "completed": "completed",
+            "failed": "failed",
+            "cancelled": "cancelled",
+        }.get(status, "completed")
+        duration_ms = index.get("duration_ms") or 0
+        duration_s = max(0.0, duration_ms / 1000.0)
+        for s in self._sessions:
+            if s["id"] == self._active_session_id:
+                s["status"] = ui_status
+                s["duration"] = f"{duration_s:.1f}s" if duration_s else "—"
+                s["docx_path"] = index.get("artifacts", {}).get("docx")
+                s["pdf_path"] = index.get("artifacts", {}).get("pdf")
+                break
+        self.sessionsChanged.emit()
 
     @pyqtSlot(str, str)
     def saveSessionJson(self, payload_str, file_name):
@@ -580,8 +890,21 @@ class AppBridge(QObject):
 
     @pyqtSlot(str, str, str, str, str, str)
     def startGeneration(self, session_name, template_id, length, hardness, image_mode, goal):
-        """Start a mock pipeline generation."""
-        # Create a new session in processing state
+        """Start a REAL pipeline generation.
+
+        Workflow:
+          1. Allocate a session id.
+          2. Build a transit payload from the cached sessionPayloadJson +
+             this call's per-generation arguments.
+          3. Materialize a transit snapshot under app/debug/transit/<id>/
+             (session_context.json, general_instructions.md,
+             <template>_fill.md, <template>_params.json, library_files.json,
+             context.json, attached/<hash>.txt).
+          4. Spawn a daemon thread that runs PipelineRunner (stages 1, 2, 5).
+          5. The thread emits QML-compatible pipeline signals via
+             BridgePipelineAdapter.
+        """
+        # 1. New session in processing state.
         new_id = str(uuid.uuid4())[:8]
         new_session = {
             "id": new_id,
@@ -594,59 +917,58 @@ class AppBridge(QObject):
         }
         self._sessions.insert(0, new_session)
         self.sessionsChanged.emit()
-
         self._active_session_id = new_id
-        self._pipeline_step = 0
-        self._pipeline_log_index = 0
-        self.pipelineStarted.emit()
 
-        # Start the step-by-step simulation
-        self._run_step(0)
+        # 2. Payload.
+        payload = self._build_pipeline_payload(
+            session_name, template_id, length, hardness, image_mode, goal
+        )
 
-    def _run_step(self, step_index: int):
-        if step_index >= len(self._PIPELINE_STEPS):
-            # Done!
+        # 3. Snapshot.
+        try:
+            snap_dir = self._materialize_transit_snapshot(new_id, payload)
+        except Exception as exc:  # noqa: BLE001
+            self.pipelineError.emit("stage1", f"snapshot failed: {exc}")
             for s in self._sessions:
-                if s["id"] == self._active_session_id:
-                    s["status"] = "completed"
-                    s["duration"] = "16.4s"
+                if s["id"] == new_id:
+                    s["status"] = "failed"
                     break
             self.sessionsChanged.emit()
-            self.pipelineProgress.emit(100, "Готово")
-            self.pipelineFinished.emit(self._active_session_id)
             return
 
-        idx, pct_start, pct_end, name, detail = (
-            step_index,
-            *self._PIPELINE_STEPS[step_index]
+        # 4. Background thread + adapter.
+        self._pipeline_adapter = BridgePipelineAdapter(self)
+        self._pipeline_thread = threading.Thread(
+            target=self._run_pipeline_blocking,
+            args=(self._pipeline_adapter, snap_dir, new_id),
+            daemon=True,
         )
-        self.pipelineStepActive.emit(step_index)
-        self.pipelineProgress.emit(pct_start, name)
+        self._pipeline_thread.start()
 
-        # Emit some log lines during this step
-        for log_i, (log_step, log_msg) in enumerate(self._LOG_MESSAGES):
-            if log_step == step_index * 3 // 1 or log_step == step_index * 3 + 1:
-                ts = datetime.now().strftime("%H:%M:%S")
-                QTimer.singleShot(
-                    log_i * 60,
-                    lambda msg=log_msg, t=ts: self.pipelineLog.emit(t, msg)
-                )
-
-        # Schedule step completion
-        QTimer.singleShot(
-            1800,
-            lambda si=step_index, n=name, d=detail, pe=pct_end: self._complete_step(si, n, d, pe)
-        )
-
-    def _complete_step(self, step_index, name, detail, pct_end):
-        self.pipelineStepDone.emit(step_index, name, detail)
-        self.pipelineProgress.emit(pct_end, name)
-        # Move to next step
-        QTimer.singleShot(300, lambda: self._run_step(step_index + 1))
+    def _run_pipeline_blocking(
+        self,
+        adapter: "BridgePipelineAdapter",
+        snap_dir: Path,
+        session_id: str,
+    ) -> None:
+        """Thread entry point: run adapter, then push result into _sessions."""
+        try:
+            result = adapter.run(snap_dir)
+            self._update_session_from_run(result)
+        except Exception as exc:  # noqa: BLE001
+            self.pipelineError.emit("orchestrator", f"{type(exc).__name__}: {exc}")
+            for s in self._sessions:
+                if s["id"] == session_id:
+                    s["status"] = "failed"
+                    break
+            self.sessionsChanged.emit()
 
     @pyqtSlot()
     def cancelPipeline(self):
-        if hasattr(self, '_active_session_id'):
+        """Request cancellation of the running pipeline (if any)."""
+        if self._pipeline_adapter is not None:
+            self._pipeline_adapter.request_cancel()
+        if self._active_session_id:
             for s in self._sessions:
                 if s["id"] == self._active_session_id:
                     s["status"] = "cancelled"

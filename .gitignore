@@ -236,3 +236,7 @@ __marimo__/
 .qwen/
 .env.example
 */backendPlan/*
+
+cache/
+agent.db
+app/config/.db_key
