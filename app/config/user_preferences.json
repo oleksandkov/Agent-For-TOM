@@ -1,5 +1,8 @@
 {
     "isDarkTheme": true,
-    "isSidebarCollapsed": true,
-    "isBigFont": false
+    "isSidebarCollapsed": false,
+    "isBigFont": false,
+    "cacheTtlDays": 30,
+    "sessionRetentionDays": 90,
+    "userStyleText": ""
 }

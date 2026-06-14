@@ -3,8 +3,8 @@ import QtQuick 2.15
 // Reusable application button
 Rectangle {
     id: root
-    height: 40
-    width: btnLabel.implicitWidth + 32
+    implicitHeight: Math.max(40, btnLabel.implicitHeight + 16)
+    implicitWidth: btnLabel.implicitWidth + 32
     radius: theme.radiusMD
     color: btnColor()
 
@@ -12,6 +12,7 @@ Rectangle {
     required property string label
     property string variant: "primary"   // "primary" | "secondary" | "ghost" | "danger"
     property bool hovered: false
+    property int fontWeight: Font.Medium
 
     signal clicked()
 
@@ -20,7 +21,7 @@ Rectangle {
         anchors.centerIn: parent
         text: root.label
         font.pixelSize: theme.fontSizeMD
-        font.weight: Font.Medium
+        font.weight: root.fontWeight
         color: textColor()
     }
 

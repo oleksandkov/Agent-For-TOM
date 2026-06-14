@@ -87,9 +87,18 @@ Rectangle {
             }
             NavItem {
                 theme: root.theme
-                label: "Створити документ"
+                label: "Створити"
                 screen: "new_document"
                 icon: "➕"
+                isCollapsed: root.isCollapsed
+                currentScreen: root.currentScreen
+                onNavigate: (s) => root.navigate(s)
+            }
+            NavItem {
+                theme: root.theme
+                label: "Сховище"
+                screen: "storage"
+                icon: "📦"
                 isCollapsed: root.isCollapsed
                 currentScreen: root.currentScreen
                 onNavigate: (s) => root.navigate(s)
@@ -143,7 +152,7 @@ Rectangle {
             }
             NavItem {
                 theme: root.theme
-                label: "Повідомити про баг"
+                label: "Повідомити<br>про баг"
                 screen: "report"
                 icon: "🐞"
                 isCollapsed: root.isCollapsed

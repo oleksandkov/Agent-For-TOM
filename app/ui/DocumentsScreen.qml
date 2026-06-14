@@ -119,7 +119,7 @@ Rectangle {
                             color: hovered ? theme.accentHover : theme.accent
                             property bool hovered: false
 
-                            RowLayout {
+                            Row {
                                 id: btnRow
                                 anchors.centerIn: parent
                                 spacing: theme.sp2
@@ -127,6 +127,9 @@ Rectangle {
                                     text: "+"
                                     font.pixelSize: 18; font.weight: Font.Medium
                                     color: "white"
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    // Adjust visually if the + sits too high in the font
+                                    anchors.verticalCenterOffset: -1
                                 }
                                 Text {
                                     id: btnText
@@ -134,6 +137,7 @@ Rectangle {
                                     font.pixelSize: theme.fontSizeMD
                                     font.weight: Font.Bold
                                     color: "white"
+                                    anchors.verticalCenter: parent.verticalCenter
                                 }
                             }
 
@@ -215,7 +219,7 @@ Rectangle {
                     // Table card
                     Rectangle {
                         Layout.fillWidth: true
-                        height: tableContent.implicitHeight
+                        implicitHeight: tableContent.implicitHeight
                         radius: theme.radiusLG
                         color: theme.surface1
                         border.color: theme.borderSubtle
@@ -359,6 +363,121 @@ Rectangle {
                                         font.pixelSize: theme.fontSizeSM
                                         color: theme.textTertiary
                                     }
+                                }
+                            }
+                        }
+                    }
+
+                    Item { height: theme.sp8 }
+
+                    // Library Section
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: theme.sp4
+                        ColumnLayout {
+                            spacing: 2
+                            Text { text: "Бібліотека завантажених файлів"; font.pixelSize: theme.fontSizeH2; font.weight: 600; color: theme.textPrimary }
+                            Text { text: "Усі файли, коли-небудь завантажені користувачем"; font.pixelSize: theme.fontSizeMD; color: theme.textSecondary }
+                        }
+                    }
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        implicitHeight: Math.max(100, libraryCol.implicitHeight)
+                        radius: theme.radiusLG
+                        color: theme.surface1
+                        border.color: theme.borderSubtle; border.width: 1
+                        clip: true
+
+                        property var libraryFiles: []
+
+                        function loadLibrary() {
+                            libraryFiles = JSON.parse(bridge.getLibraryFiles())
+                        }
+
+                        Component.onCompleted: loadLibrary()
+
+                        ColumnLayout {
+                            id: libraryCol
+                            anchors { left: parent.left; right: parent.right; top: parent.top }
+                            spacing: 0
+
+                            Rectangle {
+                                Layout.fillWidth: true; height: 40
+                                color: theme.surface2; radius: theme.radiusLG
+
+                                Rectangle { anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.right: parent.right; height: parent.height / 2; color: parent.color }
+                                Rectangle { anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.right: parent.right; height: 1; color: theme.borderSubtle }
+
+                                RowLayout {
+                                    anchors.fill: parent; anchors.leftMargin: theme.sp5; anchors.rightMargin: theme.sp5
+                                    spacing: theme.sp4
+                                    TableHeaderCell { theme: root.theme; label: "Оригінальна назва"; Layout.fillWidth: true }
+                                    TableHeaderCell { theme: root.theme; label: "Розмір (Б)"; width: 100 }
+                                    TableHeaderCell { theme: root.theme; label: "Дата"; width: 100 }
+                                    Item { width: 140 }
+                                }
+                            }
+
+                            Repeater {
+                                model: parent.parent.libraryFiles
+                                delegate: Rectangle {
+                                    Layout.fillWidth: true
+                                    height: 52
+                                    color: hovered ? theme.surface2 : theme.surface1
+                                    property bool hovered: false
+
+                                    Rectangle { visible: index < parent.parent.libraryFiles.length - 1; anchors.bottom: parent.bottom; width: parent.width; height: 1; color: theme.borderSubtle }
+
+                                    RowLayout {
+                                        anchors { fill: parent; leftMargin: theme.sp5; rightMargin: theme.sp5 }
+                                        spacing: theme.sp4
+
+                                        Text {
+                                            text: modelData.original_name
+                                            font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: theme.textPrimary
+                                            Layout.fillWidth: true; elide: Text.ElideRight
+                                        }
+
+                                        Text {
+                                            text: modelData.file_size_bytes.toString()
+                                            font.pixelSize: theme.fontSizeMD; color: theme.textSecondary
+                                            width: 100
+                                        }
+
+                                        Text {
+                                            text: modelData.created_at
+                                            font.pixelSize: theme.fontSizeSM; color: theme.textTertiary
+                                            width: 100
+                                        }
+
+                                        RowLayout {
+                                            width: 140
+                                            spacing: theme.sp1
+                                            AppButton { 
+                                                theme: root.theme; label: "Завантажити"; variant: "ghost"; height: 30; 
+                                                onClicked: bridge.downloadFile(modelData.path) 
+                                            }
+                                        }
+                                    }
+
+                                    MouseArea {
+                                        anchors.fill: parent; hoverEnabled: true
+                                        onEntered: parent.hovered = true
+                                        onExited: parent.hovered = false
+                                    }
+                                    Behavior on color { ColorAnimation { duration: 100 } }
+                                }
+                            }
+
+                            Rectangle {
+                                visible: parent.parent.libraryFiles.length === 0
+                                Layout.fillWidth: true; height: 60
+                                color: "transparent"
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "Бібліотека порожня"
+                                    font.pixelSize: theme.fontSizeLG; color: theme.textTertiary
                                 }
                             }
                         }

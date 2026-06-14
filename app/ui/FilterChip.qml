@@ -4,8 +4,8 @@ import QtQuick.Layouts 1.15
 // Filter chip for the sessions toolbar
 Rectangle {
     id: root
-    height: 32
-    width: chipLabel.implicitWidth + 40
+    implicitHeight: 32
+    implicitWidth: chipLabel.implicitWidth + 40
     radius: theme.radiusMD
     color: active ? theme.surface1 : theme.surface2
     border.color: active ? theme.accent : "transparent"

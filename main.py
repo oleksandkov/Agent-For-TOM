@@ -15,6 +15,9 @@ from PyQt6.QtCore import Qt
 # pyrefly: ignore [missing-import]
 from PyQt6.QtGui import QIcon
 
+# Suppress FFmpeg logs (like video metadata dumps) in the terminal
+os.environ["QT_LOGGING_RULES"] = "qt.multimedia.ffmpeg.info=false;qt.multimedia.ffmpeg.debug=false;qt.qpa.mime=false"
+
 # Add app directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -22,6 +25,14 @@ from app.bridge import AppBridge
 
 
 def main():
+    import ctypes
+    try:
+        # Fix Windows taskbar icon (prevents grouping under Python logo)
+        myappid = 'sych.agentfortom.app.1'
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+    except Exception:
+        pass
+
     os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Material")
     os.environ["QT_LOGGING_RULES"] = "qt.qpa.mime=false"
     os.environ.setdefault("QT_QUICK_CONTROLS_MATERIAL_THEME", "Light")
@@ -66,6 +77,17 @@ def main():
     if not engine.rootObjects():
         print("ERROR: Failed to load QML. Check the QML file path and syntax.", file=sys.stderr)
         sys.exit(1)
+
+    # Force window to foreground on Windows
+    if sys.platform == 'win32':
+        import ctypes
+        window = engine.rootObjects()[0]
+        hwnd = int(window.winId())
+        # The famous "ALT key hack" to bypass Windows focus stealing prevention
+        ctypes.windll.user32.keybd_event(0x12, 0, 0, 0) # ALT down
+        ctypes.windll.user32.keybd_event(0x12, 0, 2, 0) # ALT up
+        ctypes.windll.user32.ShowWindow(hwnd, 9) # SW_RESTORE
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
 
     # Ensure transit data is cleaned up properly on exit
     app.aboutToQuit.connect(bridge.clearTransitFolder)

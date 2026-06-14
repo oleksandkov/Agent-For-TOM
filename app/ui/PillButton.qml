@@ -3,8 +3,8 @@ import QtQuick 2.15
 // Single pill radio button
 Rectangle {
     id: root
-    height: Math.max(36, pillText.implicitHeight + 16)
-    width: pillText.implicitWidth + 32
+    implicitHeight: Math.max(36, pillText.implicitHeight + 16)
+    implicitWidth: pillText.implicitWidth + 32
     radius: 18  // fully rounded
     color: active ? theme.accentSoft2 : (hovered ? theme.surface3 : theme.surface1)
 

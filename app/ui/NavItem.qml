@@ -82,6 +82,10 @@ Rectangle {
         anchors.fill: parent
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
-        onClicked: root.navigate(root.screen)
+        onClicked: {
+            if (!root.isActive) {
+                root.navigate(root.screen)
+            }
+        }
     }
 }

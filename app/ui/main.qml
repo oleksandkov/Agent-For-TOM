@@ -8,7 +8,7 @@ ApplicationWindow {
     id: root
     width: 1024
     height: 768
-    minimumWidth: 900
+    minimumWidth: 1024
     minimumHeight: 600
     // Constraints to prevent covering the taskbar on Windows when frameless
     maximumWidth: root.screen.desktopAvailableWidth
@@ -21,16 +21,8 @@ ApplicationWindow {
     title: "Agent-For-TOM"
     flags: Qt.Window | Qt.FramelessWindowHint | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint
     
-    // ─── Resize Handles ──────────────────────────────────────────────────────────
-    MouseArea { width: 5; anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom; cursorShape: Qt.SizeHorCursor; onPressed: root.startSystemResize(Qt.LeftEdge) }
-    MouseArea { width: 5; anchors.right: parent.right; anchors.top: parent.top; anchors.bottom: parent.bottom; cursorShape: Qt.SizeHorCursor; onPressed: root.startSystemResize(Qt.RightEdge) }
-    MouseArea { height: 5; anchors.top: parent.top; anchors.left: parent.left; anchors.right: parent.right; cursorShape: Qt.SizeVerCursor; onPressed: root.startSystemResize(Qt.TopEdge) }
-    MouseArea { height: 5; anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.right: parent.right; cursorShape: Qt.SizeVerCursor; onPressed: root.startSystemResize(Qt.BottomEdge) }
-    MouseArea { width: 5; height: 5; anchors.top: parent.top; anchors.left: parent.left; cursorShape: Qt.SizeFDiagCursor; onPressed: root.startSystemResize(Qt.TopEdge | Qt.LeftEdge) }
-    MouseArea { width: 5; height: 5; anchors.top: parent.top; anchors.right: parent.right; cursorShape: Qt.SizeBDiagCursor; onPressed: root.startSystemResize(Qt.TopEdge | Qt.RightEdge) }
-    MouseArea { width: 5; height: 5; anchors.bottom: parent.bottom; anchors.left: parent.left; cursorShape: Qt.SizeBDiagCursor; onPressed: root.startSystemResize(Qt.BottomEdge | Qt.LeftEdge) }
-    MouseArea { width: 5; height: 5; anchors.bottom: parent.bottom; anchors.right: parent.right; cursorShape: Qt.SizeFDiagCursor; onPressed: root.startSystemResize(Qt.BottomEdge | Qt.RightEdge) }
-
+    property bool isReadyForResize: false
+    
     property int lastVis: Window.Maximized
     property int visBeforeMin: Window.Maximized
 
@@ -140,6 +132,7 @@ ApplicationWindow {
         property int   fontSizeMD:   13
         property int   fontSizeLG:   14
         property int   fontSizeXL:   16
+        property int   fontSizeH2:   20
         property int   fontSizeH1:   24
         // Spacing
         readonly property int   sp1:  4
@@ -237,6 +230,9 @@ ApplicationWindow {
     }
 
     Component.onCompleted: {
+        root.requestActivate()
+        root.raise()
+        
         applyTheme()
         applyFontSizes()
         
@@ -261,8 +257,8 @@ ApplicationWindow {
             root.showNormal()
             root.width = safeNormalWidth > 0 ? safeNormalWidth : 1024
             root.height = safeNormalHeight > 0 ? safeNormalHeight : 768
-            root.x = safeNormalX > -10000 ? safeNormalX : 100
-            root.y = safeNormalY > -10000 ? safeNormalY : 100
+            root.x = root.screen.virtualX + (root.screen.width - root.width) / 2
+            root.y = root.screen.virtualY + (root.screen.height - root.height) / 2
             fixGeometryTimer.start()
         } else {
             root.showMaximized()
@@ -278,20 +274,27 @@ ApplicationWindow {
         sequence: "F11"
         onActivated: root.toggleMaximized()
     }
-    Shortcut {
-        sequence: "Esc"
-        enabled: root.visibility === Window.FullScreen || root.visibility === Window.Maximized
-        onActivated: {
-            if (root.visibility === Window.Maximized || root.visibility === Window.FullScreen) {
-                root.toggleMaximized()
-            }
-        }
-    }
+
 
     Connections {
         target: bridge
         function onNavigationRequest(screen, param) {
             navigateTo(screen)
+        }
+        function onPipelineFinished(session_id) {
+            var resultStr = bridge.getSessionResult()
+            var res = {}
+            try {
+                res = JSON.parse(resultStr)
+            } catch(e) {}
+
+            if (res.status === "failed") {
+                pythonErrorModal.open()
+                navigateTo("result")
+            } else {
+                toastManager.showToast("Документ успішно згенеровано!", "success")
+                navigateTo("result")
+            }
         }
     }
 
@@ -299,6 +302,7 @@ ApplicationWindow {
         currentScreen = screen
         switch(screen) {
             case "documents":    stack.replace(documentsComp); break
+            case "storage":      stack.replace(storageComp); break
             case "new_document": stack.replace(newDocumentComp); break
             case "confirm_document": stack.replace(confirmDocumentComp); break
             case "progress":    stack.replace(progressComp); break
@@ -306,6 +310,10 @@ ApplicationWindow {
             case "templates":   stack.replace(templatesComp); break
             case "instructions":stack.replace(instructionsComp); break
             case "settings":    stack.replace(settingsComp); break
+            case "settings_instructions": 
+                currentScreen = "settings"
+                stack.replace(settingsComp, { scrollToInstructions: true }); 
+                break
             case "about":       stack.replace(aboutComp); break
         }
     }
@@ -315,6 +323,19 @@ ApplicationWindow {
     Material.theme: root.isDarkTheme ? Material.Dark : Material.Light
     Material.accent: appTheme.accent
     Material.background: root.isDarkTheme ? appTheme.surfaceBase : "#E5E7EB"
+
+    // Global click-outside to drop focus
+    MouseArea {
+        anchors.fill: parent
+        z: -1
+        onClicked: mainRootLayout.forceActiveFocus()
+    }
+
+    // Global Esc to drop focus
+    Shortcut {
+        sequence: "Escape"
+        onActivated: mainRootLayout.forceActiveFocus()
+    }
 
     ColumnLayout {
         id: mainRootLayout
@@ -453,6 +474,7 @@ ApplicationWindow {
 
     // ─── Screen Components ─────────────────────────────────────────────────────
     Component { id: documentsComp;     DocumentsScreen     { theme: appTheme; onNavigate: (s) => root.navigateTo(s) } }
+    Component { id: storageComp;       StorageScreen       { theme: appTheme; onNavigate: (s) => root.navigateTo(s) } }
     Component { id: newDocumentComp; NewDocumentScreen { theme: appTheme; initialPayload: root.sessionPayload; onNavigate: (screen) => root.navigateTo(screen); onSessionPayloadUpdated: (payload) => { root.sessionPayload = payload; bridge.sessionPayloadJson = JSON.stringify(payload); } } }
     Component { id: confirmDocumentComp; ConfirmDocumentScreen { theme: appTheme; onNavigate: (screen) => root.navigateTo(screen) } }
     Component { id: progressComp; ProgressScreen { theme: appTheme; onNavigate: (screen) => root.navigateTo(screen) } }
@@ -469,6 +491,52 @@ ApplicationWindow {
         border.color: appTheme.borderSubtle
         border.width: root.visibility === Window.Windowed && root.width < Screen.desktopAvailableWidth - 20 ? 1 : 0
         z: 9998
+    }
+
+    // ── Toasts & Modals ────────────────────────────────────────────────────────
+    ToastManager {
+        id: toastManager
+        theme: appTheme
+        z: 9999
+    }
+
+    Popup {
+        id: pythonErrorModal
+        width: Math.min(400, parent.width - 40)
+        height: 220
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        modal: true
+        focus: true
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        Overlay.modal: Rectangle { color: "#80000000" }
+        background: Rectangle {
+            radius: appTheme.radiusLG; color: appTheme.surface1
+            border.color: appTheme.borderSubtle; border.width: 1
+        }
+        contentItem: ColumnLayout {
+            spacing: appTheme.sp4
+            Text {
+                text: "😔"
+                font.pixelSize: 48
+                Layout.alignment: Qt.AlignHCenter
+            }
+            Text { 
+                text: "Помилка коду, спробуйте ще раз" 
+                font.pixelSize: appTheme.fontSizeLG
+                font.weight: Font.DemiBold
+                color: appTheme.textPrimary 
+                Layout.alignment: Qt.AlignHCenter
+            }
+            Item { Layout.fillHeight: true }
+            AppButton { 
+                theme: appTheme
+                label: "Зрозуміло"
+                variant: "primary"
+                Layout.alignment: Qt.AlignHCenter
+                onClicked: pythonErrorModal.close() 
+            }
+        }
     }
 
     // ── Splash Screen ────────────────────────────────────────────────────────────
@@ -503,7 +571,7 @@ ApplicationWindow {
                 NumberAnimation { target: splashScreen; property: "opacity"; to: 0.0; duration: 400; easing.type: Easing.InOutQuad }
                 NumberAnimation { target: splashLogo; property: "scale"; to: 1.15; duration: 400; easing.type: Easing.InQuad }
             }
-            ScriptAction { script: splashScreen.visible = false }
+            ScriptAction { script: { splashScreen.visible = false; root.isReadyForResize = true } }
         }
     }
 }

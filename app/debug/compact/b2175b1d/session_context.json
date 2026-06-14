@@ -1,0 +1,47 @@
+{
+  "id": "b2175b1d",
+  "name": "Лаба 1 - тестова",
+  "template_id": "lab1",
+  "status": "processing",
+  "input_snapshot": {
+    "template_id": "lab1",
+    "name": "Лаба 1 - тестова",
+    "theme": "Лаба 1 - тестова",
+    "goal": "",
+    "length": "short",
+    "hardness": "university_1",
+    "image_mode": "none",
+    "include_special_instructions": true,
+    "include_user_style": false,
+    "user_input": "в кінці кожного речення пиши перед крапкою символ \"ї\"",
+    "uploaded_files": [
+      {
+        "name": "LMV_LabRob.pdf",
+        "meta": "1.2 МБ",
+        "path": "E:/Documents/LMV_LabRob.pdf",
+        "txt_filename": "LMV_LabRob.pdf_qS4a5.txt",
+        "symbols": 94287,
+        "status": "done"
+      }
+    ],
+    "gap_values": {},
+    "created_at": "2026-06-14T19:52:38.316034+00:00",
+    "id": "b2175b1d",
+    "status": "processing",
+    "gap_values_ref": "lab1_params.json",
+    "global_instructions_hash": "",
+    "style_hash": "",
+    "attached_files": [
+      "0274db65f78b86cae71cc0e5671ae1ff33084d7f7c2edcbb8d2baef8e7648056"
+    ]
+  },
+  "file_refs": {
+    "global_instructions": "general_instructions.md",
+    "template_instructions": "lab1_fill.md",
+    "template_params": "lab1_params.json",
+    "context": "context.json",
+    "library_files": "library_files.json",
+    "attached": "attached/"
+  },
+  "created_at": "2026-06-14T19:52:38.316034+00:00"
+}

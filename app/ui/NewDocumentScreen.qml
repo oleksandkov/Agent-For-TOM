@@ -19,8 +19,11 @@ Rectangle {
     property string labNumber: ""
     property string sessionHints: ""
     property string lengthMode: ""
+    property string imageMode: ""
     property string hasVariants: ""
     property string variantsNumber: ""
+    property string templateId: ""
+    property string userStyleId: ""
 
     // Uploaded files list
     property var uploadedFiles: []
@@ -39,6 +42,7 @@ Rectangle {
     property bool isRestoring: false
     property bool hasRestored: false
     property var initialPayload: ({})
+    property bool hasValidHfToken: true
 
     function restorePayload(globalPayload) {
         if (hasRestored) return;
@@ -51,8 +55,16 @@ Rectangle {
             root.labNumber = sp.labNumber || "";
             root.sessionHints = sp.sessionHints || "";
             root.lengthMode = sp.lengthMode || "";
+            root.imageMode = sp.imageMode || "";
             root.hasVariants = sp.hasVariants || "";
             root.variantsNumber = sp.variantsNumber || "";
+            root.templateId = sp.template_id || "";
+            root.userStyleId = sp.userStyleId || "";
+            
+            if (typeof nameAiCheck !== "undefined") nameAiCheck.checked = sp.nameAiCheck || false;
+            if (typeof themeAiCheck !== "undefined") themeAiCheck.checked = sp.themeAiCheck || false;
+            if (typeof goalAiCheck !== "undefined") goalAiCheck.checked = sp.goalAiCheck || false;
+            
             if (sp.uploadedFiles && sp.uploadedFiles.length > 0) {
                 root.uploadedFiles = sp.uploadedFiles;
                 filesModel.clear();
@@ -69,6 +81,7 @@ Rectangle {
     }
 
     Component.onCompleted: {
+        hasValidHfToken = (bridge.getHfToken().length === 37)
         if (initialPayload && Object.keys(initialPayload).length > 0) {
             restorePayload(initialPayload);
         } else if (ApplicationWindow.window && ApplicationWindow.window.sessionPayload && Object.keys(ApplicationWindow.window.sessionPayload).length > 0) {
@@ -81,6 +94,25 @@ Rectangle {
     onInitialPayloadChanged: {
         if (initialPayload && Object.keys(initialPayload).length > 0) {
             restorePayload(initialPayload);
+        } else {
+            isRestoring = true;
+            root.documentName = "";
+            root.documentTheme = "";
+            root.documentGoal = "";
+            root.labNumber = "";
+            root.sessionHints = "";
+            root.lengthMode = "";
+            root.imageMode = "";
+            root.hasVariants = "";
+            root.variantsNumber = "";
+            root.templateId = "";
+            root.userStyleId = "";
+            if (typeof nameAiCheck !== "undefined") nameAiCheck.checked = false;
+            if (typeof themeAiCheck !== "undefined") themeAiCheck.checked = false;
+            if (typeof goalAiCheck !== "undefined") goalAiCheck.checked = false;
+            root.uploadedFiles = [];
+            filesModel.clear();
+            isRestoring = false;
         }
     }
 
@@ -108,9 +140,12 @@ Rectangle {
         sp.labNumber = root.labNumber;
         sp.sessionHints = root.sessionHints;
         sp.lengthMode = root.lengthMode;
+        sp.imageMode = root.imageMode;
         sp.hasVariants = root.hasVariants;
         sp.variantsNumber = root.variantsNumber;
         sp.uploadedFiles = root.uploadedFiles;
+        sp.template_id = root.templateId;
+        sp.userStyleId = root.userStyleId;
         
         sp.nameAiCheck = nameAiCheck.checked;
         sp.themeAiCheck = themeAiCheck.checked;
@@ -131,9 +166,32 @@ Rectangle {
     onLabNumberChanged: saveState()
     onSessionHintsChanged: saveState()
     onLengthModeChanged: saveState()
+    onImageModeChanged: saveState()
     onHasVariantsChanged: saveState()
     onVariantsNumberChanged: saveState()
     onUploadedFilesChanged: saveState()
+
+    onTemplateIdChanged: {
+        if (templateCombo && templateCombo.model) {
+            var idx = -1;
+            for (var i = 0; i < templateCombo.model.length; i++) {
+                if (templateCombo.model[i].id === root.templateId) { idx = i; break; }
+            }
+            templateCombo.currentIndex = idx;
+        }
+        saveState();
+    }
+
+    onUserStyleIdChanged: {
+        if (styleCombo && styleCombo.model) {
+            var idx = -1;
+            for (var j = 0; j < styleCombo.model.length; j++) {
+                if (styleCombo.model[j].id === root.userStyleId) { idx = j; break; }
+            }
+            styleCombo.currentIndex = idx;
+        }
+        saveState();
+    }
 
     ListModel { id: filesModel }
 
@@ -210,6 +268,7 @@ Rectangle {
     // ── Scrollable content area (leaves room for sticky footer) ───────────────
     Flickable {
         id: scrollView
+        visible: hasValidHfToken
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
@@ -223,9 +282,20 @@ Rectangle {
         WheelHandler {
             orientation: Qt.Vertical
             onWheel: (event) => {
-                var step = event.angleDelta.y * 0.5;
-                var newY = Math.max(0, Math.min(scrollView.contentHeight - scrollView.height, scrollView.contentY - step));
-                scrollView.contentY = newY;
+                var speedMultiplier = 0.5;
+                if (event.pixelDelta.y !== 0) {
+                    smoothScrollAnim.stop();
+                    var delta = event.pixelDelta.y * speedMultiplier;
+                    scrollView.contentY = Math.max(0, Math.min(scrollView.contentHeight - scrollView.height, scrollView.contentY - delta));
+                } else {
+                    var current = smoothScrollAnim.running ? smoothScrollAnim.to : scrollView.contentY;
+                    var step = event.angleDelta.y * speedMultiplier;
+                    var newY = Math.max(0, Math.min(scrollView.contentHeight - scrollView.height, current - step));
+                    if (newY !== current) {
+                        smoothScrollAnim.to = newY;
+                        smoothScrollAnim.restart();
+                    }
+                }
             }
         }
         ScrollBar.vertical: ScrollBar { id: vbar; policy: ScrollBar.AsNeeded }
@@ -250,14 +320,20 @@ Rectangle {
                         font.weight: Font.DemiBold
                         color: theme.textPrimary
                         font.letterSpacing: -0.3
+                        Layout.alignment: Qt.AlignHCenter
+                        horizontalAlignment: Text.AlignHCenter
                     }
                     Text {
                         textFormat: Text.RichText
-                        text: "Заповніть обов'язкові поля (позначені \"<font color='#EF4444'>*</font>\"). ШІ згенерує документ за шаблоном."
+                        text: "Заповніть обов'язкові поля (<font color='#EF4444'>*</font>).<br>ШІ згенерує документ за обраним шаблоном."
                         font.pixelSize: theme.fontSizeLG
                         color: theme.textSecondary
                         Layout.bottomMargin: theme.sp4
+                        Layout.alignment: Qt.AlignHCenter
+                        horizontalAlignment: Text.AlignHCenter
                     }
+
+
 
                     // ── Session Name (Top level) ──────────────────────────────
                     Rectangle {
@@ -276,35 +352,36 @@ Rectangle {
                             anchors { left: parent.left; right: parent.right; top: parent.top; margins: theme.sp6 }
                             spacing: theme.sp4
 
-                            Item {
-                                Layout.fillWidth: true
-                                Layout.preferredHeight: Math.max(28, titleRow.implicitHeight)
-
-                                Row {
-                                    id: titleRow
-                                    anchors.centerIn: parent
-                                    spacing: 2
-                                    Text { text: "Назва документу"; font.pixelSize: theme.fontSizeXL; font.weight: Font.DemiBold; color: theme.textPrimary }
-                                    Text { text: " *"; font.pixelSize: theme.fontSizeXL; font.weight: Font.DemiBold; color: "#EF4444" }
-                                }
-
+                            RowLayout {
+                                spacing: theme.sp3
                                 Rectangle {
-                                    anchors.right: titleRow.left
-                                    anchors.rightMargin: theme.sp3
-                                    anchors.verticalCenter: parent.verticalCenter
                                     width: 28; height: 28; radius: 14
-                                    color: theme.accent
-                                    opacity: nameBlock.isDone ? 1 : 0
-                                    scale: nameBlock.isDone ? 1 : 0.5
-                                    Behavior on opacity { NumberAnimation { duration: 300; easing.type: Easing.OutBack } }
-                                    Behavior on scale { NumberAnimation { duration: 300; easing.type: Easing.OutBack } }
+                                    color: nameBlock.isDone ? theme.accent : theme.accentSoft2
+                                    Behavior on color { ColorAnimation { duration: 300 } }
+                                    Text {
+                                        anchors.centerIn: parent; text: "1"
+                                        font.pixelSize: theme.fontSizeMD; font.weight: Font.DemiBold; color: theme.accent
+                                        opacity: nameBlock.isDone ? 0 : 1
+                                        scale: nameBlock.isDone ? 0.5 : 1
+                                        Behavior on opacity { NumberAnimation { duration: 300; easing.type: Easing.OutBack } }
+                                        Behavior on scale { NumberAnimation { duration: 300; easing.type: Easing.OutBack } }
+                                    }
                                     Text {
                                         anchors.centerIn: parent
                                         text: "✓"
                                         font.pixelSize: theme.fontSizeMD
                                         font.weight: Font.DemiBold
                                         color: "white"
+                                        opacity: nameBlock.isDone ? 1 : 0
+                                        scale: nameBlock.isDone ? 1 : 0.5
+                                        Behavior on opacity { NumberAnimation { duration: 300; easing.type: Easing.OutBack } }
+                                        Behavior on scale { NumberAnimation { duration: 300; easing.type: Easing.OutBack } }
                                     }
+                                }
+                                RowLayout {
+                                    spacing: 2
+                                    Text { text: "Назва документу"; font.pixelSize: theme.fontSizeXL; font.weight: Font.DemiBold; color: theme.textPrimary }
+                                    Text { text: " *"; font.pixelSize: theme.fontSizeXL; font.weight: Font.DemiBold; color: "#EF4444" }
                                 }
                             }
                             TextField {
@@ -320,6 +397,128 @@ Rectangle {
                                 font.pixelSize: theme.fontSizeSM
                                 checked: false
                                 onCheckedChanged: saveState()
+                            }
+                        }
+                    }
+
+                    // ── Section 1: Template & Style ────────────────────────────
+                    Rectangle {
+                        id: block1
+                        property bool isDone: (root.templateId !== "") && (root.userStyleId !== "")
+                        Layout.fillWidth: true
+                        radius: theme.radiusLG; color: theme.surface1
+                        border.color: isDone ? theme.accent : theme.borderSubtle
+                        border.width: isDone ? 2 : 1
+                        Behavior on border.color { ColorAnimation { duration: 400; easing.type: Easing.OutCubic } }
+                        Behavior on border.width { NumberAnimation { duration: 400; easing.type: Easing.OutCubic } }
+                        Layout.preferredHeight: sec1Col.implicitHeight + theme.sp6 * 2
+
+                        ColumnLayout {
+                            id: sec1Col
+                            anchors { left: parent.left; right: parent.right; top: parent.top; margins: theme.sp6 }
+                            spacing: theme.sp4
+
+                            RowLayout {
+                                spacing: theme.sp3
+                                Rectangle {
+                                    width: 28; height: 28; radius: 14
+                                    color: block1.isDone ? theme.accent : theme.accentSoft2
+                                    Behavior on color { ColorAnimation { duration: 300 } }
+                                    Text {
+                                        anchors.centerIn: parent; text: "2"
+                                        font.pixelSize: theme.fontSizeMD; font.weight: Font.DemiBold; color: theme.accent
+                                        opacity: block1.isDone ? 0 : 1
+                                        scale: block1.isDone ? 0.5 : 1
+                                        Behavior on opacity { NumberAnimation { duration: 300; easing.type: Easing.OutBack } }
+                                        Behavior on scale { NumberAnimation { duration: 300; easing.type: Easing.OutBack } }
+                                    }
+                                    Text {
+                                        anchors.centerIn: parent; text: "✓"
+                                        font.pixelSize: theme.fontSizeMD; font.weight: Font.DemiBold; color: "white"
+                                        opacity: block1.isDone ? 1 : 0
+                                        scale: block1.isDone ? 1 : 0.5
+                                        Behavior on opacity { NumberAnimation { duration: 300; easing.type: Easing.OutBack } }
+                                        Behavior on scale { NumberAnimation { duration: 300; easing.type: Easing.OutBack } }
+                                    }
+                                }
+                                Text { text: "Налаштування шаблону"; font.pixelSize: theme.fontSizeXL; font.weight: Font.DemiBold; color: theme.textPrimary }
+                            }
+
+                            // Template Block
+                            RowLayout {
+                                spacing: 2
+                                Text { text: "Шаблон документа"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: theme.textPrimary }
+                                Text { text: " *"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: "#EF4444" }
+                            }
+                            ComboBox {
+                                id: templateCombo
+                                Layout.fillWidth: true
+                                font.pixelSize: theme.fontSizeMD
+                                model: bridge ? JSON.parse(bridge.getTemplates()) : []
+                                textRole: "display_name"
+                                valueRole: "id"
+                                currentIndex: -1
+                                displayText: currentIndex === -1 ? "Виберіть зі списку" : currentText
+                                Component.onCompleted: {
+                                    var idx = -1;
+                                    for (var i = 0; i < model.length; i++) {
+                                        if (model[i].id === root.templateId) { idx = i; break; }
+                                    }
+                                    currentIndex = idx;
+                                }
+                                onActivated: {
+                                    root.templateId = currentValue
+                                    saveState()
+                                }
+                            }
+
+                            // User Style Block (Instructions)
+                            RowLayout {
+                                spacing: 2
+                                Text { text: "Стиль (інструкції)"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: theme.textPrimary }
+                                Text { text: " *"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: "#EF4444" }
+                            }
+                            ComboBox {
+                                id: styleCombo
+                                Layout.fillWidth: true
+                                font.pixelSize: theme.fontSizeMD
+                                model: {
+                                    if (!bridge) return [];
+                                    var instrs = JSON.parse(bridge.getInstructionsFiltered("user_created"));
+                                    instrs.unshift({id: "none", name: "Без додаткового стилю", is_active: false});
+                                    return instrs;
+                                }
+                                textRole: "name"
+                                valueRole: "id"
+                                currentIndex: -1
+                                displayText: currentIndex === -1 ? "Виберіть зі списку" : currentText
+                                Component.onCompleted: {
+                                    var idx = -1;
+                                    for (var i = 0; i < model.length; i++) {
+                                        if (model[i].id === root.userStyleId) { idx = i; break; }
+                                    }
+                                    currentIndex = idx;
+                                }
+                                onActivated: {
+                                    var newVal = currentValue;
+                                    
+                                    // Deactivate others
+                                    for (var i = 1; i < model.length; i++) {
+                                        if (model[i].is_active && model[i].id !== newVal) {
+                                            bridge.toggleInstructionStatus(model[i].id, false);
+                                        }
+                                    }
+                                    if (newVal !== "none") {
+                                        bridge.toggleInstructionStatus(newVal, true);
+                                    }
+                                    
+                                    var instrs = JSON.parse(bridge.getInstructionsFiltered("user_created"));
+                                    instrs.unshift({id: "none", name: "Без додаткового стилю", is_active: false});
+                                    model = instrs;
+                                    
+                                    root.userStyleId = newVal;
+                                    saveState();
+                                }
                             }
                         }
                     }
@@ -349,7 +548,7 @@ Rectangle {
                                     color: block2.isDone ? theme.accent : theme.accentSoft2
                                     Behavior on color { ColorAnimation { duration: 300 } }
                                     Text {
-                                        anchors.centerIn: parent; text: "1"
+                                        anchors.centerIn: parent; text: "3"
                                         font.pixelSize: theme.fontSizeMD; font.weight: Font.DemiBold; color: theme.accent
                                         opacity: block2.isDone ? 0 : 1
                                         scale: block2.isDone ? 0.5 : 1
@@ -501,7 +700,7 @@ Rectangle {
                                     color: sec3Rect.isDone ? theme.accent : theme.accentSoft2
                                     Behavior on color { ColorAnimation { duration: 300 } }
                                     Text {
-                                        anchors.centerIn: parent; text: "2"
+                                        anchors.centerIn: parent; text: "4"
                                         font.pixelSize: theme.fontSizeMD; font.weight: Font.DemiBold; color: theme.accent
                                         opacity: sec3Rect.isDone ? 0 : 1
                                         scale: sec3Rect.isDone ? 0.5 : 1
@@ -543,6 +742,32 @@ Rectangle {
                                         onClicked: {
                                             root.lengthMode = (root.lengthMode === modelData.id) ? "" : modelData.id
                                             root.forceActiveFocus() // Prevent stealing focus
+                                            saveState()
+                                        }
+                                    }
+                                }
+                            }
+
+                            RowLayout {
+                                spacing: 2
+                                Text { text: "Режим зображень"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: theme.textPrimary }
+                            }
+                            Flow {
+                                Layout.fillWidth: true
+                                spacing: theme.sp2
+                                Repeater {
+                                    model: [
+                                        {id:"none",       label:"Без зображень"},
+                                        {id:"references", label:"Посилання"},
+                                        {id:"full",       label:"Генерація"}
+                                    ]
+                                    delegate: PillButton {
+                                        theme: root.theme
+                                        label: modelData.label
+                                        active: root.imageMode === modelData.id
+                                        onClicked: {
+                                            root.imageMode = (root.imageMode === modelData.id) ? "" : modelData.id
+                                            root.forceActiveFocus()
                                             saveState()
                                         }
                                     }
@@ -691,7 +916,7 @@ Rectangle {
                                     color: sec4Rect.isDone ? theme.accent : theme.accentSoft2
                                     Behavior on color { ColorAnimation { duration: 300 } }
                                     Text {
-                                        anchors.centerIn: parent; text: "3"
+                                        anchors.centerIn: parent; text: "5"
                                         font.pixelSize: theme.fontSizeMD; font.weight: Font.DemiBold; color: theme.accent
                                         opacity: sec4Rect.isDone ? 0 : 1
                                         scale: sec4Rect.isDone ? 0.5 : 1
@@ -769,8 +994,6 @@ Rectangle {
                                         }
                                     }
                                 }
-
-                                Behavior on color { ColorAnimation { duration: 150 } }
                             }
 
                             // Context Capacity Bar
@@ -789,7 +1012,7 @@ Rectangle {
                                     }
                                     return sum;
                                 }
-                                property real pct: Math.min(totalSymbols / 48000 * 100, 100)
+                                property real pct: Math.min(totalSymbols / 150000 * 100, 100)
                                 property bool wasFull: false
                                 onPctChanged: {
                                     if (pct >= 100 && !wasFull) {
@@ -860,7 +1083,7 @@ Rectangle {
                                                     property int sym: modelData.status === "done" ? (modelData.symbols || 0) : 0
                                                     visible: modelData.status === "done"
                                                     property string fName: modelData.name || ""
-                                                    property real scaleDivisor: Math.max(48000, contextBarCol.totalSymbols)
+                                                    property real scaleDivisor: 150000
                                                     property real calculatedWidth: (sym / scaleDivisor) * parent.width
                                                     width: Math.max(4, calculatedWidth)
                                                     Behavior on width { NumberAnimation { duration: 400; easing.type: Easing.OutCubic } }
@@ -895,7 +1118,7 @@ Rectangle {
                                                                     id: txt
                                                                     anchors.top: parent.top
                                                                     anchors.horizontalCenter: parent.horizontalCenter
-                                                                    text: fName + "\n" + (sym / 48000 * 100).toFixed(1) + "% від ліміту • " + (modelData.meta || "")
+                                                                    text: fName + "\n" + (sym / 150000 * 100).toFixed(1) + "% від ліміту • " + (modelData.meta || "")
                                                                     color: "white"
                                                                     font.pixelSize: 13
                                                                     horizontalAlignment: Text.AlignHCenter
@@ -957,7 +1180,7 @@ Rectangle {
 
                                     // Text next to cursor
                                     Text {
-                                        x: parent.actualWidth + 10
+                                        x: Math.min(parent.actualWidth + 10, parent.width - width - 5)
                                         anchors.verticalCenter: parent.verticalCenter
                                         text: contextBarCol.pct.toFixed(1) + "%"
                                         font.pixelSize: theme.fontSizeSM
@@ -971,7 +1194,7 @@ Rectangle {
                                     Layout.fillWidth: true
                                     Item { Layout.fillWidth: true } // Spacer
                                     Text {
-                                        text: contextBarCol.totalSymbols + " / 48000 символів" + (contextBarCol.pct >= 95 ? " (" + contextBarCol.pct.toFixed(1) + "%)" : "")
+                                        text: contextBarCol.totalSymbols + " / 150000 символів" + (contextBarCol.pct >= 95 ? " (" + contextBarCol.pct.toFixed(1) + "%)" : "")
                                         font.pixelSize: theme.fontSizeSM
                                         color: contextBarCol.pct >= 100 ? theme.danger : (contextBarCol.pct >= 80 ? theme.warning : theme.textSecondary)
                                         font.weight: Font.Medium
@@ -1065,10 +1288,10 @@ Rectangle {
             }
         }
 
-
     // ── Sticky Footer ──────────────────────────────────────────────────────────
     Rectangle {
         id: stickyFooter
+        visible: hasValidHfToken
         anchors.bottom: parent.bottom
         anchors.left: parent.left
         anchors.right: parent.right
@@ -1105,6 +1328,12 @@ Rectangle {
                 onClicked: {
                     var errors = []
                     
+                    if (root.templateId === undefined || root.templateId === "") {
+                        errors.push("• Шаблон документа: обов'язково оберіть зі списку")
+                    }
+                    if (root.userStyleId === undefined || root.userStyleId === "") {
+                        errors.push("• Стиль (інструкції): обов'язково оберіть зі списку")
+                    }
                     if (root.documentName === undefined || root.documentName.trim().length < 5) {
                         errors.push("• Назва документу: мінімум 5 символів")
                     }
@@ -1163,8 +1392,10 @@ Rectangle {
 
                     ApplicationWindow.window.sessionPayload = {
                         "documentName": root.documentName,
-                        "selectedTemplate": root.selectedTemplate,
+                        "template_id": root.templateId,
+                        "userStyleId": root.userStyleId,
                         "lengthMode": root.lengthMode,
+                        "image_mode": root.imageMode,
                         "hasVariants": root.hasVariants,
                         "variantsNumber": root.variantsNumber,
                         "documentTheme": root.documentTheme,
@@ -1178,6 +1409,44 @@ Rectangle {
                         "hasCompletedSections": true
                     }
                     root.navigate("confirm_document")
+                }
+            }
+        }
+    }
+
+    // ── Missing Token Warning ───────────────────────────────────────────────
+    Item {
+        anchors.fill: parent
+        visible: !hasValidHfToken
+
+        ColumnLayout {
+            anchors.centerIn: parent
+            spacing: theme.sp4
+
+            Text {
+                Layout.alignment: Qt.AlignHCenter
+                text: "Відсутній або некоректний Hugging Face API ключ"
+                font.pixelSize: theme.fontSizeH1
+                font.weight: Font.DemiBold
+                color: theme.textPrimary
+            }
+
+            Text {
+                Layout.alignment: Qt.AlignHCenter
+                text: "Для створення документа потрібен валідний ключ доступу з 37 символів."
+                font.pixelSize: theme.fontSizeMD
+                color: theme.textSecondary
+            }
+
+            Item { Layout.preferredHeight: theme.sp4 }
+
+            AppButton {
+                Layout.alignment: Qt.AlignHCenter
+                theme: root.theme
+                label: "Як це зробити? Подивитись інструкцію"
+                variant: "primary"
+                onClicked: {
+                    root.navigate("settings_instructions")
                 }
             }
         }

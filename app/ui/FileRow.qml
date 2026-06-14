@@ -16,7 +16,7 @@ Rectangle {
     required property string fileMeta
     required property string fileStatus  // "done" | "processing" | "error"
     property int fileSymbols: 0
-    property bool isOversized: fileSymbols > 48000
+    property bool isOversized: fileSymbols > 150000
     property bool isHovered: false
     signal hoverStateChanged(bool hovering)
     signal dangerHoverStateChanged(bool hovering)

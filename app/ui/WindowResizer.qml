@@ -6,8 +6,8 @@ Item {
     anchors.fill: parent
     required property var window // Reference to the ApplicationWindow
 
-    // Only allow resizing if not maximized
-    visible: window.visibility !== Window.Maximized
+    // Only allow resizing if windowed and ready
+    visible: window.isReadyForResize && window.visibility !== Window.Maximized && window.visibility !== Window.FullScreen
 
     // Top
     MouseArea {

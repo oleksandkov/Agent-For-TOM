@@ -19,6 +19,13 @@ Rectangle {
 
     Component.onCompleted: loadInstructions()
 
+    Connections {
+        target: bridge
+        function onInstructionsChanged() {
+            root.loadInstructions()
+        }
+    }
+
     ScrollView {
         anchors.fill: parent
         contentWidth: availableWidth
@@ -45,7 +52,16 @@ Rectangle {
                         Text { text: "Управління AI-інструкціями"; font.pixelSize: theme.fontSizeLG; color: theme.textSecondary }
                     }
                     Item { Layout.fillWidth: true }
-                    AppButton { theme: root.theme; label: "+ Нові інструкції"; variant: "primary" }
+                    AppButton { 
+                        theme: root.theme; 
+                        label: "+ Нові інструкції"; 
+                        variant: "primary"
+                        fontWeight: Font.Bold
+                        onClicked: {
+                            newInstructionPopup.templates = JSON.parse(bridge.getTemplates())
+                            newInstructionPopup.open()
+                        }
+                    }
                 }
 
                 // Filter chips
@@ -87,7 +103,7 @@ Rectangle {
                                 TableHeaderCell { theme: root.theme; label: "Тип"; width: 130 }
                                 TableHeaderCell { theme: root.theme; label: "Прикріплено до"; width: 200 }
                                 TableHeaderCell { theme: root.theme; label: "Дата"; width: 100 }
-                                Item { width: 100 }
+                                Item { width: 260 }
                             }
                         }
 
@@ -117,6 +133,104 @@ Rectangle {
                 }
 
                 Item { height: theme.sp8 }
+            }
+        }
+    }
+
+    // Popup for new instruction
+    Popup {
+        id: newInstructionPopup
+        width: 600
+        height: 500
+        x: Math.round((parent.width - width) / 2)
+        y: Math.round((parent.height - height) / 2)
+        modal: true
+        focus: true
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        
+        property var templates: []
+
+        background: Rectangle {
+            color: theme.surface1
+            radius: theme.radiusLG
+            border.color: theme.borderSubtle
+            border.width: 1
+        }
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: theme.sp6
+            spacing: theme.sp4
+
+            Text {
+                text: "Створити нову інструкцію"
+                font.pixelSize: theme.fontSizeH2
+                font.weight: 600
+                color: theme.textPrimary
+            }
+
+            Text {
+                text: "Шаблон (опціонально)"
+                font.pixelSize: theme.fontSizeMD
+                color: theme.textSecondary
+            }
+
+            ComboBox {
+                id: templateCombo
+                Layout.fillWidth: true
+                model: [{text: "Загальна (без шаблону)", value: ""}].concat(newInstructionPopup.templates.map(t => ({text: t.display_name, value: t.id})))
+                textRole: "text"
+                valueRole: "value"
+            }
+
+            Text {
+                text: "Вміст (Markdown)"
+                font.pixelSize: theme.fontSizeMD
+                color: theme.textSecondary
+            }
+
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+
+                TextArea {
+                    id: instructionContentArea
+                    placeholderText: "Введіть інструкцію тут..."
+                    wrapMode: TextEdit.Wrap
+                    font.pixelSize: theme.fontSizeMD
+                    color: theme.textPrimary
+                    background: Rectangle {
+                        color: theme.surface2
+                        radius: theme.radiusMD
+                        border.color: instructionContentArea.activeFocus ? theme.accent : theme.borderSubtle
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.alignment: Qt.AlignRight
+                spacing: theme.sp3
+
+                AppButton {
+                    theme: root.theme
+                    label: "Скасувати"
+                    variant: "secondary"
+                    onClicked: newInstructionPopup.close()
+                }
+
+                AppButton {
+                    theme: root.theme
+                    label: "Зберегти"
+                    variant: "primary"
+                    onClicked: {
+                        let type_ = templateCombo.currentValue ? "special" : "user_created"
+                        bridge.createInstruction(type_, templateCombo.currentValue, instructionContentArea.text)
+                        instructionContentArea.text = ""
+                        newInstructionPopup.close()
+                    }
+                }
             }
         }
     }

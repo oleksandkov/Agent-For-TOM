@@ -55,10 +55,29 @@ Rectangle {
                     Repeater {
                         model: [
                             { label: "Назва документу:", value: sessionPayload.documentName || "Не вказано", aiChecked: sessionPayload.nameAiCheck },
+                            { label: "Шаблон документа:", value: (function() {
+                                var tmplId = sessionPayload.template_id;
+                                if (!tmplId) return "Не вказано";
+                                var templates = JSON.parse(bridge.getTemplates());
+                                for (var i = 0; i < templates.length; i++) {
+                                    if (templates[i].id === tmplId) return templates[i].display_name;
+                                }
+                                return "Невідомий шаблон";
+                            })(), aiChecked: false },
+                            { label: "Стиль (інструкції):", value: (function() {
+                                var styleId = sessionPayload.userStyleId;
+                                if (!styleId || styleId === "none") return "Без додаткового стилю";
+                                var instrs = JSON.parse(bridge.getInstructionsFiltered("user_created"));
+                                for (var j = 0; j < instrs.length; j++) {
+                                    if (instrs[j].id === styleId) return instrs[j].name;
+                                }
+                                return "Невідомий стиль";
+                            })(), aiChecked: false },
                             { label: "Тема:", value: sessionPayload.documentTheme || "Не вказано", aiChecked: sessionPayload.themeAiCheck },
                             { label: "Мета:", value: sessionPayload.documentGoal ? sessionPayload.documentGoal : "Немає", aiChecked: sessionPayload.goalAiCheck },
                             { label: "Номер лабораторної:", value: sessionPayload.labNumber || "Не вказано", aiChecked: false },
                             { label: "Обсяг:", value: sessionPayload.lengthMode || "middle", aiChecked: false },
+                            { label: "Режим зображень:", value: sessionPayload.image_mode === "references" ? "Посилання" : (sessionPayload.image_mode === "full" ? "Генерація" : "Без зображень"), aiChecked: false },
                             { label: "Індивідуальні завдання:", value: sessionPayload.hasVariants === "yes" ? sessionPayload.variantsNumber : (sessionPayload.hasVariants === "no" ? "Немає" : "Не вказано"), aiChecked: false },
                             { label: "Додаткові вказівки:", value: sessionPayload.sessionHints ? sessionPayload.sessionHints : "Немає", aiChecked: false },
                             { label: "Файли контексту:", value: sessionPayload.uploadedFiles && sessionPayload.uploadedFiles.length > 0 ? sessionPayload.uploadedFiles.map(function(f){return f.name}).join(", ") : "Немає", aiChecked: false }
@@ -137,17 +156,7 @@ Rectangle {
                                    String(d.getSeconds()).padStart(2, '0')
                         }
 
-                        var safeName = sessionPayload.documentName ? sessionPayload.documentName : "document"
-                        bridge.saveSessionJson(JSON.stringify(sessionPayload), safeName + "_" + formatDateTime())
-
-                        bridge.startGeneration(
-                            sessionPayload.documentName,
-                            sessionPayload.selectedTemplate,
-                            sessionPayload.lengthMode,
-                            "university_1", // default since it was removed
-                            "none", // image mode
-                            sessionPayload.documentGoal || ""
-                        )
+                        bridge.startGeneration(JSON.stringify(sessionPayload))
                         
                         if (typeof ApplicationWindow.window.clearSessionPayload === "function") {
                             ApplicationWindow.window.clearSessionPayload()

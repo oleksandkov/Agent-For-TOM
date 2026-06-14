@@ -5,46 +5,64 @@ import QtQuick.Layouts 1.15
 // Settings field with label + input
 ColumnLayout {
     id: root
-    spacing: theme.sp2
+    spacing: theme.sp4
 
     required property var theme
     required property string label
     property string placeholder: ""
     property bool isPassword: false
+    property bool _passwordVisible: false
     property string fieldType: "text"  // "text" | "combo"
     property var options: []
+    property alias text: inputFocus.text
+    property int maximumLength: 32767
 
     Text {
         text: root.label
-        font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: theme.textPrimary
+        font.pixelSize: theme.fontSizeLG
+        font.weight: Font.DemiBold
+        color: theme.textPrimary
     }
 
     // Text input
-    Rectangle {
+    TextField {
+        id: inputFocus
         visible: fieldType === "text"
-        Layout.fillWidth: true; height: 44
-        radius: theme.radiusMD; color: theme.surface1
-        border.color: inputFocus.activeFocus ? theme.accent : theme.borderStrong
-        border.width: inputFocus.activeFocus ? 2 : 1
+        Layout.fillWidth: true
+        placeholderText: root.placeholder
+        font.pixelSize: theme.fontSizeMD
+        color: theme.textPrimary
+        echoMode: root.isPassword && !root._passwordVisible ? TextInput.Password : TextInput.Normal
+        maximumLength: root.maximumLength
 
-        RowLayout {
-            anchors { fill: parent; leftMargin: theme.sp3; rightMargin: theme.sp3 }
-            TextInput {
-                id: inputFocus
-                Layout.fillWidth: true
-                font.pixelSize: theme.fontSizeLG; color: theme.textPrimary
-                echoMode: root.isPassword ? TextInput.Password : TextInput.Normal
-                Text {
-                    visible: parent.text.length === 0
-                    text: root.placeholder
-                    color: theme.textTertiary
-                    font.pixelSize: parent.font.pixelSize
-                }
+        HoverHandler { cursorShape: Qt.IBeamCursor }
+
+        Text {
+            id: eyeIcon
+            visible: root.isPassword
+            text: root._passwordVisible ? "🙈" : "👁"
+            font.pixelSize: 16
+            color: theme.textTertiary
+            
+            SequentialAnimation {
+                id: clickAnim
+                NumberAnimation { target: eyeIcon; property: "scale"; to: 0.7; duration: 100; easing.type: Easing.OutQuad }
+                NumberAnimation { target: eyeIcon; property: "scale"; to: 1.0; duration: 150; easing.type: Easing.OutBack }
             }
-            Text {
-                visible: root.isPassword
-                text: "👁"
-                font.pixelSize: 14; color: theme.textTertiary
+            
+            anchors.right: parent.right
+            anchors.rightMargin: theme.sp3
+            anchors.verticalCenter: parent.verticalCenter
+            
+            MouseArea {
+                id: eyeMouse
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                    clickAnim.restart()
+                    root._passwordVisible = !root._passwordVisible
+                    inputFocus.forceActiveFocus() // Keep focus on input while toggling visibility
+                }
             }
         }
     }

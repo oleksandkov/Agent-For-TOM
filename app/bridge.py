@@ -152,7 +152,12 @@ class AppBridge(QObject):
         self._is_dark_theme = False
         self._is_sidebar_collapsed = False
         self._is_big_font = False
+        self._cache_ttl_days = 30
+        self._session_retention_days = 90
+        self._user_style_text = ""
         self._session_payload_json = "{}"
+        self._db = None
+        self._repo = None
         # Real pipeline state (replaces the previous mock timer).
         self._active_session_id: str | None = None
         self._pipeline_adapter: "BridgePipelineAdapter | None" = None
@@ -174,13 +179,11 @@ class AppBridge(QObject):
 
     @pyqtSlot()
     def clearTransitFolder(self):
-        """Delete all files in transit folder except userInput.json."""
+        """Delete all files in transit folder."""
         transit_dir = os.path.join(os.path.dirname(__file__), "transit")
         if not os.path.exists(transit_dir):
             return
         for file in os.listdir(transit_dir):
-            if file == "userInput.json":
-                continue
             file_path = os.path.join(transit_dir, file)
             try:
                 if os.path.isfile(file_path):
@@ -191,6 +194,55 @@ class AppBridge(QObject):
         # Also clear the bridge's internal uploaded files list
         self._uploaded_files = []
         self.filesUpdated.emit("[]")
+
+    @pyqtSlot(result=str)
+    def getHfToken(self):
+        """Read HF_TOKEN from .env file."""
+        env_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+        if not os.path.exists(env_file):
+            return ""
+        try:
+            with open(env_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("HF_TOKEN="):
+                        return line.split("=", 1)[1].strip()
+        except Exception as e:
+            print(f"Error reading .env: {e}")
+        return ""
+
+    @pyqtSlot(result=str)
+    def getVideoUrl(self):
+        """Return the absolute file URL to the tutorial video."""
+        video_path = os.path.join(os.path.dirname(__file__), "assets", "videos", "tutorial.mp4")
+        return QUrl.fromLocalFile(video_path).toString()
+
+    @pyqtSlot(str)
+    def saveHfToken(self, token):
+        """Save HF_TOKEN to .env file."""
+        env_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+        lines = []
+        token_found = False
+        try:
+            if os.path.exists(env_file):
+                with open(env_file, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+            
+            for i, line in enumerate(lines):
+                if line.startswith("HF_TOKEN="):
+                    lines[i] = f"HF_TOKEN={token}\n"
+                    token_found = True
+                    break
+            
+            if not token_found:
+                # Ensure the file ends with a newline before appending
+                if lines and not lines[-1].endswith("\n"):
+                    lines[-1] += "\n"
+                lines.append(f"HF_TOKEN={token}\n")
+                
+            with open(env_file, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        except Exception as e:
+            print(f"Error saving to .env: {e}")
 
     def _save_user_input(self):
         try:
@@ -215,20 +267,63 @@ class AppBridge(QObject):
                     self._is_dark_theme = data.get("isDarkTheme", False)
                     self._is_sidebar_collapsed = data.get("isSidebarCollapsed", False)
                     self._is_big_font = data.get("isBigFont", False)
+                    self._cache_ttl_days = data.get("cacheTtlDays", 30)
+                    self._session_retention_days = data.get("sessionRetentionDays", 90)
+                    self._user_style_text = data.get("userStyleText", "")
             except Exception as e:
                 print(f"Error loading preferences: {e}")
 
     def _save_preferences(self):
         try:
+            os.makedirs(os.path.dirname(self._prefs_file), exist_ok=True)
             data = {
                 "isDarkTheme": self._is_dark_theme,
                 "isSidebarCollapsed": self._is_sidebar_collapsed,
-                "isBigFont": self._is_big_font
+                "isBigFont": self._is_big_font,
+                "cacheTtlDays": self._cache_ttl_days,
+                "sessionRetentionDays": self._session_retention_days,
+                "userStyleText": self._user_style_text,
             }
             with open(self._prefs_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
+                json.dump(data, f, indent=4, ensure_ascii=False)
         except Exception as e:
             print(f"Error saving preferences: {e}")
+
+    @pyqtSlot(str, int, int)
+    def saveSettings(self, user_style: str, cache_ttl: int, session_retention: int):
+        """Save all settings from the Settings screen at once."""
+        self._user_style_text = user_style
+        self._cache_ttl_days = max(1, cache_ttl)
+        self._session_retention_days = max(1, session_retention)
+        self._save_preferences()
+
+    @pyqtSlot(result=str)
+    def getUserStyle(self):
+        return self._user_style_text
+
+    @pyqtSlot(result=int)
+    def getCacheTtlDays(self):
+        return self._cache_ttl_days
+
+    @pyqtSlot(result=int)
+    def getSessionRetentionDays(self):
+        return self._session_retention_days
+
+    @pyqtSlot()
+    def clearCache(self):
+        """Manually clear all cached files (LLM, image, document caches)."""
+        cache_dir = os.path.join(os.path.dirname(__file__), "cache")
+        if os.path.exists(cache_dir):
+            for item in os.listdir(cache_dir):
+                item_path = os.path.join(cache_dir, item)
+                try:
+                    if os.path.isfile(item_path):
+                        os.remove(item_path)
+                    elif os.path.isdir(item_path):
+                        shutil.rmtree(item_path)
+                except Exception as e:
+                    print(f"Error clearing cache item {item}: {e}")
+        print("[bridge] Cache cleared manually")
 
     # ─── Properties ───────────────────────────────────────────────────────────
 
@@ -329,29 +424,226 @@ class AppBridge(QObject):
                 self.sessionsChanged.emit()
                 return
 
+    @pyqtSlot(str)
+    def restoreSession(self, session_id: str):
+        self._init_db()
+        session = self._repo.sessions.get(session_id)
+        if session:
+            payload = json.loads(session.get("input_snapshot") or "{}")
+            # Fill in required UI payload properties
+            ui_payload = {
+                "templateSlug": payload.get("template_slug", ""),
+                "hardness": payload.get("hardness", ""),
+                "imageMode": payload.get("image_mode", "none"),
+                "documentLength": payload.get("document_length", "medium"),
+                "useGlobalStyle": payload.get("use_global_style", True),
+                "useGlobalInstructions": payload.get("use_global_instructions", True),
+                "uploadedFiles": []
+            }
+            # Optional fields
+            for k in ["theme", "target", "specialValue1", "specialValue2", "specialValue3"]:
+                if k in payload:
+                    ui_payload[k] = payload[k]
+                    
+            self.sessionPayloadJson = json.dumps(ui_payload, ensure_ascii=False)
+            self.navigationRequest.emit("new_document", "")
+
     @pyqtSlot(result=str)
     def getTemplates(self):
         return json.dumps(self._templates, ensure_ascii=False)
 
     @pyqtSlot(result=str)
+    def getLibraryFiles(self):
+        self._init_db()
+        files = self._repo.library_file.list_all()
+        res = []
+        for f in files:
+            res.append({
+                "id": f["id"],
+                "original_name": f.get("original_name", "Unknown"),
+                "file_size_bytes": f.get("file_size_bytes", 0),
+                "created_at": f.get("created_at", "")[:10],
+                "path": f.get("stored_path", "")
+            })
+        return json.dumps(res, ensure_ascii=False)
+
+    @pyqtSlot(result=str)
+    def getGeneratedFiles(self):
+        self._init_db()
+        sessions = self._repo.sessions.list_by_status("completed")
+        res = []
+        for s in sessions:
+            res.append({
+                "session_name": s.get("name", "Unknown Session"),
+                "docx_path": s.get("docx_path", ""),
+                "pdf_path": s.get("pdf_path", ""),
+                "created_at": s.get("created_at", "")[:10]
+            })
+        return json.dumps(res, ensure_ascii=False)
+
+    @pyqtSlot(str)
+    def openFileExternal(self, rel_path: str):
+        if not rel_path:
+            return
+        import subprocess
+        full_path = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), rel_path))
+        if os.path.exists(full_path):
+            if sys.platform == "win32":
+                os.startfile(full_path)
+            elif sys.platform == "darwin":
+                subprocess.call(["open", full_path])
+            else:
+                subprocess.call(["xdg-open", full_path])
+
+    @pyqtSlot(str)
+    def showInFolder(self, rel_path: str):
+        if not rel_path:
+            return
+        import subprocess
+        full_path = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), rel_path))
+        if os.path.exists(full_path):
+            if sys.platform == "win32":
+                subprocess.call(['explorer', '/select,', full_path])
+            elif sys.platform == "darwin":
+                subprocess.call(["open", "-R", full_path])
+            else:
+                subprocess.call(["xdg-open", os.path.dirname(full_path)])
+
+    def _init_db(self):
+        if self._db is None:
+            from app.backend.db.connection import Database
+            from app.backend.db.facade import BridgeRepository
+            self._db = Database()
+            self._repo = BridgeRepository(self._db)
+
+    def _fetch_instructions(self) -> list[dict]:
+        self._init_db()
+        
+        # Get the latest version of each instruction (type, template_id combination)
+        # so that we can show them even if is_active = 0 (toggled off)
+        query = """
+            SELECT * FROM instructions 
+            WHERE id IN (
+                SELECT id FROM instructions 
+                GROUP BY type, IFNULL(template_id, 'global')
+                HAVING version = MAX(version)
+            )
+        """
+        rows = self._db.conn.execute(query).fetchall()
+        items = [dict(r) for r in rows]
+        
+        templates = {t["id"]: t for t in self._repo.templates.list_all()}
+        
+        active_categories = set()
+        for i in items:
+            if i["is_active"]:
+                active_categories.add((i["type"], i.get("template_id")))
+                
+        res = []
+        for i in items:
+            t_id = i.get("template_id")
+            t_name = templates.get(t_id, {}).get("display_name") if t_id else None
+            
+            name = ""
+            if i["type"] == "global":
+                name = "Глобальні інструкції"
+            elif i["type"] == "special":
+                name = f"Інструкції для {t_name}" if t_name else "Спеціальні інструкції"
+            else:
+                name = "Мій стиль написання"
+
+            cat = i.get("created_at", "")[:10]
+            is_act = bool(i["is_active"])
+            
+            can_pin = True
+            if not is_act and (i["type"], t_id) in active_categories:
+                can_pin = False
+            
+            res.append({
+                "id": i["id"],
+                "name": name,
+                "type": i["type"],
+                "attached_to": t_name,
+                "is_active": is_act,
+                "can_pin": can_pin,
+                "created_at": cat,
+                "content": i.get("content", "")
+            })
+            
+        def _sort_key(x):
+            is_global = 0 if x["type"] == "global" else 1
+            is_pinned = 0 if x["is_active"] else 1
+            type_prio = {"global": 0, "special": 1, "user_created": 2}.get(x["type"], 99)
+            return (is_global, is_pinned, type_prio, x["name"])
+            
+        res.sort(key=_sort_key)
+        
+        return res
+
+    @pyqtSlot(result=str)
     def getInstructions(self):
-        return json.dumps(self._instructions, ensure_ascii=False)
+        return json.dumps(self._fetch_instructions(), ensure_ascii=False)
 
     @pyqtSlot(str, result=str)
     def getInstructionsFiltered(self, type_filter: str):
+        instructions = self._fetch_instructions()
         if type_filter == "all":
-            data = self._instructions
+            data = instructions
         elif type_filter == "global":
-            data = [i for i in self._instructions if i["type"] == "global"]
+            data = [i for i in instructions if i["type"] == "global"]
         elif type_filter == "special":
-            data = [i for i in self._instructions if i["type"] == "special"]
+            data = [i for i in instructions if i["type"] == "special"]
         elif type_filter == "user_created":
-            data = [i for i in self._instructions if i["type"] == "user_created"]
+            data = [i for i in instructions if i["type"] == "user_created"]
         elif type_filter == "unattached":
-            data = [i for i in self._instructions if i["attached_to"] is None]
+            data = [i for i in instructions if i.get("attached_to") is None]
         else:
-            data = self._instructions
+            data = instructions
         return json.dumps(data, ensure_ascii=False)
+
+    @pyqtSlot(str, bool)
+    def toggleInstructionStatus(self, inst_id: str, is_active: bool):
+        self._init_db()
+        if not is_active:
+            self._repo.instructions.deactivate(inst_id)
+        else:
+            inst = self._repo.instructions.get(inst_id)
+            if inst:
+                template_id = inst["template_id"]
+                type_ = inst["type"]
+                with self._db.transaction():
+                    if template_id is None:
+                        self._db.conn.execute("UPDATE instructions SET is_active = 0 WHERE type = ? AND template_id IS NULL AND is_active = 1", (type_,))
+                    else:
+                        self._db.conn.execute("UPDATE instructions SET is_active = 0 WHERE type = ? AND template_id = ? AND is_active = 1", (type_, template_id))
+                    self._db.conn.execute("UPDATE instructions SET is_active = 1 WHERE id = ?", (inst_id,))
+        self.instructionsChanged.emit()
+
+    @pyqtSlot(str, str, str)
+    def createInstruction(self, type_: str, template_id: str, content: str):
+        self._init_db()
+        self._repo.instructions.save_new_version(
+            type_=type_,
+            content=content,
+            template_id=template_id if template_id else None
+        )
+        self.instructionsChanged.emit()
+
+    @pyqtSlot(str)
+    def deleteInstruction(self, inst_id: str):
+        self._init_db()
+        inst = self._repo.instructions.get(inst_id)
+        if inst:
+            type_ = inst["type"]
+            template_id = inst["template_id"]
+            if type_ == "global":
+                return # Cannot delete global
+            with self._db.transaction():
+                if template_id is None:
+                    self._db.conn.execute("DELETE FROM instructions WHERE type = ? AND template_id IS NULL", (type_,))
+                else:
+                    self._db.conn.execute("DELETE FROM instructions WHERE type = ? AND template_id = ?", (type_, template_id))
+        self.instructionsChanged.emit()
 
     @pyqtSlot(str)
     def navigate(self, screen: str):
@@ -438,30 +730,34 @@ class AppBridge(QObject):
             else:
                 meta = f"{size_bytes / (1024 * 1024):.1f} МБ"
 
-            # Dummy symbol calculation
-            if ext in ['.txt', '.md', '.json', '.xml', '.csv']:
-                symbols = size_bytes
-            else:
-                symbols = min(size_bytes // 10, 180000)
+            import random
+            import string
+            import subprocess
+
+            rand_chars = ''.join(random.choices(string.ascii_letters + string.digits, k=5))
+            txt_filename = f"{filename}_{rand_chars}.txt"
+            attached_dir = os.path.join(transit_dir, "attached")
+            os.makedirs(attached_dir, exist_ok=True)
+            txt_path = os.path.join(attached_dir, txt_filename)
 
             # Add to UI as processing
             file_record = {
                 "name": filename,
                 "meta": meta,
-                "path": f"transit/{filename}",
-                "symbols": symbols,
+                "path": local_path,
+                "txt_filename": txt_filename,
+                "symbols": 0,
                 "status": "processing"
             }
             self._uploaded_files.append(file_record)
             self.filesUpdated.emit(json.dumps(self._uploaded_files, ensure_ascii=False))
 
-            # Simulate processing delay
-            time.sleep(2)
-
-            def update_status(status_str):
+            def update_status(status_str, sym_count=0):
                 for f in self._uploaded_files:
                     if f["name"] == filename:
                         f["status"] = status_str
+                        if sym_count > 0:
+                            f["symbols"] = sym_count
                         break
 
             # 50MB limit check
@@ -471,26 +767,54 @@ class AppBridge(QObject):
                 self.fileWarning.emit(f"Файл перевищує ліміт у 50 МБ: {filename}")
                 continue
 
-            # Readability check
-            try:
-                with open(local_path, 'rb') as f:
-                    f.read(1024)
-            except Exception as e:
-                print(f"File {filename} is not readable: {e}")
-                update_status("error")
-                self.filesUpdated.emit(json.dumps(self._uploaded_files, ensure_ascii=False))
-                self.fileWarning.emit(f"Неможливо прочитати файл (пошкоджений або заблокований): {filename}")
-                continue
+            # Convert using backend scripts
+            converter_script = None
+            if ext == '.pdf': converter_script = 'pdf2txt.py'
+            elif ext == '.docx': converter_script = 'docx2txt.py'
+            elif ext == '.pptx': converter_script = 'pptx2txt.py'
+            elif ext in ['.png', '.jpg', '.jpeg']: converter_script = 'image2txt.py'
+            
+            symbols = 0
+            success = False
+            
+            if converter_script:
+                script_path = os.path.join(app_dir, "backend", converter_script)
+                try:
+                    subprocess.run(
+                        [sys.executable, script_path, "-o", txt_path, local_path],
+                        check=True,
+                        capture_output=True,
+                        text=True
+                    )
+                    success = True
+                except subprocess.CalledProcessError as e:
+                    print(f"Error converting {filename}: {e.stderr}")
+                    update_status("error")
+                    self.filesUpdated.emit(json.dumps(self._uploaded_files, ensure_ascii=False))
+                    self.fileWarning.emit(f"Помилка конвертації файлу: {filename}")
+                    continue
+            else:
+                try:
+                    with open(local_path, "r", encoding="utf-8", errors="replace") as f_in, \
+                         open(txt_path, "w", encoding="utf-8") as f_out:
+                         f_out.write(f_in.read())
+                    success = True
+                except Exception as e:
+                    print(f"Error reading text file {filename}: {e}")
+                    update_status("error")
+                    self.filesUpdated.emit(json.dumps(self._uploaded_files, ensure_ascii=False))
+                    self.fileWarning.emit(f"Помилка читання файлу: {filename}")
+                    continue
 
-            dest_path = os.path.join(transit_dir, filename)
-            try:
-                shutil.copy2(local_path, dest_path)
-                update_status("done")
-            except Exception as e:
-                print(f"Error copying file {filename}: {e}")
-                self._uploaded_files = [f for f in self._uploaded_files if f["name"] != filename]
+            if success and os.path.exists(txt_path):
+                try:
+                    with open(txt_path, "r", encoding="utf-8") as f:
+                        symbols = len(f.read())
+                except Exception:
+                    symbols = 0
+                
+                update_status("done", symbols)
                 self.filesUpdated.emit(json.dumps(self._uploaded_files, ensure_ascii=False))
-                self.fileWarning.emit(f"Помилка копіювання файлу: {filename}")
                 continue
 
             loaded_names.add(filename)
@@ -506,6 +830,83 @@ class AppBridge(QObject):
             self.fileWarning.emit(" | ".join(warnings))
 
         self.filesUpdated.emit(json.dumps(self._uploaded_files, ensure_ascii=False))
+
+    @pyqtSlot(result=str)
+    def getSessionResult(self):
+        self._init_db()
+        if not self._active_session_id:
+            return self.getMockResult()
+        session = self._repo.sessions.get(self._active_session_id)
+        if not session:
+            return self.getMockResult()
+
+        token_usage = json.loads(session.get("token_usage") or "{}")
+        duration_ms = session.get("duration_ms", 0)
+        snapshot = json.loads(session.get("input_snapshot") or "{}")
+        val = json.loads(session.get("validation_result") or "{}")
+        
+        data = {
+            "session_name": session.get("name"),
+            "status": session.get("status"),
+            "error_stage": session.get("error_stage"),
+            "error_message": session.get("error_message"),
+            "duration": f"{duration_ms} ms" if duration_ms else "",
+            "image_count": session.get("image_count", 0),
+            "word_count": val.get("word_count", 0),
+            "word_count_min": val.get("word_count_target_min", 0),
+            "word_count_max": val.get("word_count_target_max", 0),
+            "input_tokens": str(token_usage.get("text_model", {}).get("input_tokens", 0)),
+            "output_tokens": str(token_usage.get("text_model", {}).get("output_tokens", 0)),
+            "cached_tokens": str(token_usage.get("text_model", {}).get("cached_tokens", 0)),
+            "template": snapshot.get("template_slug", ""),
+            "hardness": snapshot.get("hardness", ""),
+            "image_mode": snapshot.get("image_mode", ""),
+            "warnings": val.get("warnings", []),
+            "docx_path": session.get("docx_output", ""),
+            "pdf_path": session.get("pdf_output", ""),
+        }
+        return json.dumps(data, ensure_ascii=False)
+
+    @pyqtSlot(result=str)
+    def getSessionFilledPy(self):
+        self._init_db()
+        if not self._active_session_id:
+            return self.getMockFilledPy()
+        session = self._repo.sessions.get(self._active_session_id)
+        if not session:
+            return self.getMockFilledPy()
+        path = session.get("filled_py_path")
+        if not path:
+            return ""
+        full_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), path)
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except:
+            return "Помилка читання файлу: " + full_path
+
+    @pyqtSlot(str)
+    def downloadFile(self, rel_path: str):
+        if not rel_path:
+            return
+        full_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), rel_path)
+        if not os.path.exists(full_path):
+            print("File not found:", full_path)
+            return
+        
+        file_name = os.path.basename(full_path)
+        
+        # Open save dialog
+        default_dir = os.path.expanduser("~\\Downloads")
+        save_path, _ = QFileDialog.getSaveFileName(
+            None, "Зберегти файл", 
+            os.path.join(default_dir, file_name)
+        )
+        if save_path:
+            try:
+                shutil.copy2(full_path, save_path)
+            except Exception as e:
+                print(f"Error copying file {full_path} to {save_path}: {e}")
 
     @pyqtSlot(str)
     def deleteFile(self, filename: str):
@@ -660,6 +1061,7 @@ class AppBridge(QObject):
         src_g = app_instructions_dir / "global_instructions.md"
         if src_g.is_file():
             shutil.copy2(src_g, snap_dir / "general_instructions.md")
+            session_ctx["input_snapshot"]["global_instructions_hash"] = self._hash_file(src_g)
 
         # 3) template instructions
         src_ti = app_template_ins_dir / f"{template_id}_fill.md"
@@ -671,6 +1073,7 @@ class AppBridge(QObject):
 
         # 4) template params (gap_values, schema-aware)
         gap_values = payload.get("gap_values") or self._fallback_gap_values(payload)
+        session_ctx["input_snapshot"]["gap_values"] = gap_values
         params_doc = {"gap_values": gap_values}
         (snap_dir / f"{template_id}_params.json").write_text(
             json.dumps(params_doc, ensure_ascii=False, indent=2),
@@ -682,6 +1085,7 @@ class AppBridge(QObject):
             us = app_instructions_dir / "user_style.md"
             if us.is_file() and us.read_text(encoding="utf-8").strip():
                 shutil.copy2(us, snap_dir / "user_style.md")
+                session_ctx["input_snapshot"]["style_hash"] = self._hash_file(us)
 
         # 6) uploaded files: move/copy from app/transit/ into attached/
         uploaded = payload.get("uploaded_files") or []
@@ -694,14 +1098,21 @@ class AppBridge(QObject):
             if f_info.get("status") not in (None, "done"):
                 continue
             fname = f_info.get("name")
+            txt_filename = f_info.get("txt_filename")
             if not fname:
                 continue
-            src = app_transit_dir / fname
+                
+            if txt_filename:
+                src = app_transit_dir / "attached" / txt_filename
+            else:
+                src = app_transit_dir / fname
+                
             if not src.is_file():
                 # Try with the file_hash as the stored name.
                 fh = f_info.get("file_hash") or fname
                 src = app_transit_dir / fh
             if not src.is_file():
+                print(f"[bridge] warning: could not find source file for {fname} at {src}")
                 continue
             file_hash = f_info.get("file_hash") or self._hash_file(src)
             dest = attached_dir / f"{file_hash}.txt"
@@ -842,76 +1253,31 @@ class AppBridge(QObject):
                 break
         self.sessionsChanged.emit()
 
-    @pyqtSlot(str, str)
-    def saveSessionJson(self, payload_str, file_name):
-        import json
-        import os
-        import shutil
-        from datetime import datetime
-        
-        try:
-            payload = json.loads(payload_str)
-            payload["saved_at"] = datetime.now().isoformat()
-            
-            sessions_dir = os.path.join(os.path.dirname(__file__), "db")
-            
-            safe_name = "".join(c for c in file_name if c.isalnum() or c in " -_").strip()
-            if not safe_name:
-                safe_name = "session"
-                
-            session_folder = os.path.join(sessions_dir, safe_name)
-            os.makedirs(session_folder, exist_ok=True)
-            
-            transit_dir = os.path.join(os.path.dirname(__file__), "transit")
-            local_file_paths = []
-            
-            if "uploadedFiles" in payload and isinstance(payload["uploadedFiles"], list):
-                for f_info in payload["uploadedFiles"]:
-                    fname = f_info.get("name")
-                    if fname:
-                        src_path = os.path.join(transit_dir, fname)
-                        if os.path.exists(src_path):
-                            dst_path = os.path.join(session_folder, fname)
-                            try:
-                                shutil.move(src_path, dst_path)
-                                local_file_paths.append(os.path.abspath(dst_path).replace("\\\\", "/"))
-                            except Exception as e:
-                                print(f"[bridge] Error moving file {fname}: {e}")
-            
-            payload["localFilePaths"] = local_file_paths
-            
-            file_path = os.path.join(session_folder, f"{safe_name}.json")
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=4, ensure_ascii=False)
-                
-            print(f"[bridge] Saved session to folder: {session_folder}")
-        except Exception as e:
-            print(f"[bridge] Error saving session JSON: {e}")
-
-    @pyqtSlot(str, str, str, str, str, str)
-    def startGeneration(self, session_name, template_id, length, hardness, image_mode, goal):
+    @pyqtSlot(str)
+    def startGeneration(self, payload_str: str):
         """Start a REAL pipeline generation.
-
-        Workflow:
-          1. Allocate a session id.
-          2. Build a transit payload from the cached sessionPayloadJson +
-             this call's per-generation arguments.
-          3. Materialize a transit snapshot under app/debug/transit/<id>/
-             (session_context.json, general_instructions.md,
-             <template>_fill.md, <template>_params.json, library_files.json,
-             context.json, attached/<hash>.txt).
-          4. Spawn a daemon thread that runs PipelineRunner (stages 1, 2, 5).
-          5. The thread emits QML-compatible pipeline signals via
-             BridgePipelineAdapter.
         """
+        import json
+        payload = json.loads(payload_str)
+        
+        session_name = payload.get("documentName", "")
+        template_id = payload.get("template_id", "lab1")
+        length = payload.get("lengthMode", "middle")
+        hardness = "university_1"
+        image_mode = payload.get("image_mode", "none")
+        goal = payload.get("documentGoal", "")
+        include_user_style = payload.get("userStyleId") not in [None, "", "none"]
+
+        self._init_db()
+
         # 1. New session in processing state.
         new_id = str(uuid.uuid4())[:8]
         new_session = {
             "id": new_id,
             "name": session_name or "Нова сесія",
             "status": "processing",
-            "template": template_id or "lab1",
-            "hardness": hardness or "university_1",
+            "template": template_id,
+            "hardness": hardness,
             "duration": "—",
             "created_at": datetime.now().strftime("%d %b %Y, %H:%M"),
         }
@@ -920,13 +1286,16 @@ class AppBridge(QObject):
         self._active_session_id = new_id
 
         # 2. Payload.
-        payload = self._build_pipeline_payload(
+        pipeline_payload = self._build_pipeline_payload(
             session_name, template_id, length, hardness, image_mode, goal
         )
+        pipeline_payload["uploaded_files"] = payload.get("uploadedFiles", [])
+        pipeline_payload["user_input"] = payload.get("sessionHints", "")
+        pipeline_payload["include_user_style"] = include_user_style
 
         # 3. Snapshot.
         try:
-            snap_dir = self._materialize_transit_snapshot(new_id, payload)
+            snap_dir = self._materialize_transit_snapshot(new_id, pipeline_payload)
         except Exception as exc:  # noqa: BLE001
             self.pipelineError.emit("stage1", f"snapshot failed: {exc}")
             for s in self._sessions:
@@ -935,6 +1304,21 @@ class AppBridge(QObject):
                     break
             self.sessionsChanged.emit()
             return
+            
+        # DB insertion
+        try:
+            from app.backend.db.repositories.sessions import SessionCreate
+            session_create = SessionCreate(
+                id=new_id,
+                name=session_name or "Нова сесія",
+                status="processing",
+                template_id=template_id,
+                hardness=hardness,
+                input_snapshot=json.dumps(pipeline_payload, ensure_ascii=False)
+            )
+            self._repo.sessions.create(session_create)
+        except Exception as e:
+            print(f"[bridge] Warning: DB insertion failed: {e}")
 
         # 4. Background thread + adapter.
         self._pipeline_adapter = BridgePipelineAdapter(self)

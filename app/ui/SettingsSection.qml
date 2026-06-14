@@ -8,7 +8,7 @@ Rectangle {
     radius: theme.radiusLG
     color: theme.surface1
     border.color: theme.borderSubtle; border.width: 1
-    height: sectionCol.implicitHeight + theme.sp5 * 2
+    implicitHeight: sectionCol.implicitHeight + theme.sp5 * 2
     clip: true
 
     required property var theme
@@ -31,7 +31,7 @@ Rectangle {
         Item {
             id: contentPlaceholder
             Layout.fillWidth: true
-            height: children.length > 0 ? children[0].implicitHeight : 0
+            implicitHeight: children.length > 0 ? children[0].implicitHeight : 0
         }
     }
 }

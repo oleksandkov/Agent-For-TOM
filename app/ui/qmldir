@@ -1,5 +1,3 @@
-module ui
-
 # Components (shared)
 Sidebar           1.0 Sidebar.qml
 NavItem           1.0 NavItem.qml
@@ -18,8 +16,10 @@ FormField         1.0 FormField.qml
 FileRow           1.0 FileRow.qml
 StatCard          1.0 StatCard.qml
 StatsRow          1.0 StatsRow.qml
+Accordion          1.0 Accordion.qml
 SettingsSection   1.0 SettingsSection.qml
 SettingsField     1.0 SettingsField.qml
+ToastManager      1.0 ToastManager.qml
 
 # Session screen components
 SessionTableRow   1.0 SessionTableRow.qml
@@ -35,3 +35,4 @@ ResultScreen      1.0 ResultScreen.qml
 TemplatesScreen   1.0 TemplatesScreen.qml
 InstructionsScreen 1.0 InstructionsScreen.qml
 SettingsScreen    1.0 SettingsScreen.qml
+StorageScreen     1.0 StorageScreen.qml

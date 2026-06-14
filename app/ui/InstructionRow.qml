@@ -14,6 +14,13 @@ Rectangle {
     property bool isLast: false
     property bool hovered: false
 
+    MouseArea {
+        anchors.fill: parent; hoverEnabled: true
+        onEntered: root.hovered = true
+        onExited:  root.hovered = false
+        z: -1
+    }
+
     Rectangle {
         visible: !isLast
         anchors.bottom: parent.bottom
@@ -24,6 +31,8 @@ Rectangle {
     RowLayout {
         anchors { fill: parent; leftMargin: theme.sp5; rightMargin: theme.sp5 }
         spacing: theme.sp4
+
+
 
         // Name
         Text {
@@ -68,16 +77,34 @@ Rectangle {
 
         // Actions
         RowLayout {
-            spacing: theme.sp1; width: 100
+            spacing: theme.sp1; width: 260
+            
+            AppButton { 
+                theme: root.theme; 
+                label: modelData.is_active ? "Відкріпити" : "Закріпити"; 
+                variant: modelData.is_active ? "ghost" : "secondary"; 
+                visible: modelData.is_active || (modelData.can_pin !== undefined ? modelData.can_pin : true)
+                height: 30; 
+                onClicked: {
+                    bridge.toggleInstructionStatus(modelData.id, !modelData.is_active)
+                }
+            }
+            
             AppButton { theme: root.theme; label: "Редагувати"; variant: "ghost"; height: 30 }
+            AppButton { 
+                theme: root.theme; 
+                label: "Видалити"; 
+                variant: "danger"; 
+                height: 30; 
+                visible: modelData.type !== "global"
+                onClicked: {
+                    // Call a bridge method to delete instruction
+                    bridge.deleteInstruction(modelData.id)
+                }
+            }
         }
     }
 
-    MouseArea {
-        anchors.fill: parent; hoverEnabled: true
-        onEntered: root.hovered = true
-        onExited:  root.hovered = false
-    }
 
     function typeLabel(t) {
         switch(t) {

@@ -141,6 +141,14 @@ Rectangle {
                     text: "Дублювати"
                     onTriggered: root.duplicateSession()
                 }
+                MenuItem {
+                    text: "Відновити"
+                    onTriggered: {
+                        if (typeof bridge.restoreSession === "function") {
+                            bridge.restoreSession(modelData.id)
+                        }
+                    }
+                }
                 MenuSeparator {}
                 MenuItem {
                     text: "Видалити"
