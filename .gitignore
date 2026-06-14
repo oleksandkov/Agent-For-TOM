@@ -238,5 +238,5 @@ __marimo__/
 */backendPlan/*
 
 cache/
-agent.db
+# agent.db
 app/config/.db_key
