@@ -57,7 +57,9 @@ from app.backend.pipeline.utils import (
     HF_REQUEST_TIMEOUT_SECONDS,
     SANDBOX_TIMEOUT_SECONDS,
     Timer,
+    count_words_in_docx,
     ensure_dir,
+    get_word_count_target,
     now_iso,
     sha256_hex,
 )
@@ -184,6 +186,7 @@ def _build_index(
     docx_path: Path | None,
     pdf_path: Path | None,
     synthesis: SynthesisResult,
+    word_count: int = 0,
 ) -> dict[str, Any]:
     timings = {k: round(v, 1) for k, v in ctx.timings.items()}
     token_usage = {
@@ -192,6 +195,15 @@ def _build_index(
         "source": synthesis.source,
         "model": synthesis.model,
     }
+    # Pull the target range out of the input snapshot (set by the bridge
+    # from the chosen "length" value) so the result screen can show
+    # "X / min–max".
+    length_value = ""
+    try:
+        length_value = str(ctx.input_snapshot.get("length", "") or "")
+    except Exception:
+        length_value = ""
+    target_min, target_max = get_word_count_target(length_value)
     return {
         "session_id": ctx.session_id,
         "session_name": ctx.session_name,
@@ -207,6 +219,9 @@ def _build_index(
         "warnings": list(ctx.warnings),
         "errors": list(ctx.errors),
         "token_usage": token_usage,
+        "word_count": int(word_count or 0),
+        "word_count_target_min": int(target_min),
+        "word_count_target_max": int(target_max),
         "artifacts": {
             "filled_py": str(filled_py_path),
             "docx": str(docx_path) if docx_path else None,
@@ -432,6 +447,36 @@ def run_stage5(
 
         result.metrics["images_generated"] = 0  # image gen out of scope
 
+        # E+. Word count of the produced DOCX, written to both
+        # stage metrics and the top-level index so the result screen
+        # can display it. Best-effort: never crash the pipeline.
+        word_count = 0
+        if docx_path.is_file():
+            try:
+                word_count = int(count_words_in_docx(docx_path))
+            except Exception:
+                word_count = 0
+        result.metrics["word_count"] = word_count
+        length_value = ""
+        try:
+            length_value = str(ctx.input_snapshot.get("length", "") or "")
+        except Exception:
+            length_value = ""
+        target_min, target_max = get_word_count_target(length_value)
+        result.metrics["word_count_target_min"] = target_min
+        result.metrics["word_count_target_max"] = target_max
+        if word_count and target_min and target_max:
+            if word_count < target_min:
+                result.warnings.append(
+                    f"Word count {word_count} is below the target range "
+                    f"({target_min}–{target_max})."
+                )
+            elif word_count > target_max:
+                result.warnings.append(
+                    f"Word count {word_count} is above the target range "
+                    f"({target_min}–{target_max})."
+                )
+
         # F. Write index.json
         all_stages: list[StageResult] = list(prior_stages) + [result]
         index = _build_index(
@@ -439,6 +484,7 @@ def run_stage5(
             docx_path if docx_path.is_file() else None,
             pdf_path if pdf_path.is_file() else None,
             synthesis,
+            word_count=word_count,
         )
         (output_dir / "index.json").write_text(
             json.dumps(index, ensure_ascii=False, indent=2),

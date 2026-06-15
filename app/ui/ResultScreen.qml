@@ -142,9 +142,13 @@ Rectangle {
                                 Layout.fillWidth: true; height: 8; radius: 4; color: theme.surface3
                                 Rectangle {
                                     height: parent.height; radius: parent.radius
-                                    width: parent.width * Math.min(
-                                        (resultData.word_count - resultData.word_count_min) /
-                                        (resultData.word_count_max - resultData.word_count_min), 1.0)
+                                    width: {
+                                        var wc = resultData.word_count || 0
+                                        var lo = resultData.word_count_min || 0
+                                        var hi = resultData.word_count_max || 0
+                                        if (hi <= lo) return wc > 0 ? parent.width : 0
+                                        return parent.width * Math.min(Math.max((wc - lo) / (hi - lo), 0), 1.0)
+                                    }
                                     color: theme.accent
                                     Behavior on width { NumberAnimation { duration: 600; easing.type: Easing.OutCubic } }
                                 }

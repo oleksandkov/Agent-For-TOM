@@ -10,6 +10,7 @@ import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 # pyrefly: ignore [missing-import]
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, pyqtProperty, QTimer, QUrl
@@ -33,6 +34,22 @@ from app.backend.pipeline.bridge_adapter import (  # noqa: E402
 
 
 # ─── Mock data ───────────────────────────────────────────────────────────────
+
+
+def _index_stage_metric(index: dict[str, Any], stage_prefix: str, metric_key: str) -> Any:
+    """Return ``index['stages'][...].metrics[metric_key]`` for the first
+    stage whose name starts with ``stage_prefix``. Returns 0 / None when
+    the index has no stages or the metric is missing.
+    """
+    try:
+        for stage in index.get("stages", []) or []:
+            if str(stage.get("name", "")).startswith(stage_prefix):
+                return stage.get("metrics", {}).get(metric_key, 0)
+    except Exception:
+        pass
+    return 0
+
+
 
 MOCK_SESSIONS = [
     {
@@ -128,6 +145,10 @@ class AppBridge(QObject):
     sessionPayloadJsonChanged = pyqtSignal()
     supportAttachFilesChanged = pyqtSignal()
     enableCachingChanged = pyqtSignal()
+    documentsVisibilityChanged = pyqtSignal()
+    storageVisibilityChanged = pyqtSignal()
+    templatesVisibilityChanged = pyqtSignal()
+    instructionsVisibilityChanged = pyqtSignal()
 
     # Pipeline signals
     pipelineStarted = pyqtSignal()
@@ -149,6 +170,15 @@ class AppBridge(QObject):
         self._pipeline_timer = None
         self._pipeline_step = 0
         self._uploaded_files = []
+        # Load .env eagerly so visibility / feature flags read by the
+        # pyqtProperty accessors below reflect the user's config the
+        # very first time QML evaluates them (otherwise `get_env(...)`
+        # would see an empty os.environ and default to True).
+        from app.backend.pipeline import load_env as _load_env
+        try:
+            _load_env()
+        except Exception:
+            pass
         self._prefs_file = os.path.join(os.path.dirname(__file__), "config", "user_preferences.json")
         self._transit_file = os.path.join(os.path.dirname(__file__), "transit", "userInput.json")
         self._is_dark_theme = False
@@ -393,6 +423,26 @@ class AppBridge(QObject):
     def enableCaching(self):
         from app.backend.pipeline.utils import get_enable_caching
         return get_enable_caching()
+
+    @pyqtProperty(bool, notify=documentsVisibilityChanged)
+    def documentsVisibility(self):
+        from app.backend.pipeline.utils import get_documents_visibility
+        return get_documents_visibility()
+
+    @pyqtProperty(bool, notify=storageVisibilityChanged)
+    def storageVisibility(self):
+        from app.backend.pipeline.utils import get_storage_visibility
+        return get_storage_visibility()
+
+    @pyqtProperty(bool, notify=templatesVisibilityChanged)
+    def templatesVisibility(self):
+        from app.backend.pipeline.utils import get_templates_visibility
+        return get_templates_visibility()
+
+    @pyqtProperty(bool, notify=instructionsVisibilityChanged)
+    def instructionsVisibility(self):
+        from app.backend.pipeline.utils import get_instructions_visibility
+        return get_instructions_visibility()
 
     # ─── Slots (QML → Python) ─────────────────────────────────────────────────
 
@@ -913,9 +963,44 @@ class AppBridge(QObject):
         )
 
         # word_count: from validation_result if present, else from index
-        word_count = val.get("word_count", 0) or output_index.get("word_count", 0)
-        word_count_min = val.get("word_count_target_min", 0)
-        word_count_max = val.get("word_count_target_max", 0)
+        word_count = (
+            val.get("word_count", 0)
+            or output_index.get("word_count", 0)
+            or _index_stage_metric(output_index, "stage5", "word_count")
+            or 0
+        )
+        # target min/max — pull from index, then validation, then
+        # derive from the input snapshot's "length" field so the bar
+        # always has a sensible value to render.
+        word_count_min = (
+            output_index.get("word_count_target_min", 0)
+            or val.get("word_count_target_min", 0)
+            or _index_stage_metric(output_index, "stage5", "word_count_target_min")
+            or 0
+        )
+        word_count_max = (
+            output_index.get("word_count_target_max", 0)
+            or val.get("word_count_target_max", 0)
+            or _index_stage_metric(output_index, "stage5", "word_count_target_max")
+            or 0
+        )
+        if (not word_count_min or not word_count_max) and snapshot:
+            try:
+                from app.backend.pipeline.utils import get_word_count_target
+                target_min, target_max = get_word_count_target(snapshot.get("length", ""))
+                word_count_min = word_count_min or target_min
+                word_count_max = word_count_max or target_max
+            except Exception:
+                pass
+
+        # image_count: prefer the live index/stage5 value (newer
+        # pipeline writes 0), fall back to the session DB column.
+        image_count = (
+            _index_stage_metric(output_index, "stage5", "images_generated")
+            or output_index.get("image_count", 0)
+            or session.get("image_count", 0)
+            or 0
+        )
 
         # Duration: prefer the LLM call duration for display, fall back to total pipeline duration
         display_duration = f"{int(llm_duration_ms)} ms" if llm_duration_ms else (f"{duration_ms} ms" if duration_ms else "")
@@ -926,7 +1011,7 @@ class AppBridge(QObject):
             "error_stage": session.get("error_stage"),
             "error_message": session.get("error_message"),
             "duration": display_duration,
-            "image_count": session.get("image_count", 0),
+            "image_count": image_count,
             "word_count": word_count,
             "word_count_min": word_count_min,
             "word_count_max": word_count_max,
@@ -1053,6 +1138,15 @@ class AppBridge(QObject):
         }
         canonical_image_mode = image_mode_map.get(image_mode, image_mode or "none")
 
+        # Word-count target range for the chosen length. We expose both
+        # fields in the snapshot so downstream readers (orchestrator
+        # index.json, result screen) always know the expected range.
+        try:
+            from app.backend.pipeline.utils import get_word_count_target
+            target_min, target_max = get_word_count_target(canonical_length)
+        except Exception:
+            target_min, target_max = 1500, 2100
+
         return {
             "template_id": template_id or cached.get("template_id") or "lab1",
             "name": session_name or cached.get("name") or "Нова сесія",
@@ -1061,6 +1155,8 @@ class AppBridge(QObject):
             "length": canonical_length,
             "hardness": canonical_hardness,
             "image_mode": canonical_image_mode,
+            "word_count_min": target_min,
+            "word_count_max": target_max,
             "include_special_instructions": bool(
                 cached.get("includeSpecialInstructions") if cached.get("includeSpecialInstructions") is not None
                 else cached.get("include_special_instructions") if cached.get("include_special_instructions") is not None

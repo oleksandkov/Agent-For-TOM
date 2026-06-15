@@ -173,6 +173,107 @@ def get_allow_local_llm() -> bool:
     return val in ("true", "1", "yes")
 
 
+def _visibility(env_value: str | None, default: bool = True) -> bool:
+    raw = (env_value or "").strip().lower()
+    if raw == "":
+        return default
+    return raw in ("true", "1", "yes", "on")
+
+
+def get_documents_visibility() -> bool:
+    """Whether the Documents page is visible in the sidebar/UI."""
+    return _visibility(get_env("DOCUMENTS_VISIBILITY"), default=True)
+
+
+def get_storage_visibility() -> bool:
+    """Whether the Storage page is visible in the sidebar/UI."""
+    return _visibility(get_env("STORAGE_VISIBILITY"), default=True)
+
+
+def get_templates_visibility() -> bool:
+    """Whether the Templates page is visible in the sidebar/UI."""
+    return _visibility(get_env("TEMPLATES_VISIBILITY"), default=True)
+
+
+def get_instructions_visibility() -> bool:
+    """Whether the Instructions page is visible in the sidebar/UI."""
+    return _visibility(get_env("INSTRUCTIONS_VISIBILITY"), default=True)
+
+
+# Word-count target ranges per canonical "length" value. The numbers
+# match what the global LLM instructions aim for (≈1700–2500 words for
+# a typical university lab report).
+WORD_COUNT_TARGETS: dict[str, tuple[int, int]] = {
+    "short": (900, 1400),
+    "middle": (1500, 2100),
+    "long": (2200, 3000),
+}
+
+
+def get_word_count_target(length: str | None) -> tuple[int, int]:
+    """Return ``(word_count_min, word_count_max)`` for a canonical length."""
+    if not length:
+        return WORD_COUNT_TARGETS["middle"]
+    return WORD_COUNT_TARGETS.get(length, WORD_COUNT_TARGETS["middle"])
+
+
+def count_words_in_text(text: str) -> int:
+    """Whitespace-delimited word count. Returns 0 for empty/None."""
+    if not text:
+        return 0
+    return len(text.split())
+
+
+def count_words_in_docx(docx_path: Path) -> int:
+    """Best-effort word count of a DOCX file.
+
+    We use ``python-docx`` if available (already a project dep) and
+    fall back to extracting the raw text with ``zipfile`` + ``xml`` so
+    this never crashes the pipeline.
+    """
+    try:
+        from docx import Document  # python-docx
+    except Exception:
+        Document = None  # type: ignore[assignment]
+
+    if Document is not None:
+        try:
+            doc = Document(str(docx_path))
+            pieces: list[str] = []
+            for p in doc.paragraphs:
+                pieces.append(p.text)
+            for tbl in doc.tables:
+                for row in tbl.rows:
+                    for cell in row.cells:
+                        pieces.append(cell.text)
+            return count_words_in_text("\n".join(pieces))
+        except Exception:
+            pass
+
+    # Fallback: pull word/document.xml out of the zip and count words
+    # from the visible text nodes. This is best-effort — formatting and
+    # tables are skipped — but it's better than zero.
+    try:
+        import zipfile
+        import re
+        from xml.etree import ElementTree as ET
+
+        with zipfile.ZipFile(str(docx_path)) as zf:
+            try:
+                xml_bytes = zf.read("word/document.xml")
+            except KeyError:
+                return 0
+        root = ET.fromstring(xml_bytes)
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        texts: list[str] = []
+        for t in root.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t"):
+            if t.text:
+                texts.append(t.text)
+        return len(re.findall(r"\S+", "\n".join(texts)))
+    except Exception:
+        return 0
+
+
 def sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 

@@ -234,16 +234,22 @@ Rectangle {
                         spacing: 0
 
                         Repeater {
-                            model: 6
-                            delegate: PipelineStepRow {
+                            model: root.stepCount
+                            delegate: Item {
+                                required property int index
                                 readonly property int delegateIndex: index
-                                theme: root.theme
-                                stepIndex: delegateIndex
-                                stepName: root.stepNames[delegateIndex]
-                                stepDetail: root.stepDetails[delegateIndex]
-                                stepState: root.stepStates[delegateIndex]
-                                isLast: delegateIndex === 5
-                                Layout.fillWidth: true
+                                implicitHeight: pipelineRow.implicitHeight
+                                implicitWidth: pipelineRow.implicitWidth
+                                PipelineStepRow {
+                                    id: pipelineRow
+                                    anchors { left: parent.left; right: parent.right }
+                                    theme: root.theme
+                                    stepIndex: delegateIndex
+                                    stepName: root.stepNames[delegateIndex]
+                                    stepDetail: root.stepDetails[delegateIndex]
+                                    stepState: root.stepStates[delegateIndex]
+                                    isLast: delegateIndex === 5
+                                }
                             }
                         }
                     }
@@ -369,7 +375,7 @@ Rectangle {
 
                     AppButton {
                         theme: root.theme
-                        label: "Переглянути результат →"
+                        label: "Далі →"
                         variant: "primary"
                         visible: root.isFinished
                         onClicked: root.navigate("result")

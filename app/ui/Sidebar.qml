@@ -77,6 +77,7 @@ Rectangle {
             spacing: 2
 
             NavItem {
+                visible: bridge ? bridge.documentsVisibility : true
                 theme: root.theme
                 label: "Документи"
                 screen: "documents"
@@ -95,6 +96,7 @@ Rectangle {
                 onNavigate: (s) => root.navigate(s)
             }
             NavItem {
+                visible: bridge ? bridge.storageVisibility : true
                 theme: root.theme
                 label: "Сховище"
                 screen: "storage"
@@ -104,6 +106,7 @@ Rectangle {
                 onNavigate: (s) => root.navigate(s)
             }
             NavItem {
+                visible: bridge ? bridge.templatesVisibility : true
                 theme: root.theme
                 label: "Шаблони"
                 screen: "templates"
@@ -114,6 +117,7 @@ Rectangle {
                 onNavigate: (s) => root.navigate(s)
             }
             NavItem {
+                visible: bridge ? bridge.instructionsVisibility : true
                 theme: root.theme
                 label: "Інструкції"
                 screen: "instructions"

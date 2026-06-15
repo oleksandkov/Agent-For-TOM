@@ -232,22 +232,29 @@ ApplicationWindow {
     Component.onCompleted: {
         root.requestActivate()
         root.raise()
-        
+
         applyTheme()
         applyFontSizes()
-        
+
         try {
             root.sessionPayload = JSON.parse(bridge.sessionPayloadJson || "{}")
         } catch(e) {
             root.sessionPayload = {}
         }
-        
+
+        // If the documents page is hidden by env, start on the new-document
+        // screen so the user doesn't land on a forbidden page.
+        if (bridge && !bridge.documentsVisibility && root.currentScreen === "documents") {
+            root.currentScreen = "new_document"
+            stack.replace(newDocumentComp)
+        }
+
         root.width = 1024
         root.height = 768
-        
+
         // Show windowed first to register normal geometry
         root.visible = true
-        
+
         // Then maximize after a brief delay
         restoreMaximizedTimer.start()
     }
@@ -299,6 +306,21 @@ ApplicationWindow {
     }
 
     function navigateTo(screen) {
+        // Guard: refuse to navigate to a page whose visibility is disabled
+        // by the DOCUMENTS_VISIBILITY / STORAGE_VISIBILITY / TEMPLATES_VISIBILITY /
+        // INSTRUCTIONS_VISIBILITY env vars. Fall back to the documents screen.
+        if (!bridge) {
+            // bridge not ready — allow navigation
+        } else if (screen === "documents" && !bridge.documentsVisibility) {
+            screen = "new_document"
+        } else if (screen === "storage" && !bridge.storageVisibility) {
+            screen = "new_document"
+        } else if (screen === "templates" && !bridge.templatesVisibility) {
+            screen = "new_document"
+        } else if (screen === "instructions" && !bridge.instructionsVisibility) {
+            screen = "new_document"
+        }
+
         currentScreen = screen
         switch(screen) {
             case "documents":    stack.replace(documentsComp); break
@@ -310,9 +332,9 @@ ApplicationWindow {
             case "templates":   stack.replace(templatesComp); break
             case "instructions":stack.replace(instructionsComp); break
             case "settings":    stack.replace(settingsComp); break
-            case "settings_instructions": 
+            case "settings_instructions":
                 currentScreen = "settings"
-                stack.replace(settingsComp, { scrollToInstructions: true }); 
+                stack.replace(settingsComp, { scrollToInstructions: true });
                 break
             case "about":       stack.replace(aboutComp); break
         }

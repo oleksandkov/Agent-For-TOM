@@ -60,7 +60,21 @@ def _qml_step_index(stage_name: str) -> int:
         return 0
     if stage_name in ("stage5", "stage5_output"):
         return 4  # we treat the whole synthesis+execute as "execute+compose"
-    return 0  # stage2 falls under "Text LLM (Pass 1)" for the QML UI
+    return 1  # stage2 falls under "Text LLM (Pass 1)" for the QML UI
+
+
+# Progress percentage checkpoint for each QML step. When step N starts,
+# we advance the bar to PROGRESS_FOR_STEP[N]. The last value is the
+# value at "100% completion" so we always leave 1-3% headroom until
+# the pipeline actually finishes.
+PROGRESS_FOR_STEP: dict[int, int] = {
+    0: 15,   # Конвертація файлів started
+    1: 35,   # Text LLM (Pass 1) started
+    2: 60,   # Валідація started (we don't actually run a separate stage)
+    3: 75,   # Генерація зображень started
+    4: 90,   # Виконання + Compose started
+    5: 98,   # PDF компіляція started
+}
 
 
 class BridgePipelineAdapter:
@@ -140,7 +154,12 @@ class BridgePipelineAdapter:
             return
 
         idx, name, _detail = _STEP_TABLE[_qml_step_index(step_name)]
+        # Mark the step active, then advance the progress bar to the
+        # checkpoint for THIS step. The checkpoint fires when the step
+        # is reached, not when it finishes, so the bar moves continuously
+        # even though the orchestrator only calls us per stage.
         self._emit_step_active(idx)
+        self._emit_progress(PROGRESS_FOR_STEP.get(idx, 0), name)
         self._emit_log(f"[{step_name}] start")
         for w in result.warnings:
             self._emit_log(f"[{step_name}] WARN  {w}")
@@ -153,6 +172,12 @@ class BridgePipelineAdapter:
             )
             if metrics_str:
                 self._emit_log(f"[{step_name}] {metrics_str}")
+        # Push the bar to the next checkpoint when the step finishes too
+        # (so it advances past PROGRESS_FOR_STEP[idx] and toward the
+        # final 100% mark).
+        next_idx = min(idx + 1, max(PROGRESS_FOR_STEP.keys()))
+        if next_idx in PROGRESS_FOR_STEP:
+            self._emit_progress(PROGRESS_FOR_STEP[next_idx], name)
         self._emit_step_done(idx, name, f"{result.status} ({result.duration_ms:.0f} ms)")
 
     def run(self, transit_dir: Path | str) -> dict[str, Any]:
@@ -168,8 +193,8 @@ class BridgePipelineAdapter:
 
         # Mark all 6 steps in the UI as "active then done" at the
         # correct moments. The QML progress bar uses cumulative
-        # percentages; we approximate that by mapping our 3 stages to
-        # 0%, 33%, 75% progress, then 100% on completion.
+        # percentages; PROGRESS_FOR_STEP drives intermediate updates
+        # from `_on_step` so the bar actually moves.
         for idx, name, detail in _STEP_TABLE:
             self._emit_log(f"[step {idx}] {name}: {detail}")
         self._emit_progress(0, "Старт")
