@@ -1,0 +1,38 @@
+# Components (shared)
+Sidebar           1.0 Sidebar.qml
+NavItem           1.0 NavItem.qml
+Topbar            1.0 Topbar.qml
+TopbarIconBtn     1.0 TopbarIconBtn.qml
+AppButton         1.0 AppButton.qml
+SmallBadge        1.0 SmallBadge.qml
+StatusBadge       1.0 StatusBadge.qml
+FilterChip        1.0 FilterChip.qml
+TabChip           1.0 TabChip.qml
+TableHeaderCell   1.0 TableHeaderCell.qml
+PillButton        1.0 PillButton.qml
+PillGroup         1.0 PillGroup.qml
+FormSection       1.0 FormSection.qml
+FormField         1.0 FormField.qml
+FileRow           1.0 FileRow.qml
+StatCard          1.0 StatCard.qml
+StatsRow          1.0 StatsRow.qml
+Accordion          1.0 Accordion.qml
+SettingsSection   1.0 SettingsSection.qml
+SettingsField     1.0 SettingsField.qml
+ToastManager      1.0 ToastManager.qml
+
+# Session screen components
+SessionTableRow   1.0 SessionTableRow.qml
+TemplateCard      1.0 TemplateCard.qml
+InstructionRow    1.0 InstructionRow.qml
+PipelineStepRow   1.0 PipelineStepRow.qml
+
+# Screens
+SessionsScreen    1.0 SessionsScreen.qml
+NewSessionScreen  1.0 NewSessionScreen.qml
+ProgressScreen    1.0 ProgressScreen.qml
+ResultScreen      1.0 ResultScreen.qml
+TemplatesScreen   1.0 TemplatesScreen.qml
+InstructionsScreen 1.0 InstructionsScreen.qml
+SettingsScreen    1.0 SettingsScreen.qml
+StorageScreen     1.0 StorageScreen.qml
