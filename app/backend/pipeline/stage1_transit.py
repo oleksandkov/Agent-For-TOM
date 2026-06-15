@@ -180,19 +180,21 @@ def run_stage1(ctx: PipelineContext) -> StageResult:
             result.artifacts["params"] = str(params_path)
 
         # 4. Special-instructions file and global instructions.
-        template_ins = transit_dir / f"{template_id}_fill.md"
-        if not template_ins.is_file():
-            # The snapshot may have a custom name. We accept any *_fill.md.
-            candidates = sorted(transit_dir.glob("*_fill.md"))
-            if candidates:
-                template_ins = candidates[0]
-            else:
-                result.warnings.append(
-                    f"Template instructions file ({template_id}_fill.md) missing"
-                )
-        if template_ins.is_file():
-            log_lines.append(f"template_instructions={template_ins.name}")
-            result.artifacts["template_instructions"] = str(template_ins)
+        include_special_instructions = snap.get("include_special_instructions", True)
+        if include_special_instructions:
+            template_ins = transit_dir / f"{template_id}_fill.md"
+            if not template_ins.is_file():
+                # The snapshot may have a custom name. We accept any *_fill.md.
+                candidates = sorted(transit_dir.glob("*_fill.md"))
+                if candidates:
+                    template_ins = candidates[0]
+                else:
+                    result.warnings.append(
+                        f"Template instructions file ({template_id}_fill.md) missing"
+                    )
+            if template_ins.is_file():
+                log_lines.append(f"template_instructions={template_ins.name}")
+                result.artifacts["template_instructions"] = str(template_ins)
 
         global_ins = transit_dir / "general_instructions.md"
         if not global_ins.is_file():
@@ -213,7 +215,11 @@ def run_stage1(ctx: PipelineContext) -> StageResult:
             if entry.get("file_hash")
         }
 
-        attached_hashes = list(snap.get("attached_files") or [])
+        from .utils import get_support_attach_files
+        if get_support_attach_files():
+            attached_hashes = list(snap.get("attached_files") or [])
+        else:
+            attached_hashes = []
         merged_parts: list[str] = []
         total_tokens = 0
         converted_now = 0

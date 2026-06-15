@@ -49,7 +49,7 @@ DEFAULT_IMAGE_LLM_MODEL = "black-forest-labs/FLUX.1-schnell"
 DEFAULT_COMPACT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_OPENROUTER_MODEL = "openrouter/free"
-DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"
 
 # Whether to print a hard warning when HUGGY_FACE_TOKEN is missing.
 WARN_ON_MISSING_HF_TOKEN = False
@@ -88,7 +88,7 @@ def load_env(env_file: Path | None = None) -> dict[str, str]:
         if " #" in value:
             value = value.split(" #", 1)[0].rstrip()
         parsed[key] = value
-        os.environ.setdefault(key, value)
+        os.environ[key] = value  # .env always overrides pre-existing process env
     return parsed
 
 
@@ -164,6 +164,12 @@ def get_support_attach_files() -> bool:
 def get_enable_caching() -> bool:
     """Return True if LLM response caching is enabled."""
     val = (get_env("ENABLE_CACHING") or "false").strip().lower()
+    return val in ("true", "1", "yes")
+
+
+def get_allow_local_llm() -> bool:
+    """Return True if the local Qwen model runner is allowed to run."""
+    val = (get_env("ALLOW_LOCAL_LLM") or "true").strip().lower()
     return val in ("true", "1", "yes")
 
 
@@ -269,4 +275,5 @@ __all__ = [
     "Timer",
     "get_support_attach_files",
     "get_enable_caching",
+    "get_allow_local_llm",
 ]

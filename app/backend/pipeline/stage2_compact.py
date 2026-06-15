@@ -156,34 +156,45 @@ def run_stage2(ctx: PipelineContext, *, use_qwen: bool = True) -> StageResult:
                 result.warnings.append("Template params file not found; downstream will need fallback values")
 
             # 4. Compact template-specific instructions.
-            template_ins_name = f"{ctx.template_id}_fill.md"
-            src_ti = transit_dir / template_ins_name
-            if not src_ti.is_file():
-                candidates = sorted(transit_dir.glob("*_fill.md"))
-                if candidates:
-                    src_ti = candidates[0]
-                    template_ins_name = src_ti.name
-            if src_ti.is_file():
-                text = _read(src_ti)
-                compact_text, was_compacted, mode, in_t, out_t = _maybe_compact(
-                    "fill", text, runner, cache=result.metrics
-                )
-                dst_ti = compact_dir / template_ins_name
-                _write(dst_ti, compact_text)
-                result.artifacts["template_instructions"] = str(dst_ti)
-                log_lines.append(
-                    f"template_instructions: {in_t} -> {out_t} tokens ({mode})"
-                )
-                result.metrics["template_instructions_in"] = in_t
-                result.metrics["template_instructions_out"] = out_t
-                if was_compacted and mode == "heuristic":
-                    result.warnings.append(
-                        f"Template instructions ({in_t} tokens) compacted by heuristic"
+            include_special_instructions = True
+            session_ctx_path = transit_dir / "session_context.json"
+            if session_ctx_path.is_file():
+                try:
+                    session_ctx = json.loads(session_ctx_path.read_text(encoding="utf-8"))
+                    include_special_instructions = session_ctx.get("input_snapshot", {}).get("include_special_instructions", True)
+                except Exception:
+                    pass
+
+            if include_special_instructions:
+                template_ins_name = f"{ctx.template_id}_fill.md"
+                src_ti = transit_dir / template_ins_name
+                if not src_ti.is_file():
+                    candidates = sorted(transit_dir.glob("*_fill.md"))
+                    if candidates:
+                        src_ti = candidates[0]
+                        template_ins_name = src_ti.name
+                if src_ti.is_file():
+                    text = _read(src_ti)
+                    compact_text, was_compacted, mode, in_t, out_t = _maybe_compact(
+                        "fill", text, runner, cache=result.metrics
                     )
-            else:
-                result.warnings.append("Template instructions file missing")
+                    dst_ti = compact_dir / template_ins_name
+                    _write(dst_ti, compact_text)
+                    result.artifacts["template_instructions"] = str(dst_ti)
+                    log_lines.append(
+                        f"template_instructions: {in_t} -> {out_t} tokens ({mode})"
+                    )
+                    result.metrics["template_instructions_in"] = in_t
+                    result.metrics["template_instructions_out"] = out_t
+                    if was_compacted and mode == "heuristic":
+                        result.warnings.append(
+                            f"Template instructions ({in_t} tokens) compacted by heuristic"
+                        )
+                else:
+                    result.warnings.append("Template instructions file missing")
 
             # 5. Compact each attached file.
+            from app.backend.pipeline.utils import get_support_attach_files
             attached_src = transit_dir / "attached"
             attached_dst = ensure_dir(compact_dir / "attached_compact")
             attached_total_in = 0
@@ -193,7 +204,7 @@ def run_stage2(ctx: PipelineContext, *, use_qwen: bool = True) -> StageResult:
             attached_heuristic = 0
             attached_files_count = 0
 
-            if attached_src.is_dir():
+            if get_support_attach_files() and attached_src.is_dir():
                 for txt_path in sorted(attached_src.glob("*.txt")):
                     attached_files_count += 1
                     text = _read(txt_path)
@@ -233,17 +244,26 @@ def run_stage2(ctx: PipelineContext, *, use_qwen: bool = True) -> StageResult:
             result.metrics["attached_heuristic_count"] = attached_heuristic
 
             # 6. User style (always copy if present).
-            user_style_path = ctx.transit_dir / "user_style.md"
-            if user_style_path.is_file():
-                style_text = _read(user_style_path)
-                if style_text.strip():
-                    compact_text, _, mode, in_t, out_t = _maybe_compact(
-                        "user_style", style_text, runner, cache=result.metrics
-                    )
-                    dst_style = compact_dir / "user_style.md"
-                    _write(dst_style, compact_text)
-                    result.artifacts["user_style"] = str(dst_style)
-                    log_lines.append(f"user_style: {in_t} -> {out_t} tokens ({mode})")
+            include_user_style = True
+            if session_ctx_path.is_file():
+                try:
+                    session_ctx = json.loads(session_ctx_path.read_text(encoding="utf-8"))
+                    include_user_style = session_ctx.get("input_snapshot", {}).get("include_user_style", True)
+                except Exception:
+                    pass
+
+            if include_user_style:
+                user_style_path = ctx.transit_dir / "user_style.md"
+                if user_style_path.is_file():
+                    style_text = _read(user_style_path)
+                    if style_text.strip():
+                        compact_text, _, mode, in_t, out_t = _maybe_compact(
+                            "user_style", style_text, runner, cache=result.metrics
+                        )
+                        dst_style = compact_dir / "user_style.md"
+                        _write(dst_style, compact_text)
+                        result.artifacts["user_style"] = str(dst_style)
+                        log_lines.append(f"user_style: {in_t} -> {out_t} tokens ({mode})")
 
             result.artifacts["compact_dir"] = str(compact_dir)
             result.status = STAGE_OK if not result.warnings else STAGE_WARN

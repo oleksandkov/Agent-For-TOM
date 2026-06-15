@@ -236,12 +236,13 @@ Rectangle {
                         Repeater {
                             model: 6
                             delegate: PipelineStepRow {
+                                readonly property int delegateIndex: index
                                 theme: root.theme
-                                stepIndex: index
-                                stepName: root.stepNames[index]
-                                stepDetail: root.stepDetails[index]
-                                stepState: root.stepStates[index]
-                                isLast: index === 5
+                                stepIndex: delegateIndex
+                                stepName: root.stepNames[delegateIndex]
+                                stepDetail: root.stepDetails[delegateIndex]
+                                stepState: root.stepStates[delegateIndex]
+                                isLast: delegateIndex === 5
                                 Layout.fillWidth: true
                             }
                         }

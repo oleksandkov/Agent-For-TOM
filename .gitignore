@@ -240,3 +240,5 @@ __marimo__/
 cache/
 # agent.db
 app/config/.db_key
+
+debug/

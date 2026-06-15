@@ -136,14 +136,14 @@ Rectangle {
         // Time indicator for done steps
         Text {
             visible: root.stepState === "done"
-            text: mockTimes[root.stepIndex] || "—"
+            text: stepBody.mockTimes[root.stepIndex] || "—"
             font.pixelSize: theme.fontSizeSM
             color: theme.textTertiary
             font.family: "JetBrains Mono, Consolas, monospace"
         }
         Text {
             visible: root.stepState === "running"
-            text: "~" + mockTimes[root.stepIndex] || "…"
+            text: "~" + stepBody.mockTimes[root.stepIndex] || "…"
             font.pixelSize: theme.fontSizeSM
             color: theme.accent
             font.family: "JetBrains Mono, Consolas, monospace"

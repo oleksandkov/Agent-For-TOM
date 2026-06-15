@@ -173,6 +173,7 @@ Rectangle {
                         StatsRow { theme: root.theme; label: "Input tokens (text model)"; value: resultData.input_tokens || "0" }
                         StatsRow { theme: root.theme; label: "Output tokens (text model)"; value: resultData.output_tokens || "0" }
                         StatsRow { theme: root.theme; label: "Cached tokens"; value: resultData.cached_tokens || "0" }
+                        StatsRow { theme: root.theme; label: "Модель"; value: resultData.llm_model || "-" }
                         StatsRow { theme: root.theme; label: "Зображень згенеровано"; value: (resultData.image_count || 0).toString() }
                         StatsRow { theme: root.theme; label: "Word count"; value: (resultData.word_count || 0) + " / " + (resultData.word_count_min || 0) + "–" + (resultData.word_count_max || 0) }
                         StatsRow { theme: root.theme; label: "Шаблон"; value: resultData.template || "-" }
@@ -181,6 +182,7 @@ Rectangle {
 
                         // Code spoiler
                         Rectangle {
+                            id: codeSpoiler
                             Layout.fillWidth: true
                             height: codeSpoilerCol.implicitHeight
                             radius: theme.radiusLG; color: theme.surface1
@@ -198,17 +200,17 @@ Rectangle {
                                     Layout.fillWidth: true; height: 40
                                     color: theme.surface2; radius: theme.radiusLG
 
-                                    Rectangle { anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.right: parent.right; height: parent.height / 2; color: parent.color; visible: parent.parent.isExpanded }
+                                    Rectangle { anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.right: parent.right; height: parent.height / 2; color: parent.color; visible: codeSpoiler.isExpanded }
 
                                     RowLayout {
                                         anchors { fill: parent; margins: theme.sp4 }
                                         Text { text: "Показати вихідний код (filled.py)"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: theme.textPrimary; Layout.fillWidth: true }
-                                        Text { text: parent.parent.parent.isExpanded ? "▲" : "▼"; color: theme.textSecondary }
+                                        Text { text: codeSpoiler.isExpanded ? "▲" : "▼"; color: theme.textSecondary }
                                     }
 
                                     MouseArea {
                                         anchors.fill: parent
-                                        onClicked: parent.parent.parent.isExpanded = !parent.parent.parent.isExpanded
+                                        onClicked: codeSpoiler.isExpanded = !codeSpoiler.isExpanded
                                     }
                                 }
 

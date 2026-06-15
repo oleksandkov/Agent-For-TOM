@@ -170,13 +170,16 @@ class PipelineRunner:
                 snap = ctx.input_snapshot or {}
                 template_row = bridge.templates.get_by_name(ctx.template_id or snap.get("template_id", "lab1") or "lab1")
                 template_pk = template_row["id"] if template_row else "00000000-0000-0000-0000-000000000001"
-                sess = bridge.sessions.create(
-                    template_id=template_pk,
-                    name=ctx.session_name,
-                    input_snapshot=snap,
-                    output_dir=str(ctx.output_dir.relative_to(self._repo_root())),
-                )
-                db_session_id = sess["id"]
+                sess = bridge.sessions.get(ctx.session_id)
+                if sess is None:
+                    sess = bridge.sessions.create(
+                        session_id=ctx.session_id,
+                        template_id=template_pk,
+                        name=ctx.session_name,
+                        input_snapshot=snap,
+                        output_dir=str(ctx.output_dir.relative_to(self._repo_root())),
+                    )
+                db_session_id = ctx.session_id
                 bridge.audit.log(
                     actor="pipeline", action="session.create",
                     target_id=db_session_id, details={"name": ctx.session_name},

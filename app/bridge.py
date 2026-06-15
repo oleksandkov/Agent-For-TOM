@@ -126,6 +126,8 @@ class AppBridge(QObject):
     isSidebarCollapsedChanged = pyqtSignal()
     isBigFontChanged = pyqtSignal()
     sessionPayloadJsonChanged = pyqtSignal()
+    supportAttachFilesChanged = pyqtSignal()
+    enableCachingChanged = pyqtSignal()
 
     # Pipeline signals
     pipelineStarted = pyqtSignal()
@@ -381,6 +383,16 @@ class AppBridge(QObject):
     @pyqtProperty(str, notify=currentScreenChanged)
     def currentScreen(self):
         return self._current_screen
+
+    @pyqtProperty(bool, notify=supportAttachFilesChanged)
+    def supportAttachFiles(self):
+        from app.backend.pipeline.utils import get_support_attach_files
+        return get_support_attach_files()
+
+    @pyqtProperty(bool, notify=enableCachingChanged)
+    def enableCaching(self):
+        from app.backend.pipeline.utils import get_enable_caching
+        return get_enable_caching()
 
     # ─── Slots (QML → Python) ─────────────────────────────────────────────────
 
@@ -840,30 +852,94 @@ class AppBridge(QObject):
         if not session:
             return self.getMockResult()
 
-        token_usage = json.loads(session.get("token_usage") or "{}")
+        def safe_json_loads(val):
+            if not val:
+                return {}
+            if isinstance(val, dict):
+                return val
+            try:
+                return json.loads(val)
+            except Exception:
+                return {}
+
+        token_usage = safe_json_loads(session.get("token_usage"))
         duration_ms = session.get("duration_ms", 0)
-        snapshot = json.loads(session.get("input_snapshot") or "{}")
-        val = json.loads(session.get("validation_result") or "{}")
-        
+        snapshot = safe_json_loads(session.get("input_snapshot"))
+        val = safe_json_loads(session.get("validation_result"))
+
+        # ── Read from index.json for richer metrics ──────────────────────
+        # The orchestrator does not populate validation_result, so we fall
+        # back to reading the output index.json produced by stage5.
+        output_index: dict[str, Any] = {}
+        docx_path_raw = session.get("docx_output") or session.get("docx_path") or ""
+        if docx_path_raw:
+            import pathlib
+            out_dir = pathlib.Path(docx_path_raw).parent
+            idx_path = out_dir / "index.json"
+            if idx_path.exists():
+                try:
+                    with open(idx_path, "r", encoding="utf-8") as f:
+                        output_index = json.load(f)
+                except Exception:
+                    pass
+
+        # Stage5 metrics contain llm_prompt_tokens / llm_output_tokens
+        stage5_metrics: dict[str, Any] = {}
+        for stage in output_index.get("stages", []):
+            if stage.get("name", "").startswith("stage5"):
+                stage5_metrics = stage.get("metrics", {})
+                break
+
+        # token_usage in DB: {"prompt_tokens": N, "output_tokens": N, ...}
+        prompt_tokens = (
+            token_usage.get("prompt_tokens")
+            or stage5_metrics.get("llm_prompt_tokens")
+            or 0
+        )
+        output_tokens = (
+            token_usage.get("output_tokens")
+            or stage5_metrics.get("llm_output_tokens")
+            or 0
+        )
+        llm_model = (
+            token_usage.get("model")
+            or stage5_metrics.get("llm_model")
+            or ""
+        )
+        llm_duration_ms = (
+            token_usage.get("duration_ms")
+            or stage5_metrics.get("llm_duration_ms")
+            or 0
+        )
+
+        # word_count: from validation_result if present, else from index
+        word_count = val.get("word_count", 0) or output_index.get("word_count", 0)
+        word_count_min = val.get("word_count_target_min", 0)
+        word_count_max = val.get("word_count_target_max", 0)
+
+        # Duration: prefer the LLM call duration for display, fall back to total pipeline duration
+        display_duration = f"{int(llm_duration_ms)} ms" if llm_duration_ms else (f"{duration_ms} ms" if duration_ms else "")
+
         data = {
             "session_name": session.get("name"),
             "status": session.get("status"),
             "error_stage": session.get("error_stage"),
             "error_message": session.get("error_message"),
-            "duration": f"{duration_ms} ms" if duration_ms else "",
+            "duration": display_duration,
             "image_count": session.get("image_count", 0),
-            "word_count": val.get("word_count", 0),
-            "word_count_min": val.get("word_count_target_min", 0),
-            "word_count_max": val.get("word_count_target_max", 0),
-            "input_tokens": str(token_usage.get("text_model", {}).get("input_tokens", 0)),
-            "output_tokens": str(token_usage.get("text_model", {}).get("output_tokens", 0)),
-            "cached_tokens": str(token_usage.get("text_model", {}).get("cached_tokens", 0)),
-            "template": snapshot.get("template_slug", ""),
+            "word_count": word_count,
+            "word_count_min": word_count_min,
+            "word_count_max": word_count_max,
+            "input_tokens": str(prompt_tokens),
+            "output_tokens": str(output_tokens),
+            "cached_tokens": str(token_usage.get("cached_tokens", 0)),
+            "llm_model": llm_model,
+            "template": snapshot.get("template_id", snapshot.get("template_slug", "")),
             "hardness": snapshot.get("hardness", ""),
             "image_mode": snapshot.get("image_mode", ""),
             "warnings": val.get("warnings", []),
-            "docx_path": session.get("docx_output", ""),
-            "pdf_path": session.get("pdf_output", ""),
+            "docx_path": session.get("docx_path") or session.get("docx_output", ""),
+            "pdf_path": session.get("pdf_path") or session.get("pdf_output", ""),
         }
         return json.dumps(data, ensure_ascii=False)
 
@@ -980,18 +1056,38 @@ class AppBridge(QObject):
         return {
             "template_id": template_id or cached.get("template_id") or "lab1",
             "name": session_name or cached.get("name") or "Нова сесія",
-            "theme": cached.get("theme") or session_name or "",
-            "goal": goal or cached.get("goal") or "",
+            "theme": cached.get("documentTheme") or cached.get("theme") or session_name or "",
+            "goal": goal or cached.get("documentGoal") or cached.get("goal") or "",
             "length": canonical_length,
             "hardness": canonical_hardness,
             "image_mode": canonical_image_mode,
             "include_special_instructions": bool(
-                cached.get("include_special_instructions", True)
+                cached.get("includeSpecialInstructions") if cached.get("includeSpecialInstructions") is not None
+                else cached.get("include_special_instructions") if cached.get("include_special_instructions") is not None
+                else True
             ),
-            "include_user_style": bool(cached.get("include_user_style", False)),
-            "user_input": cached.get("user_input") or "",
+            "include_user_style": bool(
+                cached.get("includeUserStyle") if cached.get("includeUserStyle") is not None
+                else cached.get("include_user_style") if cached.get("include_user_style") is not None
+                else False
+            ),
+            "user_input": cached.get("sessionHints") or cached.get("user_input") or "",
             "uploaded_files": cached.get("uploadedFiles") or cached.get("uploaded_files") or [],
             "gap_values": cached.get("gap_values") or {},
+            
+            "documentTheory": cached.get("documentTheory") or "",
+            "documentTasks": cached.get("documentTasks") or "",
+            "documentQuestions": cached.get("documentQuestions") or "",
+            "documentBibliography": cached.get("documentBibliography") or "",
+            "theoryAiCheck": cached.get("theoryAiCheck", True),
+            "tasksAiCheck": cached.get("tasksAiCheck", True),
+            "questionsAiCheck": cached.get("questionsAiCheck", True),
+            "bibliographyAiCheck": cached.get("bibliographyAiCheck", True),
+            
+            "nameAiCheck": cached.get("nameAiCheck", False),
+            "themeAiCheck": cached.get("themeAiCheck", False),
+            "goalAiCheck": cached.get("goalAiCheck", True),
+            "labNumber": cached.get("labNumber") or "1",
         }
 
     def _materialize_transit_snapshot(
@@ -1064,12 +1160,13 @@ class AppBridge(QObject):
             session_ctx["input_snapshot"]["global_instructions_hash"] = self._hash_file(src_g)
 
         # 3) template instructions
-        src_ti = app_template_ins_dir / f"{template_id}_fill.md"
-        if not src_ti.is_file():
-            # Fall back to lab1_fill.md if the requested template file is missing.
-            src_ti = app_template_ins_dir / "lab1_fill.md"
-        if src_ti.is_file():
-            shutil.copy2(src_ti, snap_dir / f"{template_id}_fill.md")
+        if payload.get("include_special_instructions", True):
+            src_ti = app_template_ins_dir / f"{template_id}_fill.md"
+            if not src_ti.is_file():
+                # Fall back to lab1_fill.md if the requested template file is missing.
+                src_ti = app_template_ins_dir / "lab1_fill.md"
+            if src_ti.is_file():
+                shutil.copy2(src_ti, snap_dir / f"{template_id}_fill.md")
 
         # 4) template params (gap_values, schema-aware)
         gap_values = payload.get("gap_values") or self._fallback_gap_values(payload)
@@ -1195,40 +1292,60 @@ class AppBridge(QObject):
         Mirrors the keys in ``app/instructions/template-ins/lab1_fill.md``
         so that the gap_assembler can produce a real filled.py.
         """
-        name = payload.get("name") or "Нова лабораторна робота"
-        theme = payload.get("theme") or name
-        goal = payload.get("goal") or "дослідити та проаналізувати поставлену задачу."
-        user_input = payload.get("user_input") or ""
-        return {
-            "lab_number": {"value": "1", "ai_accessible": False},
-            "work_title": {"value": theme, "ai_accessible": True},
-            "goal": {"value": goal, "ai_accessible": True},
+        def split_lines(txt: str) -> list[str]:
+            if not txt:
+                return []
+            return [line.strip() for line in txt.splitlines() if line.strip()]
+
+        template_id = payload.get("template_id") or "lab1"
+        name = payload.get("name") or ""
+        theme = payload.get("theme") or name or ""
+        goal = payload.get("goal") or ""
+        theory = payload.get("documentTheory") or ""
+        
+        tasks_val = split_lines(payload.get("documentTasks") or "")
+        questions_val = split_lines(payload.get("documentQuestions") or "")
+        bib_val = split_lines(payload.get("documentBibliography") or "")
+
+        default_lab_num = "2" if template_id == "lab2" else "1"
+        lab_num = payload.get("labNumber") or payload.get("lab_number") or default_lab_num
+
+        gap_values = {
+            "lab_number": {"value": lab_num, "ai_accessible": False},
+            "work_title": {"value": theme, "ai_accessible": bool(payload.get("themeAiCheck", False))},
+            "goal": {"value": goal, "ai_accessible": bool(payload.get("goalAiCheck", True))},
             "general_info": {
-                "value": user_input or f"{theme} — базові теоретичні відомості.",
-                "ai_accessible": True,
+                "value": theory,
+                "ai_accessible": bool(payload.get("theoryAiCheck", True)),
             },
             "tasks": {
-                "value": [
-                    "Реалізувати алгоритми відповідно до мети роботи.",
-                    "Продемонструвати їх роботу на тестових даних.",
-                    "Зробити висновки щодо отриманих результатів.",
-                ],
-                "ai_accessible": True,
+                "value": tasks_val,
+                "ai_accessible": bool(payload.get("tasksAiCheck", True)),
             },
             "control_questions": {
-                "value": [
-                    "У чому полягає мета роботи?",
-                    "Які основні кроки виконаних алгоритмів?",
-                ],
-                "ai_accessible": True,
+                "value": questions_val,
+                "ai_accessible": bool(payload.get("questionsAiCheck", True)),
             },
             "bibliography": {
-                "value": [
-                    "Кнут, Д. Е. Мистецтво програмування. Т. 3 : Сортування і пошук. Київ : Вільямс, 2020. 824 с.",
-                ],
-                "ai_accessible": True,
+                "value": bib_val,
+                "ai_accessible": bool(payload.get("bibliographyAiCheck", True)),
             },
         }
+
+        if template_id == "lab2":
+            variants_val = []
+            if payload.get("hasVariants") == "yes":
+                try:
+                    num_vars = int(payload.get("variantsNumber") or 0)
+                except (ValueError, TypeError):
+                    num_vars = 0
+                variants_val = ["" for _ in range(num_vars)]
+            gap_values["variants"] = {
+                "value": variants_val,
+                "ai_accessible": True,
+            }
+
+        return gap_values
 
     def _update_session_from_run(self, run_dict: dict) -> None:
         """Push the orchestrator's result back into ``self._sessions``."""
@@ -1266,7 +1383,8 @@ class AppBridge(QObject):
         hardness = "university_1"
         image_mode = payload.get("image_mode", "none")
         goal = payload.get("documentGoal", "")
-        include_user_style = payload.get("userStyleId") not in [None, "", "none"]
+        include_user_style = bool(payload.get("includeUserStyle", payload.get("userStyleId") not in [None, "", "none"]))
+        include_special_instructions = bool(payload.get("includeSpecialInstructions", True))
 
         self._init_db()
 
@@ -1292,6 +1410,7 @@ class AppBridge(QObject):
         pipeline_payload["uploaded_files"] = payload.get("uploadedFiles", [])
         pipeline_payload["user_input"] = payload.get("sessionHints", "")
         pipeline_payload["include_user_style"] = include_user_style
+        pipeline_payload["include_special_instructions"] = include_special_instructions
 
         # 3. Snapshot.
         try:
@@ -1307,16 +1426,16 @@ class AppBridge(QObject):
             
         # DB insertion
         try:
-            from app.backend.db.repositories.sessions import SessionCreate
-            session_create = SessionCreate(
-                id=new_id,
+            template_row = self._repo.templates.get_by_name(template_id)
+            template_pk = template_row["id"] if template_row else "00000000-0000-0000-0000-000000000001"
+            self._repo.sessions.create(
+                template_id=template_pk,
                 name=session_name or "Нова сесія",
-                status="processing",
-                template_id=template_id,
-                hardness=hardness,
-                input_snapshot=json.dumps(pipeline_payload, ensure_ascii=False)
+                input_snapshot=pipeline_payload,
+                session_id=new_id,
+                output_dir=None
             )
-            self._repo.sessions.create(session_create)
+            self._repo.sessions.set_started(new_id)
         except Exception as e:
             print(f"[bridge] Warning: DB insertion failed: {e}")
 

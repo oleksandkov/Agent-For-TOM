@@ -20,14 +20,14 @@ Rectangle {
     RowLayout {
         anchors.fill: parent
         Text {
-            text: root.label
+            text: label
             font.pixelSize: theme.fontSizeMD
             color: theme.textSecondary
             Layout.preferredWidth: 280
         }
         Item { Layout.fillWidth: true }
         Text {
-            text: root.value
+            text: value
             font.pixelSize: theme.fontSizeMD
             color: theme.textPrimary
             font.weight: Font.Medium

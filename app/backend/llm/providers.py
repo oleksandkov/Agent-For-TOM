@@ -138,6 +138,35 @@ def _call_openrouter_json_llm(prompt: str) -> tuple[dict[str, Any] | None, dict[
     return None, metrics
 
 
+def _truncate_prompt_for_groq(prompt: str, max_chars: int = 6_000) -> str:
+    """Truncate the prompt to stay under Groq's per-minute token limit.
+
+    Groq free tier for llama-3.1-8b-instant allows 6000 TPM total. We
+    request max_tokens=2000 for output (enough for a ~350-word general_info
+    plus all other fields), leaving ~4000 tokens for the prompt. At ~4
+    chars/token for Cyrillic+ASCII that is ~16 000 chars. We cap at 6000
+    chars (~1500 tokens) to be safe.
+
+    The prompt is structured so that user data (theme, goal, params) comes
+    BEFORE the schema/few-shot example. We therefore truncate from the END
+    only — this drops the schema example but never the user's actual input.
+    A short task reminder is appended after the cut so the model still knows
+    what JSON shape to return.
+    """
+    reminder = (
+        "\n\n# YOUR TASK\n"
+        "Return a single JSON object with keys: goal, general_info, tasks, "
+        "control_questions, bibliography — all in Ukrainian academic style, "
+        "matching the theme from the session context above. "
+        "Output ONLY the JSON. No markdown fences."
+    )
+    budget = max_chars - len(reminder.encode("utf-8"))
+    if len(prompt) <= budget:
+        return prompt + reminder
+    # Head-only cut: drop trailing schema/example, keep user data intact.
+    return prompt[:budget] + reminder
+
+
 def _call_groq_json_llm(prompt: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     api_key = get_groq_api_key()
     model = get_groq_model()
@@ -146,29 +175,43 @@ def _call_groq_json_llm(prompt: str) -> tuple[dict[str, Any] | None, dict[str, A
         metrics["error"] = "no GROQ_API_KEY"
         return None, metrics
 
-    try:
-        from groq import Groq
+    # Groq TPM limits cause 413 on very long prompts; truncate defensively.
+    safe_prompt = _truncate_prompt_for_groq(prompt)
+    # Fallback chain: configured model → llama-3.1-8b-instant as last resort.
+    models_to_try = [model]
+    if model != "llama-3.1-8b-instant":
+        models_to_try.append("llama-3.1-8b-instant")
 
-        client = Groq(api_key=api_key, timeout=120.0)
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=8000,
-            temperature=0.2,
-        )
-        text = response.choices[0].message.content or ""
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            metrics["prompt_tokens"] = int(getattr(usage, "prompt_tokens", 0) or 0)
-            metrics["output_tokens"] = int(getattr(usage, "completion_tokens", 0) or 0)
-    except Exception as exc:  # noqa: BLE001
-        metrics["error"] = f"{type(exc).__name__}: {exc}"
-        return None, metrics
+    last_exc: Exception | None = None
+    for current_model in models_to_try:
+        metrics["model"] = current_model
+        try:
+            from groq import Groq
 
-    return _parse_json_response(text, metrics)
+            client = Groq(api_key=api_key, timeout=120.0)
+            response = client.chat.completions.create(
+                model=current_model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": safe_prompt},
+                ],
+                max_tokens=2000,  # Groq free tier: 6000 TPM; 2000 out + ~1500 prompt = 3500 total
+                temperature=0.2,
+            )
+            text = response.choices[0].message.content or ""
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                metrics["prompt_tokens"] = int(getattr(usage, "prompt_tokens", 0) or 0)
+                metrics["output_tokens"] = int(getattr(usage, "completion_tokens", 0) or 0)
+            return _parse_json_response(text, metrics)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            # Only retry with a smaller model on 413 (too large) errors.
+            if "413" not in str(exc):
+                break
+
+    metrics["error"] = f"{type(last_exc).__name__}: {last_exc}"
+    return None, metrics
 
 
 def _cascade_order() -> list[str]:

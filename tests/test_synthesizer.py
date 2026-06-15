@@ -181,6 +181,8 @@ class TestSynthesizeWithMockedLocalQwen(unittest.TestCase):
     """
 
     def setUp(self):
+        import os
+        os.environ["ALLOW_LOCAL_LLM"] = "true"
         try:
             from app.backend.db.connection import Database
             db = Database()
@@ -302,6 +304,8 @@ class TestGapAssemblerAfterSynthesis(unittest.TestCase):
     text, not the user's typed defaults."""
 
     def setUp(self):
+        import os
+        os.environ["ALLOW_LOCAL_LLM"] = "true"
         try:
             from app.backend.db.connection import Database
             db = Database()

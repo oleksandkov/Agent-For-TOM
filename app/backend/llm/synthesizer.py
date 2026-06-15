@@ -65,7 +65,7 @@ _DEFAULT_COMPACT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
 # produces the 1000-1700 word count needed by the global
 # instructions. The 8b-instant model is faster but only emits ~50
 # words of general_info which falls far short of the target.
-_DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+_DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"
 
 
 def _get_env(name: str) -> str | None:
@@ -107,7 +107,7 @@ def load_env() -> None:
         # Strip inline "# comment" after a space.
         if " #" in value:
             value = value.split(" #", 1)[0].rstrip()
-        os.environ.setdefault(key, value)
+        os.environ[key] = value  # .env always overrides pre-existing process env
 
 
 def get_hf_token() -> str | None:
@@ -305,16 +305,20 @@ def _build_user_prompt(
             general_instructions_content = g_fallback.read_text(encoding="utf-8")
 
     prompt_parts = []
-    
+
+    # ── Critical fixed instructions (always first, always kept) ─────────
     if general_instructions_content:
         prompt_parts.append(f"# SYSTEM INSTRUCTIONS (general_instructions.md)\n{general_instructions_content}\n")
-        
+
+    # ── User data (most important — must not be truncated) ──────────────
+    # NOTE: these are placed BEFORE the big schema/example block so that
+    # if the prompt is truncated for small-context providers (e.g. Groq),
+    # the user's actual theme/goal/params survive the cut.
     prompt_parts.append("# INPUT JSON DATA & CONTEXT\n")
-    
+
     if session_context_content:
         prompt_parts.append(f"## 1. Session Context (session_context.json)\n```json\n{session_context_content}\n```\n")
     else:
-        # Legacy/fallback representation
         legacy_sc = {
             "template_id": template_id,
             "theme": theme,
@@ -322,12 +326,11 @@ def _build_user_prompt(
             "hardness": hardness,
             "user_input": user_input
         }
-        prompt_parts.append(f"## 1. Session Context (session_context.json - fallback)\n```json\n{json.dumps(legacy_sc, ensure_ascii=False, indent=2)}\n```\n")
-        
+        prompt_parts.append(f"## 1. Session Context (fallback)\n```json\n{json.dumps(legacy_sc, ensure_ascii=False, indent=2)}\n```\n")
+
     if template_params_content:
         prompt_parts.append(f"## 2. Template Parameters & Gaps ({template_id}_params.json)\n```json\n{template_params_content}\n```\n")
     else:
-        # Legacy/fallback representation of gap values
         user_lines: list[str] = []
         for key, block in user_gap_values.items():
             if not isinstance(block, dict):
@@ -343,27 +346,22 @@ def _build_user_prompt(
                 value_repr = str(value)
             user_lines.append(f"- [{marker}] {key}: {value_repr}")
         user_block = "\n".join(user_lines) if user_lines else "(none)"
-        prompt_parts.append(f"## 2. Template Parameters & Gaps (fallback representation)\n{user_block}\n")
-        
+        prompt_parts.append(f"## 2. Template Parameters & Gaps (fallback)\n{user_block}\n")
+
     if template_instructions_content:
         prompt_parts.append(f"## 3. Template-Specific Instructions ({template_id}_fill.md)\n{template_instructions_content}\n")
-        
-    prompt_parts.append(f"## 4. Attached Files Metadata (library_files.json)\n```json\n{library_files_content}\n```\n")
-    
+
     if support_attach:
+        prompt_parts.append(f"## 4. Attached Files Metadata (library_files.json)\n```json\n{library_files_content}\n```\n")
         prompt_parts.append(f"## 5. Reference Material / Attached Files Excerpts\n{attached_excerpt or '(no reference material)'}\n")
-    else:
-        prompt_parts.append("## 5. Reference Material / Attached Files Excerpts\n(Attached files support is disabled, ignoring attached files)\n")
-        
+
     if user_style_content.strip():
         prompt_parts.append(f"## 6. User Preferred Vocabulary & Style (user_style.md)\n{user_style_content}\n")
-    else:
-        prompt_parts.append("## 6. User Preferred Vocabulary & Style (user_style.md)\n(no user style provided)\n")
-        
-    # Schema validation reminder and example
+
+    # ── Schema + few-shot example (placed last — dropped first by truncation) ──
     schema_str = json.dumps(SCHEMA, ensure_ascii=False, indent=2)
     example_json = json.dumps(FEW_SHOT_EXAMPLE, ensure_ascii=False, indent=2)
-    
+
     prompt_parts.append(
         f"# RESPONSE SCHEMA REQUIREMENT\n"
         f"You MUST return a single valid JSON object matching this schema exactly:\n"
@@ -371,12 +369,13 @@ def _build_user_prompt(
         f"Example of correct response structure (do NOT copy content, just follow shape):\n"
         f"```json\n{example_json}\n```\n\n"
         f"# YOUR TASK\n"
-        f"Generate the missing or rewritten gap values (marked as `ai_accessible: true` or ✎ REWRITE) in Ukrainian academic style. "
+        f"Generate the missing or rewritten gap values (marked as `ai_accessible: true` or ✎ REWRITE) in Ukrainian academic style "
+        f"for the theme specified in Section 1 (session_context.json). "
         f"Ensure that all fields marked as `ai_accessible: false` (🔒 KEEP) are returned verbatim. "
         f"CRITICAL: Adhere to the target word count constraints for the length specified in session_context.json.\n"
         f"Output ONLY the JSON object. Do not include markdown fences, comments, or extra prose."
     )
-    
+
     return "\n".join(prompt_parts)
 
 
@@ -715,7 +714,12 @@ def _call_local_qwen_json_llm(prompt: str) -> tuple[dict[str, Any] | None, dict[
     metrics: dict[str, Any] = {"model": get_compact_model(), "source": "local_qwen"}
     try:
         from app.backend.compact.qwen_runner import QwenRunner
-        runner = QwenRunner()
+        import re
+        prompt_tokens = len(re.findall(r"\S+", prompt))
+        # Cyrillic tokenizers can have up to 4-5 tokens per word.
+        # We multiply by 6 for safety and use 16384 as a safe default minimum.
+        n_ctx = max(16384, prompt_tokens * 6 + 2048)
+        runner = QwenRunner(n_ctx=n_ctx)
     except Exception as exc:  # noqa: BLE001
         return None, {"error": f"Qwen unavailable: {exc}"}
     # Reuse the runner's summarisation slot with a much lower max_tokens
@@ -861,7 +865,7 @@ def synthesize_gap_values(
     user_gap_values: dict[str, Any],
     attached_excerpt: str = "",
     allow_remote: bool = True,
-    allow_local_qwen: bool = True,
+    allow_local_qwen: bool | None = None,
     compact_dir: Path | None = None,
 ) -> SynthesisResult:
     """Synthesize the per-template gap_values via the 5-tier fallback.
@@ -874,6 +878,9 @@ def synthesize_gap_values(
 
     # Read the caching flag (local helper to avoid circular import).
     import os as _os
+    if allow_local_qwen is None:
+        allow_local_qwen = (_os.environ.get("ALLOW_LOCAL_LLM") or "true").strip().lower() in ("true", "1", "yes")
+
     _caching_enabled = (_os.environ.get("ENABLE_CACHING") or "false").strip().lower() in ("true", "1", "yes")
 
     cache_k = _cache_key(

@@ -243,16 +243,18 @@ def _synthesize(
     # typed values would be used verbatim, which is not what the user
     # asked for when they marked the gap ai_accessible.
     from app.backend.compact.qwen_runner import QwenRunner
-    local_qwen_available = True
-    try:
-        QwenRunner()
-    except Exception:
-        local_qwen_available = False
     from app.backend.pipeline.utils import (
+        get_allow_local_llm,
         get_gemini_api_key,
         get_openrouter_api_key,
         get_groq_api_key,
     )
+    local_qwen_available = get_allow_local_llm()
+    if local_qwen_available:
+        try:
+            QwenRunner()
+        except Exception:
+            local_qwen_available = False
     remote_available = bool(
         get_gemini_api_key() or get_openrouter_api_key() or get_groq_api_key()
     )
@@ -285,10 +287,13 @@ def _synthesize(
         user_gap_values=user_gap_values,
         attached_excerpt=attached,
         compact_dir=compact_dir,
+        allow_local_qwen=local_qwen_available,
     )
 
     from app.backend.pipeline.utils import get_support_attach_files
-    included = ["general_instructions.md", "session_context.json", f"{template_id}_params.json", f"{template_id}_fill.md"]
+    included = ["general_instructions.md", "session_context.json", f"{template_id}_params.json"]
+    if (compact_dir / f"{template_id}_fill.md").is_file():
+        included.append(f"{template_id}_fill.md")
     if get_support_attach_files():
         included.append("library_files.json")
     if (compact_dir / "user_style.md").is_file():

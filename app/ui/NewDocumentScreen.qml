@@ -25,6 +25,18 @@ Rectangle {
     property string templateId: ""
     property string userStyleId: ""
 
+    // Remaining academic field properties
+    property string documentTheory: ""
+    property string documentTasks: ""
+    property string documentQuestions: ""
+    property string documentBibliography: ""
+    property bool theoryAiCheck: true
+    property bool tasksAiCheck: true
+    property bool questionsAiCheck: true
+    property bool bibliographyAiCheck: true
+    property bool includeSpecialInstructions: true
+    property bool includeUserStyle: false
+
     // Uploaded files list
     property var uploadedFiles: []
     property bool showWarning: false
@@ -61,6 +73,17 @@ Rectangle {
             root.templateId = sp.template_id || "";
             root.userStyleId = sp.userStyleId || "";
             
+            root.documentTheory = sp.documentTheory || "";
+            root.documentTasks = sp.documentTasks || "";
+            root.documentQuestions = sp.documentQuestions || "";
+            root.documentBibliography = sp.documentBibliography || "";
+            root.theoryAiCheck = sp.theoryAiCheck !== undefined ? sp.theoryAiCheck : true;
+            root.tasksAiCheck = sp.tasksAiCheck !== undefined ? sp.tasksAiCheck : true;
+            root.questionsAiCheck = sp.questionsAiCheck !== undefined ? sp.questionsAiCheck : true;
+            root.bibliographyAiCheck = sp.bibliographyAiCheck !== undefined ? sp.bibliographyAiCheck : true;
+            root.includeSpecialInstructions = sp.includeSpecialInstructions !== undefined ? sp.includeSpecialInstructions : true;
+            root.includeUserStyle = sp.includeUserStyle !== undefined ? sp.includeUserStyle : false;
+            
             if (typeof nameAiCheck !== "undefined") nameAiCheck.checked = sp.nameAiCheck || false;
             if (typeof themeAiCheck !== "undefined") themeAiCheck.checked = sp.themeAiCheck || false;
             if (typeof goalAiCheck !== "undefined") goalAiCheck.checked = sp.goalAiCheck || false;
@@ -72,9 +95,6 @@ Rectangle {
                     filesModel.append(sp.uploadedFiles[i]);
                 }
             }
-            if (sp.nameAiCheck !== undefined) nameAiCheck.checked = sp.nameAiCheck;
-            if (sp.themeAiCheck !== undefined) themeAiCheck.checked = sp.themeAiCheck;
-            if (sp.goalAiCheck !== undefined) goalAiCheck.checked = sp.goalAiCheck;
             isRestoring = false;
         }
         hasRestored = true;
@@ -107,6 +127,16 @@ Rectangle {
             root.variantsNumber = "";
             root.templateId = "";
             root.userStyleId = "";
+            root.documentTheory = "";
+            root.documentTasks = "";
+            root.documentQuestions = "";
+            root.documentBibliography = "";
+            root.theoryAiCheck = true;
+            root.tasksAiCheck = true;
+            root.questionsAiCheck = true;
+            root.bibliographyAiCheck = true;
+            root.includeSpecialInstructions = true;
+            root.includeUserStyle = false;
             if (typeof nameAiCheck !== "undefined") nameAiCheck.checked = false;
             if (typeof themeAiCheck !== "undefined") themeAiCheck.checked = false;
             if (typeof goalAiCheck !== "undefined") goalAiCheck.checked = false;
@@ -150,6 +180,16 @@ Rectangle {
         sp.nameAiCheck = nameAiCheck.checked;
         sp.themeAiCheck = themeAiCheck.checked;
         sp.goalAiCheck = goalAiCheck.checked;
+        sp.documentTheory = root.documentTheory;
+        sp.documentTasks = root.documentTasks;
+        sp.documentQuestions = root.documentQuestions;
+        sp.documentBibliography = root.documentBibliography;
+        sp.theoryAiCheck = root.theoryAiCheck;
+        sp.tasksAiCheck = root.tasksAiCheck;
+        sp.questionsAiCheck = root.questionsAiCheck;
+        sp.bibliographyAiCheck = root.bibliographyAiCheck;
+        sp.includeSpecialInstructions = root.includeSpecialInstructions;
+        sp.includeUserStyle = root.includeUserStyle;
         
         var isSect1Done = (root.documentName && root.documentName.trim().length >= 5) && (root.labNumber !== "");
         var isSect2Done = (root.documentTheme && root.documentTheme.trim().length > 0) && (root.documentGoal && root.documentGoal.trim().length > 0);
@@ -170,6 +210,16 @@ Rectangle {
     onHasVariantsChanged: saveState()
     onVariantsNumberChanged: saveState()
     onUploadedFilesChanged: saveState()
+    onDocumentTheoryChanged: saveState()
+    onDocumentTasksChanged: saveState()
+    onDocumentQuestionsChanged: saveState()
+    onDocumentBibliographyChanged: saveState()
+    onTheoryAiCheckChanged: saveState()
+    onTasksAiCheckChanged: saveState()
+    onQuestionsAiCheckChanged: saveState()
+    onBibliographyAiCheckChanged: saveState()
+    onIncludeSpecialInstructionsChanged: saveState()
+    onIncludeUserStyleChanged: saveState()
 
     onTemplateIdChanged: {
         if (templateCombo && templateCombo.model) {
@@ -182,16 +232,7 @@ Rectangle {
         saveState();
     }
 
-    onUserStyleIdChanged: {
-        if (styleCombo && styleCombo.model) {
-            var idx = -1;
-            for (var j = 0; j < styleCombo.model.length; j++) {
-                if (styleCombo.model[j].id === root.userStyleId) { idx = j; break; }
-            }
-            styleCombo.currentIndex = idx;
-        }
-        saveState();
-    }
+
 
     ListModel { id: filesModel }
 
@@ -404,7 +445,7 @@ Rectangle {
                     // ── Section 1: Template & Style ────────────────────────────
                     Rectangle {
                         id: block1
-                        property bool isDone: (root.templateId !== "") && (root.userStyleId !== "")
+                        property bool isDone: (root.templateId !== "")
                         Layout.fillWidth: true
                         radius: theme.radiusLG; color: theme.surface1
                         border.color: isDone ? theme.accent : theme.borderSubtle
@@ -472,53 +513,20 @@ Rectangle {
                                 }
                             }
 
-                            // User Style Block (Instructions)
-                            RowLayout {
-                                spacing: 2
-                                Text { text: "Стиль (інструкції)"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: theme.textPrimary }
-                                Text { text: " *"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: "#EF4444" }
+                            CheckBox {
+                                id: specialInstructionsCheck
+                                text: "Враховувати спеціальні інструкції шаблону " + (root.templateId ? "(" + root.templateId + "_fill.md)" : "") + " 📋"
+                                font.pixelSize: theme.fontSizeSM
+                                checked: root.includeSpecialInstructions
+                                onToggled: root.includeSpecialInstructions = checked
                             }
-                            ComboBox {
-                                id: styleCombo
-                                Layout.fillWidth: true
-                                font.pixelSize: theme.fontSizeMD
-                                model: {
-                                    if (!bridge) return [];
-                                    var instrs = JSON.parse(bridge.getInstructionsFiltered("user_created"));
-                                    instrs.unshift({id: "none", name: "Без додаткового стилю", is_active: false});
-                                    return instrs;
-                                }
-                                textRole: "name"
-                                valueRole: "id"
-                                currentIndex: -1
-                                displayText: currentIndex === -1 ? "Виберіть зі списку" : currentText
-                                Component.onCompleted: {
-                                    var idx = -1;
-                                    for (var i = 0; i < model.length; i++) {
-                                        if (model[i].id === root.userStyleId) { idx = i; break; }
-                                    }
-                                    currentIndex = idx;
-                                }
-                                onActivated: {
-                                    var newVal = currentValue;
-                                    
-                                    // Deactivate others
-                                    for (var i = 1; i < model.length; i++) {
-                                        if (model[i].is_active && model[i].id !== newVal) {
-                                            bridge.toggleInstructionStatus(model[i].id, false);
-                                        }
-                                    }
-                                    if (newVal !== "none") {
-                                        bridge.toggleInstructionStatus(newVal, true);
-                                    }
-                                    
-                                    var instrs = JSON.parse(bridge.getInstructionsFiltered("user_created"));
-                                    instrs.unshift({id: "none", name: "Без додаткового стилю", is_active: false});
-                                    model = instrs;
-                                    
-                                    root.userStyleId = newVal;
-                                    saveState();
-                                }
+
+                            CheckBox {
+                                id: userStyleCheck
+                                text: "Враховувати користувацький стиль (user_style.md) 🎨"
+                                font.pixelSize: theme.fontSizeSM
+                                checked: root.includeUserStyle
+                                onToggled: root.includeUserStyle = checked
                             }
                         }
                     }
@@ -668,6 +676,82 @@ Rectangle {
                                     Layout.fillWidth: true
                                 }
                             }
+
+                            // Теоретичні відомості
+                            Text { text: "Теоретичні відомості"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: theme.textPrimary }
+                            TextArea {
+                                id: theoryField
+                                Layout.fillWidth: true
+                                placeholderText: "Введіть теоретичні відомості (якщо порожньо — ШІ згенерує за темою)..."
+                                height: 80; font.pixelSize: theme.fontSizeLG
+                                wrapMode: TextArea.Wrap
+                                text: root.documentTheory
+                                onTextChanged: root.documentTheory = text
+                            }
+                            CheckBox {
+                                id: theoryAiCheck
+                                text: "Дозволити ШІ покращити це поле ✨"
+                                font.pixelSize: theme.fontSizeSM
+                                checked: root.theoryAiCheck
+                                onToggled: root.theoryAiCheck = checked
+                            }
+
+                            // Завдання
+                            Text { text: "Завдання (по одному на рядок)"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: theme.textPrimary }
+                            TextArea {
+                                id: tasksField
+                                Layout.fillWidth: true
+                                placeholderText: "Введіть завдання, кожне на новому рядку..."
+                                height: 80; font.pixelSize: theme.fontSizeLG
+                                wrapMode: TextArea.Wrap
+                                text: root.documentTasks
+                                onTextChanged: root.documentTasks = text
+                            }
+                            CheckBox {
+                                id: tasksAiCheck
+                                text: "Дозволити ШІ покращити це поле ✨"
+                                font.pixelSize: theme.fontSizeSM
+                                checked: root.tasksAiCheck
+                                onToggled: root.tasksAiCheck = checked
+                            }
+
+                            // Контрольні запитання
+                            Text { text: "Контрольні запитання (по одному на рядок)"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: theme.textPrimary }
+                            TextArea {
+                                id: questionsField
+                                Layout.fillWidth: true
+                                placeholderText: "Введіть контрольні запитання, кожне на новому рядку..."
+                                height: 80; font.pixelSize: theme.fontSizeLG
+                                wrapMode: TextArea.Wrap
+                                text: root.documentQuestions
+                                onTextChanged: root.documentQuestions = text
+                            }
+                            CheckBox {
+                                id: questionsAiCheck
+                                text: "Дозволити ШІ покращити це поле ✨"
+                                font.pixelSize: theme.fontSizeSM
+                                checked: root.questionsAiCheck
+                                onToggled: root.questionsAiCheck = checked
+                            }
+
+                            // Література
+                            Text { text: "Література (по одному джерелу на рядок)"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: theme.textPrimary }
+                            TextArea {
+                                id: bibliographyField
+                                Layout.fillWidth: true
+                                placeholderText: "Введіть джерела літератури, кожне на новому рядку..."
+                                height: 80; font.pixelSize: theme.fontSizeLG
+                                wrapMode: TextArea.Wrap
+                                text: root.documentBibliography
+                                onTextChanged: root.documentBibliography = text
+                            }
+                            CheckBox {
+                                id: bibliographyAiCheck
+                                text: "Дозволити ШІ покращити це поле ✨"
+                                font.pixelSize: theme.fontSizeSM
+                                checked: root.bibliographyAiCheck
+                                onToggled: root.bibliographyAiCheck = checked
+                            }
                         }
                     }
 
@@ -676,7 +760,10 @@ Rectangle {
                         id: sec3Rect
                         property bool isDone: {
                             var isLenDone = (root.lengthMode !== "");
-                            var isVarDone = (root.hasVariants === "no" || (root.hasVariants === "yes" && parseInt(root.variantsNumber, 10) >= 2));
+                            var isVarDone = true;
+                            if (root.templateId === "lab2") {
+                                isVarDone = (root.hasVariants === "no" || (root.hasVariants === "yes" && parseInt(root.variantsNumber, 10) >= 2));
+                            }
                             var isHintsOk = (root.sessionHints.trim() === "" || root.sessionHints.trim().length >= 5);
                             return isLenDone && isVarDone && isHintsOk;
                         }
@@ -757,9 +844,8 @@ Rectangle {
                                 spacing: theme.sp2
                                 Repeater {
                                     model: [
-                                        {id:"none",       label:"Без зображень"},
-                                        {id:"references", label:"Посилання"},
-                                        {id:"full",       label:"Генерація"}
+                                        {id:"none",       label:"Вимкнути зображення"},
+                                        {id:"full",       label:"Увімкнути зображення"}
                                     ]
                                     delegate: PillButton {
                                         theme: root.theme
@@ -774,56 +860,64 @@ Rectangle {
                                 }
                             }
 
-                            RowLayout {
-                                spacing: 2
-                                Text { text: "Додати індивідуальні завдання по варіантам?"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: theme.textPrimary }
-                                Text { text: " *"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: "#EF4444" }
-                            }
-                            Flow {
+                            ColumnLayout {
                                 Layout.fillWidth: true
-                                spacing: theme.sp2
-                                PillButton {
-                                    theme: root.theme
-                                    label: "Так"
-                                    active: root.hasVariants === "yes"
-                                    onClicked: {
-                                        root.hasVariants = (root.hasVariants === "yes") ? "" : "yes"
-                                        root.forceActiveFocus() // Prevent stealing focus
-                                        saveState()
-                                    }
+                                spacing: theme.sp4
+                                visible: root.templateId === "lab2"
+
+                                RowLayout {
+                                    spacing: 2
+                                    Text { text: "Додати індивідуальні завдання по варіантам?"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: theme.textPrimary }
+                                    Text { text: " *"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: "#EF4444" }
                                 }
-                                PillButton {
-                                    theme: root.theme
-                                    label: "Ні"
-                                    active: root.hasVariants === "no"
-                                    onClicked: {
-                                        if (root.hasVariants === "no") {
-                                            root.hasVariants = ""
-                                        } else {
-                                            root.hasVariants = "no"
-                                            root.variantsNumber = ""
+                                Flow {
+                                    Layout.fillWidth: true
+                                    spacing: theme.sp2
+                                    PillButton {
+                                        theme: root.theme
+                                        label: "Так"
+                                        active: root.hasVariants === "yes"
+                                        onClicked: {
+                                            root.hasVariants = (root.hasVariants === "yes") ? "" : "yes"
+                                            root.forceActiveFocus() // Prevent stealing focus
+                                            saveState()
+                                        }
+                                    }
+                                    PillButton {
+                                        theme: root.theme
+                                        label: "Ні"
+                                        active: root.hasVariants === "no"
+                                        onClicked: {
+                                            if (root.hasVariants === "no") {
+                                                root.hasVariants = ""
+                                            } else {
+                                                root.hasVariants = "no"
+                                                root.variantsNumber = ""
+                                            }
+                                            root.forceActiveFocus()
+                                            saveState()
                                         }
                                     }
                                 }
-                            }
-                            
-                            RowLayout {
-                                visible: opacity > 0
-                                opacity: root.hasVariants === "yes" ? 1 : 0
-                                Behavior on opacity { NumberAnimation { duration: 250; easing.type: Easing.OutCubic } }
-                                spacing: theme.sp3
+                                
                                 RowLayout {
-                                    spacing: 2
-                                    Text { text: "Кількість варіантів:"; font.pixelSize: theme.fontSizeMD; color: theme.textSecondary }
-                                    Text { text: " *"; font.pixelSize: theme.fontSizeMD; color: "#EF4444" }
-                                }
-                                TextField {
-                                    placeholderText: "Наприклад: 10"
-                                    font.pixelSize: theme.fontSizeMD
-                                    Layout.preferredWidth: Math.max(150, implicitWidth + 20)
-                                    validator: RegularExpressionValidator { regularExpression: /^[1-9][0-9]?$/ }
-                                    onTextChanged: root.variantsNumber = text
-                                    text: root.variantsNumber
+                                    visible: opacity > 0
+                                    opacity: root.hasVariants === "yes" ? 1 : 0
+                                    Behavior on opacity { NumberAnimation { duration: 250; easing.type: Easing.OutCubic } }
+                                    spacing: theme.sp3
+                                    RowLayout {
+                                        spacing: 2
+                                        Text { text: "Кількість варіантів:"; font.pixelSize: theme.fontSizeMD; color: theme.textSecondary }
+                                        Text { text: " *"; font.pixelSize: theme.fontSizeMD; color: "#EF4444" }
+                                    }
+                                    TextField {
+                                        placeholderText: "Наприклад: 10"
+                                        font.pixelSize: theme.fontSizeMD
+                                        Layout.preferredWidth: Math.max(150, implicitWidth + 20)
+                                        validator: RegularExpressionValidator { regularExpression: /^[1-9][0-9]?$/ }
+                                        onTextChanged: root.variantsNumber = text
+                                        text: root.variantsNumber
+                                    }
                                 }
                             }
                             
@@ -889,7 +983,9 @@ Rectangle {
                     // ── Section 4: Files ───────────────────────────────────────
                     Rectangle {
                         id: sec4Rect
+                        visible: bridge.supportAttachFiles
                         property bool isDone: {
+                            if (!visible) return true;
                             if (!root.uploadedFiles || root.uploadedFiles.length === 0) return false;
                             for (var i = 0; i < root.uploadedFiles.length; i++) {
                                 if (root.uploadedFiles[i].status !== "done") return false;
@@ -902,7 +998,7 @@ Rectangle {
                         border.width: isDone ? 2 : 1
                         Behavior on border.color { ColorAnimation { duration: 400; easing.type: Easing.OutCubic } }
                         Behavior on border.width { NumberAnimation { duration: 400; easing.type: Easing.OutCubic } }
-                        Layout.preferredHeight: sec4Col.implicitHeight + theme.sp6 * 2
+                        Layout.preferredHeight: visible ? (sec4Col.implicitHeight + theme.sp6 * 2) : 0
 
                         ColumnLayout {
                             id: sec4Col
@@ -1331,9 +1427,6 @@ Rectangle {
                     if (root.templateId === undefined || root.templateId === "") {
                         errors.push("• Шаблон документа: обов'язково оберіть зі списку")
                     }
-                    if (root.userStyleId === undefined || root.userStyleId === "") {
-                        errors.push("• Стиль (інструкції): обов'язково оберіть зі списку")
-                    }
                     if (root.documentName === undefined || root.documentName.trim().length < 5) {
                         errors.push("• Назва документу: мінімум 5 символів")
                     }
@@ -1346,38 +1439,54 @@ Rectangle {
                     if (root.documentGoal !== undefined && root.documentGoal.trim().length > 0 && root.documentGoal.trim().length < 5) {
                         errors.push("• Мета: якщо введено, мінімум 5 символів")
                     }
+                    if (root.documentTheory !== undefined && root.documentTheory.trim().length > 0 && root.documentTheory.trim().length < 5) {
+                        errors.push("• Теоретичні відомості: якщо введено, мінімум 5 символів")
+                    }
+                    if (root.documentTasks !== undefined && root.documentTasks.trim().length > 0 && root.documentTasks.trim().length < 5) {
+                        errors.push("• Завдання: якщо введено, мінімум 5 символів")
+                    }
+                    if (root.documentQuestions !== undefined && root.documentQuestions.trim().length > 0 && root.documentQuestions.trim().length < 5) {
+                        errors.push("• Контрольні запитання: якщо введено, мінімум 5 символів")
+                    }
+                    if (root.documentBibliography !== undefined && root.documentBibliography.trim().length > 0 && root.documentBibliography.trim().length < 5) {
+                        errors.push("• Література: якщо введено, мінімум 5 символів")
+                    }
                     if (root.lengthMode === "") {
                         errors.push("• Обсяг документа: обов'язково оберіть один із варіантів")
                     }
-                    if (root.hasVariants === "") {
-                        errors.push("• Додати індивідуальні завдання: обов'язково оберіть Так або Ні")
-                    } else if (root.hasVariants === "yes") {
-                        var vNum = parseInt(root.variantsNumber, 10);
-                        if (isNaN(vNum) || vNum < 2) {
-                            errors.push("• Кількість варіантів: мінімум 2")
+                    if (root.templateId === "lab2") {
+                        if (root.hasVariants === "") {
+                            errors.push("• Додати індивідуальні завдання: обов'язково оберіть Так або Ні")
+                        } else if (root.hasVariants === "yes") {
+                            var vNum = parseInt(root.variantsNumber, 10);
+                            if (isNaN(vNum) || vNum < 2) {
+                                errors.push("• Кількість варіантів: мінімум 2")
+                            }
                         }
                     }
                     if (root.sessionHints.trim().length > 0 && root.sessionHints.trim().length < 5) {
                         errors.push("• Додаткові вказівки: мінімум 5 символів")
                     }
 
-                    var hasFileError = false;
-                    var hasProcessing = false;
-                    for (var i = 0; i < root.uploadedFiles.length; i++) {
-                        if (root.uploadedFiles[i].status === "error") {
-                            hasFileError = true;
-                        } else if (root.uploadedFiles[i].status === "processing") {
-                            hasProcessing = true;
+                    if (bridge.supportAttachFiles) {
+                        var hasFileError = false;
+                        var hasProcessing = false;
+                        for (var i = 0; i < root.uploadedFiles.length; i++) {
+                            if (root.uploadedFiles[i].status === "error") {
+                                hasFileError = true;
+                            } else if (root.uploadedFiles[i].status === "processing") {
+                                hasProcessing = true;
+                            }
                         }
-                    }
-                    if (hasProcessing) {
-                        errors.push("• Зачекайте завершення завантаження всіх файлів")
-                    }
-                    if (hasFileError) {
-                        errors.push("• Видаліть файли з помилками, щоб продовжити")
-                    }
-                    if (contextBarCol.pct >= 100) {
-                        errors.push("• Заповненість контексту перевищує 100%. Видаліть зайві файли.")
+                        if (hasProcessing) {
+                            errors.push("• Зачекайте завершення завантаження всіх файлів")
+                        }
+                        if (hasFileError) {
+                            errors.push("• Видаліть файли з помилками, щоб продовжити")
+                        }
+                        if (contextBarCol.pct >= 100) {
+                            errors.push("• Заповненість контексту перевищує 100%. Видаліть зайві файли.")
+                        }
                     }
                     
                     if (errors.length > 0) {
@@ -1396,16 +1505,26 @@ Rectangle {
                         "userStyleId": root.userStyleId,
                         "lengthMode": root.lengthMode,
                         "image_mode": root.imageMode,
-                        "hasVariants": root.hasVariants,
-                        "variantsNumber": root.variantsNumber,
+                        "hasVariants": root.templateId === "lab2" ? root.hasVariants : "no",
+                        "variantsNumber": root.templateId === "lab2" ? root.variantsNumber : "",
                         "documentTheme": root.documentTheme,
                         "documentGoal": root.documentGoal,
+                        "documentTheory": root.documentTheory,
+                        "documentTasks": root.documentTasks,
+                        "documentQuestions": root.documentQuestions,
+                        "documentBibliography": root.documentBibliography,
                         "labNumber": root.labNumber,
                         "sessionHints": root.sessionHints,
-                        "uploadedFiles": root.uploadedFiles,
+                        "uploadedFiles": bridge.supportAttachFiles ? root.uploadedFiles : [],
                         "nameAiCheck": nameAiCheck.checked,
                         "themeAiCheck": themeAiCheck.checked,
                         "goalAiCheck": goalAiCheck.checked,
+                        "theoryAiCheck": root.theoryAiCheck,
+                        "tasksAiCheck": root.tasksAiCheck,
+                        "questionsAiCheck": root.questionsAiCheck,
+                        "bibliographyAiCheck": root.bibliographyAiCheck,
+                        "includeSpecialInstructions": root.includeSpecialInstructions,
+                        "includeUserStyle": root.includeUserStyle,
                         "hasCompletedSections": true
                     }
                     root.navigate("confirm_document")

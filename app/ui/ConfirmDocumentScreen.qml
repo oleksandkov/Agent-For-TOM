@@ -53,35 +53,37 @@ Rectangle {
 
                     // List of user choices
                     Repeater {
-                        model: [
-                            { label: "Назва документу:", value: sessionPayload.documentName || "Не вказано", aiChecked: sessionPayload.nameAiCheck },
-                            { label: "Шаблон документа:", value: (function() {
-                                var tmplId = sessionPayload.template_id;
-                                if (!tmplId) return "Не вказано";
-                                var templates = JSON.parse(bridge.getTemplates());
-                                for (var i = 0; i < templates.length; i++) {
-                                    if (templates[i].id === tmplId) return templates[i].display_name;
-                                }
-                                return "Невідомий шаблон";
-                            })(), aiChecked: false },
-                            { label: "Стиль (інструкції):", value: (function() {
-                                var styleId = sessionPayload.userStyleId;
-                                if (!styleId || styleId === "none") return "Без додаткового стилю";
-                                var instrs = JSON.parse(bridge.getInstructionsFiltered("user_created"));
-                                for (var j = 0; j < instrs.length; j++) {
-                                    if (instrs[j].id === styleId) return instrs[j].name;
-                                }
-                                return "Невідомий стиль";
-                            })(), aiChecked: false },
-                            { label: "Тема:", value: sessionPayload.documentTheme || "Не вказано", aiChecked: sessionPayload.themeAiCheck },
-                            { label: "Мета:", value: sessionPayload.documentGoal ? sessionPayload.documentGoal : "Немає", aiChecked: sessionPayload.goalAiCheck },
-                            { label: "Номер лабораторної:", value: sessionPayload.labNumber || "Не вказано", aiChecked: false },
-                            { label: "Обсяг:", value: sessionPayload.lengthMode || "middle", aiChecked: false },
-                            { label: "Режим зображень:", value: sessionPayload.image_mode === "references" ? "Посилання" : (sessionPayload.image_mode === "full" ? "Генерація" : "Без зображень"), aiChecked: false },
-                            { label: "Індивідуальні завдання:", value: sessionPayload.hasVariants === "yes" ? sessionPayload.variantsNumber : (sessionPayload.hasVariants === "no" ? "Немає" : "Не вказано"), aiChecked: false },
-                            { label: "Додаткові вказівки:", value: sessionPayload.sessionHints ? sessionPayload.sessionHints : "Немає", aiChecked: false },
-                            { label: "Файли контексту:", value: sessionPayload.uploadedFiles && sessionPayload.uploadedFiles.length > 0 ? sessionPayload.uploadedFiles.map(function(f){return f.name}).join(", ") : "Немає", aiChecked: false }
-                        ]
+                        model: {
+                            var items = [
+                                { label: "Назва документу:", value: sessionPayload.documentName || "Не вказано", aiChecked: sessionPayload.nameAiCheck },
+                                { label: "Шаблон документа:", value: (function() {
+                                    var tmplId = sessionPayload.template_id;
+                                    if (!tmplId) return "Не вказано";
+                                    var templates = JSON.parse(bridge.getTemplates());
+                                    for (var i = 0; i < templates.length; i++) {
+                                        if (templates[i].id === tmplId) return templates[i].display_name;
+                                    }
+                                    return "Невідомий шаблон";
+                                })(), aiChecked: false },
+                                { label: "Враховувати користувацький стиль (user_style.md):", value: sessionPayload.includeUserStyle === true ? "Так" : "Ні", aiChecked: false },
+                                { label: "Тема:", value: sessionPayload.documentTheme || "Не вказано", aiChecked: sessionPayload.themeAiCheck },
+                                { label: "Мета:", value: sessionPayload.documentGoal ? sessionPayload.documentGoal : "Немає", aiChecked: sessionPayload.goalAiCheck },
+                                { label: "Теоретичні відомості:", value: sessionPayload.documentTheory ? sessionPayload.documentTheory : "Немає", aiChecked: sessionPayload.theoryAiCheck },
+                                { label: "Завдання:", value: sessionPayload.documentTasks ? sessionPayload.documentTasks : "Немає", aiChecked: sessionPayload.tasksAiCheck },
+                                { label: "Контрольні запитання:", value: sessionPayload.documentQuestions ? sessionPayload.documentQuestions : "Немає", aiChecked: sessionPayload.questionsAiCheck },
+                                { label: "Література:", value: sessionPayload.documentBibliography ? sessionPayload.documentBibliography : "Немає", aiChecked: sessionPayload.bibliographyAiCheck },
+                                { label: "Номер лабораторної:", value: sessionPayload.labNumber || "Не вказано", aiChecked: false },
+                                { label: "Обсяг:", value: sessionPayload.lengthMode || "middle", aiChecked: false },
+                                { label: "Режим зображень:", value: sessionPayload.image_mode === "references" ? "Посилання" : (sessionPayload.image_mode === "full" ? "Генерація" : "Без зображень"), aiChecked: false }
+                            ];
+                            if (sessionPayload.template_id === "lab2") {
+                                items.push({ label: "Індивідуальні завдання:", value: sessionPayload.hasVariants === "yes" ? sessionPayload.variantsNumber : (sessionPayload.hasVariants === "no" ? "Немає" : "Не вказано"), aiChecked: false });
+                            }
+                            items.push({ label: "Спеціальні інструкції шаблону:", value: sessionPayload.includeSpecialInstructions === true ? "Так" : "Ні", aiChecked: false });
+                            items.push({ label: "Додаткові вказівки:", value: sessionPayload.sessionHints ? sessionPayload.sessionHints : "Немає", aiChecked: false });
+                            items.push({ label: "Файли контексту:", value: sessionPayload.uploadedFiles && sessionPayload.uploadedFiles.length > 0 ? sessionPayload.uploadedFiles.map(function(f){return f.name}).join(", ") : "Немає", aiChecked: false });
+                            return items;
+                        }
                         RowLayout {
                             Layout.fillWidth: true
                             spacing: theme.sp4
