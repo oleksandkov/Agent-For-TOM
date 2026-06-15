@@ -209,7 +209,7 @@ class QwenRunner:
                         headers={
                             "Authorization": f"Bearer {openrouter_key}",
                             "HTTP-Referer": "https://github.com/agent-for-tom",
-                            "X-Title": "Agent-For-TOM",
+                            "X-Title": "Agent-For-Labs",
                         },
                         json={
                             "model": current_model,

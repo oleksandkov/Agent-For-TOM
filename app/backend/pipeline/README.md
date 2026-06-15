@@ -1,4 +1,4 @@
-# Agent-For-TOM Backend Pipeline — Implementation Status
+# Agent-For-Labs Backend Pipeline — Implementation Status
 
 This document describes what is implemented in `app/backend/pipeline/`
 as of the current commit, what works end-to-end, and the **known

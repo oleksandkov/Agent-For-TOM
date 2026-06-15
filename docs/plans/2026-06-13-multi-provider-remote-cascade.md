@@ -56,7 +56,7 @@ groq>=0.11.0
 
 **Step 2.** Install in the active venv:
 ```bash
-cd C:\Github\Agent-For-TOM
+cd C:\Github\Agent-For-Labs
 uv pip install -r requirements.txt
 ```
 
@@ -243,7 +243,7 @@ def _call_openrouter_json_llm(prompt: str) -> tuple[dict[str, Any] | None, dict[
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "HTTP-Referer": "https://github.com/agent-for-tom",
-                "X-Title": "Agent-For-TOM",
+                "X-Title": "Agent-For-Labs",
             },
             json={
                 "model": model,
@@ -462,7 +462,7 @@ class TestRemoteCascade(unittest.TestCase):
 
 **Step 2.** Run only these tests:
 ```bash
-cd C:\Github\Agent-For-TOM
+cd C:\Github\Agent-For-Labs
 .venv\Scripts\python.exe -m unittest tests.test_synthesizer.TestRemoteCascade -v
 ```
 
@@ -524,7 +524,7 @@ This already works — no change needed; the cascade's `source` field is overrid
 
 **Step 1.**
 ```bash
-cd C:\Github\Agent-For-TOM
+cd C:\Github\Agent-For-Labs
 .venv\Scripts\python.exe -m unittest tests.test_synthesizer -v
 ```
 
@@ -541,7 +541,7 @@ Pick (a) for safety; we can delete in a follow-up commit if no caller remains.
 ### Task 7: Add `.env` entries (manual, requires user-provided keys)
 **Why:** The cascade only does anything if at least one provider has a key.
 
-**Files:** `C:\Github\Agent-For-TOM\.env`
+**Files:** `C:\Github\Agent-For-Labs\.env`
 
 **Step 1.** Ask the user which of the three providers they have keys for. Append only the lines they confirm:
 ```bash
@@ -571,7 +571,7 @@ Pick (a) for safety; we can delete in a follow-up commit if no caller remains.
 
 **Step 1.** With at least one key configured in `.env`:
 ```bash
-cd C:\Github\Agent-For-TOM
+cd C:\Github\Agent-For-Labs
 .venv\Scripts\python.exe -c "
 from app.backend.llm.synthesizer import synthesize_gap_values
 r = synthesize_gap_values(
@@ -612,7 +612,7 @@ This calls the cascade directly and shows the aggregated error.
 
 **Step 1.**
 ```bash
-cd C:\Github\Agent-For-TOM
+cd C:\Github\Agent-For-Labs
 .venv\Scripts\python.exe run_pipeline.py example_session
 ```
 

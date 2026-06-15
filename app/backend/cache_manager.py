@@ -1,4 +1,4 @@
-"""cache_manager.py — 3-level caching for Agent-For-TOM pipeline.
+"""cache_manager.py — 3-level caching for Agent-For-Labs pipeline.
 
 Level 1 — LLM Cache: stores full LLM responses keyed by prompt fingerprint.
     Avoids redundant API calls when the same template + params + files

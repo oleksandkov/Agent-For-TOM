@@ -983,7 +983,7 @@ Rectangle {
                     // ── Section 4: Files ───────────────────────────────────────
                     Rectangle {
                         id: sec4Rect
-                        visible: bridge.supportAttachFiles
+                        visible: typeof bridge !== "undefined" && bridge !== null && bridge.supportAttachFiles !== undefined ? bridge.supportAttachFiles : true
                         property bool isDone: {
                             if (!visible) return true;
                             if (!root.uploadedFiles || root.uploadedFiles.length === 0) return false;

@@ -105,7 +105,7 @@ def _call_openrouter_json_llm(prompt: str) -> tuple[dict[str, Any] | None, dict[
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "HTTP-Referer": "https://github.com/agent-for-tom",
-                    "X-Title": "Agent-For-TOM",
+                    "X-Title": "Agent-For-Labs",
                 },
                 json={
                     "model": current_model,

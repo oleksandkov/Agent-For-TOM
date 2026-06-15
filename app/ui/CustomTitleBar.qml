@@ -39,7 +39,7 @@ Rectangle {
         }
         Item { width: theme.sp2 }
         Text {
-            text: "Agent-For-TOM"
+            text: "Agent-For-Labs"
             color: theme.textPrimary
             font.pixelSize: theme.fontSizeSM
             font.weight: Font.Medium

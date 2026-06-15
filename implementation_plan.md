@@ -1,6 +1,6 @@
-# Implementation Plan: PyQt6 + QML Desktop Interface for Agent-For-TOM
+# Implementation Plan: PyQt6 + QML Desktop Interface for Agent-For-Labs
 
-This plan details how to build the desktop interface for **Agent-For-TOM** using **PyQt6** and **QML (Qt Quick)**. It outlines the application architecture, directory structure, visual styling, and provides the starting boilerplate files to run a premium, modern prototype.
+This plan details how to build the desktop interface for **Agent-For-Labs** using **PyQt6** and **QML (Qt Quick)**. It outlines the application architecture, directory structure, visual styling, and provides the starting boilerplate files to run a premium, modern prototype.
 
 ---
 
@@ -61,7 +61,7 @@ This plan details how to build the desktop interface for **Agent-For-TOM** using
 We will create a structured and modular directory under the workspace root:
 
 ```
-Agent-For-TOM/
+Agent-For-Labs/
 ├── app/
 │   ├── __init__.py
 │   ├── bridge.py             # QObject subclass to communicate with QML
@@ -87,22 +87,22 @@ Agent-For-TOM/
 
 Below is the proposed implementation of the core boilerplate files.
 
-### 1. [NEW] [main.py](file:///e:/Programming/Agent-For-TOM/main.py)
+### 1. [NEW] [main.py](file:///e:/Programming/Agent-For-Labs/main.py)
 Entry point to load the QML engine, register the Python Bridge, and style the Material theme.
 
-### 2. [NEW] [bridge.py](file:///e:/Programming/Agent-For-TOM/app/bridge.py)
+### 2. [NEW] [bridge.py](file:///e:/Programming/Agent-For-Labs/app/bridge.py)
 The Python-to-QML bridge implementing slots for configuration loading, session listing, and launching threads.
 
-### 3. [NEW] [worker.py](file:///e:/Programming/Agent-For-TOM/app/worker.py)
+### 3. [NEW] [worker.py](file:///e:/Programming/Agent-For-Labs/app/worker.py)
 The background worker subclassing `QThread` executing pipeline stages sequentially without locking the GUI.
 
-### 4. [NEW] [main.qml](file:///e:/Programming/Agent-For-TOM/app/ui/main.qml)
+### 4. [NEW] [main.qml](file:///e:/Programming/Agent-For-Labs/app/ui/main.qml)
 The parent QML container managing layout, dark theme settings, sidebar navigation, and StackView routing.
 
-### 5. [NEW] [Dashboard.qml](file:///e:/Programming/Agent-For-TOM/app/ui/screens/Dashboard.qml)
+### 5. [NEW] [Dashboard.qml](file:///e:/Programming/Agent-For-Labs/app/ui/screens/Dashboard.qml)
 The Session list screen displaying active, draft, and completed jobs with badge statuses.
 
-### 6. [NEW] [SessionForm.qml](file:///e:/Programming/Agent-For-TOM/app/ui/screens/SessionForm.qml)
+### 6. [NEW] [SessionForm.qml](file:///e:/Programming/Agent-For-Labs/app/ui/screens/SessionForm.qml)
 The parameter and document generation launch form.
 
 ---

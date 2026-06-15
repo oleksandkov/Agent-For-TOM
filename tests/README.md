@@ -1,6 +1,6 @@
 # Tests
 
-Smoke + integration tests for the Agent-For-TOM backend pipeline.
+Smoke + integration tests for the Agent-For-Labs backend pipeline.
 
 ## Running
 

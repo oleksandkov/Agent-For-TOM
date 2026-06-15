@@ -1,4 +1,4 @@
-"""run_pipeline.py — CLI entry point for the Agent-For-TOM pipeline.
+"""run_pipeline.py — CLI entry point for the Agent-For-Labs pipeline.
 
 Usage:
     python run_pipeline.py <transit_session_id>
@@ -83,7 +83,7 @@ def _resolve_sessions(args: argparse.Namespace) -> list[Path]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Run the Agent-For-TOM pipeline on a transit snapshot.",
+        description="Run the Agent-For-Labs pipeline on a transit snapshot.",
     )
     parser.add_argument("session_id", nargs="?", help="Session id under app/debug/transit/")
     parser.add_argument("--transit-dir", help="Explicit transit directory path")

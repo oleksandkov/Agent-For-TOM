@@ -57,7 +57,7 @@ Rectangle {
                     mipmap: true
                 }
                 Text {
-                    text: "Agent-For-TOM"
+                    text: "Agent-For-Labs"
                     font.pixelSize: theme.fontSizeLG
                     font.weight: Font.DemiBold
                     color: theme.textPrimary

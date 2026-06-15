@@ -17,7 +17,7 @@ Rectangle {
     property bool isFinished: false
     property bool hasError: false
     property string errorMessage: ""
-    property var logLines: []
+    property var logLines: ApplicationWindow.window ? ApplicationWindow.window.sessionLogLines : []
     property var stepStates: ["pending","pending","pending","pending","pending","pending"]
 
     // Names for the 6 pipeline steps
@@ -47,7 +47,6 @@ Rectangle {
             root.isRunning = true
             root.isFinished = false
             root.hasError = false
-            root.logLines = []
             root.stepStates = ["pending","pending","pending","pending","pending","pending"]
         }
 
@@ -66,13 +65,6 @@ Rectangle {
             var states = root.stepStates.slice()
             states[stepIndex] = "done"
             root.stepStates = states
-        }
-
-        function onPipelineLog(timestamp, message) {
-            var lines = root.logLines.slice()
-            lines.push({time: timestamp, msg: message})
-            if (lines.length > 50) lines = lines.slice(-50)
-            root.logLines = lines
         }
 
         function onPipelineFinished(sessionId) {

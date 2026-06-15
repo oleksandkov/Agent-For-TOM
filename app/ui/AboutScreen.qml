@@ -73,7 +73,7 @@ Rectangle {
 
                 Text {
                     Layout.alignment: Qt.AlignHCenter
-                    text: "Agent-For-TOM"
+                    text: "Agent-For-Labs"
                     font.pixelSize: theme.fontSizeH1 * 1.5
                     font.weight: Font.Bold
                     color: theme.textPrimary
@@ -199,6 +199,7 @@ Rectangle {
             }
 
             // ── Inspired By ───────────────────────────────────────────────
+            /*
             Text {
                 text: "Натхненно"
                 font.pixelSize: theme.fontSizeH1
@@ -243,6 +244,7 @@ Rectangle {
                     }
                 }
             }
+            */
         }
     }
 }

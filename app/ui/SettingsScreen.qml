@@ -121,7 +121,7 @@ Rectangle {
                         id: aboutCol
                         anchors { left: parent.left; right: parent.right; top: parent.top; margins: theme.sp4 }
                         spacing: theme.sp1
-                        Text { text: "Agent-For-TOM"; font.pixelSize: theme.fontSizeXL; font.weight: Font.DemiBold; color: theme.textPrimary; wrapMode: Text.WordWrap; Layout.fillWidth: true }
+                        Text { text: "Agent-For-Labs"; font.pixelSize: theme.fontSizeXL; font.weight: Font.DemiBold; color: theme.textPrimary; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                         Text { text: "Версія 1.0.0  ·  PyQt6 + QML"; font.pixelSize: theme.fontSizeMD; color: theme.textSecondary; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                         Text { text: "2-pass pipeline  ·  SQLite  ·  3 cache levels"; font.pixelSize: theme.fontSizeSM; color: theme.textTertiary; wrapMode: Text.WordWrap; Layout.fillWidth: true }
                     }

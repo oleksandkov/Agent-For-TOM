@@ -1,4 +1,4 @@
-"""app/backend/pipeline — Agent-For-TOM backend pipeline package.
+"""app/backend/pipeline — Agent-For-Labs backend pipeline package.
 
 Public entry points:
   - PipelineRunner / run_pipeline_for_session (orchestrator)

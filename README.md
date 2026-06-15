@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🤖 Agent-For-TOM
+# 🤖 Agent-For-Labs
 
 **Your Personal AI Assistant for Ukrainian Academic Documents**
 
@@ -81,8 +81,8 @@ graph TD
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/iberikofer/Agent-For-TOM.git
-   cd Agent-For-TOM
+   git clone https://github.com/iberikofer/Agent-For-Labs.git
+   cd Agent-For-Labs
    ```
 
 2. **Install dependencies**

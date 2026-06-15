@@ -1,5 +1,5 @@
 -- app/db/schema/001_init.sql
--- Agent-For-TOM: 9 main tables + schema_version tracker.
+-- Agent-For-Labs: 9 main tables + schema_version tracker.
 -- Source of truth: docs/database.md (Combined/) +
 --   Plan/backend3/database/database implementation plan.md
 -- Conventions:

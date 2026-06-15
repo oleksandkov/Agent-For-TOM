@@ -11,7 +11,7 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, r"C:\Github\Agent-For-TOM")
+sys.path.insert(0, r"C:\Github\Agent-For-Labs")
 
 # Monkey-patch BEFORE the synthesizer module imports _call_local_qwen_json_llm
 from app.backend.llm import synthesizer as _synth

@@ -1,4 +1,4 @@
-# app/db — Agent-For-TOM database
+# app/db — Agent-For-Labs database
 
 Single SQLite file (`agent.db`) holds **everything** the app needs at
 rest: templates, instructions, the file library, sessions, pipeline

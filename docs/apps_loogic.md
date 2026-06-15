@@ -1,4 +1,4 @@
-# Apps pipeline — Agent-For-TOM (Combined v2)
+# Apps pipeline — Agent-For-Labs (Combined v2)
 
 Архітектура: **2 проходи** (Text LLM → Image Processing Stage) + **5 вхідних елементів**.
 

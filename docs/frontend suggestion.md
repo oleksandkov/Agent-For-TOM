@@ -1,4 +1,4 @@
-# Frontend Suggestion — Agent-For-TOM (Combined v2)
+# Frontend Suggestion — Agent-For-Labs (Combined v2)
 
 ## З яких файлів виведені вимоги
 

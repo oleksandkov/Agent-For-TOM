@@ -49,7 +49,7 @@ class ResponseParseResult:
 
 
 class ResponseParser:
-    """Parse and validate LLM responses for the Agent-For-TOM pipeline."""
+    """Parse and validate LLM responses for the Agent-For-Labs pipeline."""
 
     MANIFEST_SEPARATOR = "<!--IMAGE_MANIFEST-->"
 

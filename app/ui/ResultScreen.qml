@@ -15,6 +15,7 @@ Rectangle {
     property string activeTab: "overview"
 
     property bool isFailed: resultData.status === "failed"
+    property var logLines: ApplicationWindow.window ? ApplicationWindow.window.sessionLogLines : []
 
     Component.onCompleted: {
         resultData = JSON.parse(bridge.getSessionResult())
@@ -232,6 +233,95 @@ Rectangle {
                                         color: "#CDD6F4"
                                         wrapMode: Text.Wrap
                                         lineHeight: 1.6
+                                    }
+                                }
+                            }
+                        }
+
+                        // Live log
+                        Rectangle {
+                            Layout.fillWidth: true
+                            height: logHeader.height + logBody.height
+                            radius: theme.radiusLG
+                            color: theme.surface1
+                            border.color: theme.borderSubtle
+                            border.width: 1
+                            clip: true
+
+                            ColumnLayout {
+                                anchors { left: parent.left; right: parent.right; top: parent.top }
+                                spacing: 0
+
+                                // Log header
+                                Rectangle {
+                                    id: logHeader
+                                    Layout.fillWidth: true
+                                    height: 40
+                                    color: theme.surface2
+                                    radius: theme.radiusLG
+
+                                    Rectangle {
+                                        anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.right: parent.right
+                                        height: parent.height / 2; color: parent.color
+                                    }
+                                    Rectangle {
+                                        anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.right: parent.right
+                                        height: 1; color: theme.borderSubtle
+                                    }
+
+                                    RowLayout {
+                                        anchors.fill: parent; anchors.margins: theme.sp4
+                                        RowLayout {
+                                            spacing: theme.sp2
+                                            Rectangle {
+                                                width: 6; height: 6; radius: 3; color: theme.success
+                                            }
+                                            Text { text: "Live log"; font.pixelSize: theme.fontSizeMD; font.weight: Font.Medium; color: theme.textPrimary }
+                                        }
+                                        Item { Layout.fillWidth: true }
+                                        Text { text: root.logLines.length + " рядків"; font.pixelSize: theme.fontSizeSM; color: theme.textTertiary }
+                                    }
+                                }
+
+                                // Log body
+                                Rectangle {
+                                    id: logBody
+                                    Layout.fillWidth: true
+                                    height: 180
+                                    color: theme.surfaceBase
+
+                                    ListView {
+                                        id: logView
+                                        anchors.fill: parent
+                                        anchors.margins: theme.sp4
+                                        model: root.logLines
+                                        clip: true
+                                        spacing: 2
+                                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOn }
+                                        onCountChanged: Qt.callLater(function() {
+                                            positionViewAtEnd()
+                                        })
+
+                                        delegate: RowLayout {
+                                            width: logView.width
+                                            spacing: theme.sp4
+                                            Text {
+                                                text: modelData.time
+                                                font.pixelSize: theme.fontSizeXS
+                                                color: theme.textTertiary
+                                                font.family: "JetBrains Mono, Consolas, monospace"
+                                            }
+                                            Text {
+                                                text: modelData.msg
+                                                font.pixelSize: theme.fontSizeXS
+                                                color: modelData.msg.indexOf("[done]") >= 0 ? theme.success
+                                                     : (modelData.msg.indexOf("[llm]") >= 0 || modelData.msg.indexOf("[image]") >= 0 ? theme.accent
+                                                     : theme.textSecondary)
+                                                font.family: "JetBrains Mono, Consolas, monospace"
+                                                Layout.fillWidth: true
+                                                wrapMode: Text.Wrap
+                                            }
+                                        }
                                     }
                                 }
                             }

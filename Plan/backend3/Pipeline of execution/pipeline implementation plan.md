@@ -1,4 +1,4 @@
-# План пайплайну виконання Agent-For-TOM (v3)
+# План пайплайну виконання Agent-For-Labs (v3)
 
 > **Джерело головної ідеї:** `None ai/working/backend3/Pipeline of execution/Pipeline.md` (Step 0–5, debug-папки `transit/compact/main_out/image-gen/output`, поділ Special/Universal параметрів, GIVE ACCESS TO AI per gap).
 >

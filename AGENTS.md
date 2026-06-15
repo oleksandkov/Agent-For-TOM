@@ -1,4 +1,4 @@
-# Agent-For-TOM
+# Agent-For-Labs
 
 Desktop Python application that uses free HuggingFace LLM models to generate
 standardized Ukrainian academic documents (lab reports, methodological guides,

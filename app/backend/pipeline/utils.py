@@ -1,6 +1,6 @@
 """app/backend/pipeline/utils.py
 
-Shared utilities for the Agent-For-TOM backend pipeline.
+Shared utilities for the Agent-For-Labs backend pipeline.
 
 Responsibilities:
   - locate the project root and the canonical directory layout

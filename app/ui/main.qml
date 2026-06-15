@@ -18,7 +18,7 @@ ApplicationWindow {
         clearSessionPayload()
         bridge.clearTransitFolder()
     }
-    title: "Agent-For-TOM"
+    title: "Agent-For-Labs"
     flags: Qt.Window | Qt.FramelessWindowHint | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint
     
     property bool isReadyForResize: false
@@ -52,6 +52,21 @@ ApplicationWindow {
     
     // Shared state between New Session and Confirm Session
     property var sessionPayload: ({})
+    property var sessionLogLines: []
+
+    Connections {
+        target: bridge
+        function onPipelineStarted() {
+            root.sessionLogLines = []
+        }
+        function onPipelineLog(timestamp, message) {
+            var lines = root.sessionLogLines.slice()
+            lines.push({time: timestamp, msg: message})
+            // Keep up to 500 lines for the result screen log
+            if (lines.length > 500) lines = lines.slice(-500)
+            root.sessionLogLines = lines
+        }
+    }
 
     Timer {
         id: restoreMaximizedTimer

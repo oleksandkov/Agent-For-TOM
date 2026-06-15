@@ -1,5 +1,5 @@
 -- app/db/schema/003_indexes.sql
--- All indexes for the Agent-For-TOM database. Created AFTER tables
+-- All indexes for the Agent-For-Labs database. Created AFTER tables
 -- so that the schema stays in a single coherent forward migration.
 
 -- ── sessions ──────────────────────────────────────────────────────────

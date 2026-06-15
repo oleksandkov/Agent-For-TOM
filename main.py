@@ -1,5 +1,5 @@
 """
-Agent-For-TOM — Desktop Application Launcher
+Agent-For-Labs — Desktop Application Launcher
 PyQt6 + QML, Single-user, SQLite, 2-pass AI pipeline
 """
 import sys
@@ -39,9 +39,9 @@ def main():
     os.environ.setdefault("QT_QUICK_CONTROLS_MATERIAL_ACCENT", "#0F766E")
 
     app = QApplication(sys.argv)
-    app.setApplicationName("Agent-For-TOM")
-    app.setApplicationDisplayName("Agent-For-TOM")
-    app.setOrganizationName("Agent-For-TOM")
+    app.setApplicationName("Agent-For-Labs")
+    app.setApplicationDisplayName("Agent-For-Labs")
+    app.setOrganizationName("Agent-For-Labs")
     app.setApplicationVersion("1.0.0")
 
     # Set app icon
