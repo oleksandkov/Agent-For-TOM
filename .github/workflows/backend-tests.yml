@@ -1,0 +1,62 @@
+name: backend-tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packages/backend/**"
+      - ".github/workflows/backend-tests.yml"
+  pull_request:
+    paths:
+      - "packages/backend/**"
+      - ".github/workflows/backend-tests.yml"
+
+defaults:
+  run:
+    working-directory: packages/backend
+
+jobs:
+  lint:
+    name: ruff (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+      - name: Sync dependencies
+        run: uv sync --frozen --all-groups
+      - name: Ruff lint
+        run: uv run ruff check src tests
+      - name: Ruff format check
+        run: uv run ruff format --check src tests
+
+  typecheck:
+    name: mypy (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+      - name: Sync dependencies
+        run: uv sync --frozen --all-groups
+      - name: mypy
+        run: uv run mypy src/backend/tom
+
+  test:
+    name: pytest (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: latest
+      - name: Sync dependencies
+        run: uv sync --frozen --all-groups
+      - name: pytest
+        run: uv run pytest -q --cov=backend.tom --cov-report=term-missing

@@ -233,13 +233,3 @@ __marimo__/
 
 # Oleksandkov 
 
-*none ai/*
-.qwen/
-.env.example
-*/backendPlan/*
-
-cache/
-# agent.db
-app/config/.db_key
-
-debug/
