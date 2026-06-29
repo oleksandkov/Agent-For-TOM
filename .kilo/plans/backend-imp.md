@@ -165,7 +165,76 @@ MCP is how TOM extends itself. We need (a) an MCP client lifecycle in-process an
 
 ---
 
-## Section 8 — Built-in MCP Servers (tom-docx, tom-pdf, tom-fmt)
+## Section 8 — Local Debugging & Manual Test Harness (playground)
+
+### Description
+Dev-only UI to manually exercise the **provider abstraction (§5)** and **tool dispatch (§7)** end-to-end without depending on the desktop colleague's UI. Two surfaces, both gated by an env var:
+
+- **`tom playground …` CLI** — terminal REPL into any configured provider; tool call inspector
+- **`GET /v1/playground` HTML page** — single-file browser UI with SSE streaming
+
+There is **no audit trail, no session persistence, no core-memory mutation** here. The harness exists so the dev can: (a) verify a freshly added `provider_configs` row is wired correctly, (b) send ad-hoc prompts and see streamed tokens immediately, (c) exercise the MCP dispatcher by hand, (d) tweak the system prompt in §10 and iterate on the response shape fast. Production builds leave this off.
+
+### Feedback
+<!-- TBD — terminal-only vs. HTML preferred, default port, whether the HTML page should support file uploads. -->
+
+### What to do
+- [ ] `src/backend/tom/playground/__init__.py`
+- [ ] `playground/security.py`: `ensure_playground_enabled()` raises `PermissionError` (logs the offending subcommand) unless `TOM_PLAYGROUND == "1"`; expose `is_playground_enabled()` for the FastAPI layer
+- [ ] `playground/cli.py`: REPL loop — `input()` → `provider.chat()` → print streamed `text_delta` chunks live; `Ctrl+D` / `exit` / `quit` end it; flags `--provider NAME`, `--temperature`, `--max-tokens`
+- [ ] `playground/cli.py`: `playground providers` subcommand lists configured providers + runs `health()` on each, prints JSON
+- [ ] `playground/cli.py`: `playground call <tool_name> '<json-args>'` invokes a single MCP tool through the dispatcher (Section 7) and prints the result; refuses if the env gate is closed
+- [ ] `playground/web.py`: single-file HTML (vanilla, no JS framework); uses `EventSource` for SSE; provider + model dropdown populated from the registry; raw `<pre>` output area
+- [ ] `src/backend/tom/api/playground.py`: FastAPI router, mounted only when `is_playground_enabled()` is true; `GET /v1/playground` (HTML) and `POST /v1/playground/chat` (SSE)
+- [ ] Wire `tom playground chat|providers|call` subcommands in `__main__.py` (behind the env gate)
+- [ ] `docs/dev-playground.md`: usage, curl examples, security note (default-off, loopback-only)
+- [ ] Tests: unit for CLI parser (flags + REPL input → call args); unit for security gate (`TOM_PLAYGROUND=0/1` matrix); e2e SSE with `httpx` + a stub provider
+
+### Manual test sequence (from this section onward)
+
+```bash
+# 0. Seed a provider (assuming TOM_DATA_DIR set)
+uv run python -c "
+import os; os.environ.setdefault('TOM_DATA_DIR', 'C:/tmp/tom-pg-smoke')
+from backend.tom.db.init_db import init_db
+from backend.tom.db.session import SessionLocal
+from backend.tom.db.models import ProviderConfigORM
+init_db()
+s = SessionLocal(); s.add(ProviderConfigORM(
+    name='local', type='ollama', model='qwen2:1.5b', is_default=True, fallback_chain=[]
+)); s.commit(); s.close()
+"
+
+# 1. List providers + health (JSON)
+TOM_PLAYGROUND=1 uv run python -m backend.tom playground providers
+
+# 2. Terminal REPL into a provider
+TOM_PLAYGROUND=1 uv run python -m backend.tom playground chat --provider local
+> hello, who are you?
+streaming reply on stdout...
+> /exit
+
+# 3. Web page only reachable when the server's env matches
+TOM_PLAYGROUND=1 uv run python -m backend.tom serve &
+curl -s http://127.0.0.1:7878/v1/playground | head -40      # HTML
+curl -N -X POST http://127.0.0.1:7878/v1/playground/chat \
+     -H 'Content-Type: application/json' \
+     -d '{"provider":"local","messages":[{"role":"user","content":"hi"}]}'
+
+# 4. Without the env var, the same server must refuse
+TOM_PLAYGROUND= uv run python -m backend.tom serve &
+curl -i http://127.0.0.1:7878/v1/playground                     # 403 / 404
+
+# 5. Invoke a tool directly through the dispatcher
+TOM_PLAYGROUND=1 uv run python -m backend.tom playground call echo '{"msg":"hi"}'
+```
+
+### Security
+Default-off in every code path; the env var is the only barrier between a developer install and arbitrary prompt execution. The hardening pass in **§12 (Permissions & Security Hardening)** tightens the gate further (per-binding origin checks, rate limit). **Do not bind anywhere except `127.0.0.1:7878`** while the playground is open.
+
+---
+
+## Section 9 — Built-in MCP Servers (tom-docx, tom-pdf, tom-fmt)
 
 ### Description
 Three concrete servers the user can call from chat on day one. Each is a small Python package with a manifest, registered in the loader, and tested with real fixtures.
@@ -189,7 +258,7 @@ Three concrete servers the user can call from chat on day one. Each is a small P
 
 ---
 
-## Section 9 — Agent Instructions & System Prompt
+## Section 10 — Agent Instructions & System Prompt
 
 ### Description
 The instructions file is what makes TOM behave like TOM, not generic Langflow. Lives in code (version-controlled) but copyable per-user overrides into `core_memory.json` are allowed for personalization.
@@ -207,7 +276,7 @@ The instructions file is what makes TOM behave like TOM, not generic Langflow. L
 
 ---
 
-## Section 10 — Self-Improvement Pipeline
+## Section 11 — Self-Improvement Pipeline
 
 ### Description
 The "kill feature": hourly pattern detection → LLM-generated MCP skill draft → sandbox test → user approval queue. Backend builds A, B, C, D; frontend (E) is colleague's. Contract between them must be frozen before either starts.
@@ -216,29 +285,29 @@ The "kill feature": hourly pattern detection → LLM-generated MCP skill draft �
 <!-- Detection thresholds (similarity X, min N occurrences), which LLM does drafting, sandbox platform rules. -->
 
 ### What to do
-- [ ] **10.A Pattern detector**
+- [ ] **11.A Pattern detector**
   - [ ] `improvement/detector.py`: asyncio cron, every hour by default (configurable)
   - [ ] Embedding-based clustering of `archival` rows from last 7 days
   - [ ] Threshold: ≥3 sessions with cosine > X in window → `Pattern` row
   - [ ] Unit: threshold logic; e2e: seed sessions, run detector, assert patterns
-- [ ] **10.B Skill scaffolder**
+- [ ] **11.B Skill scaffolder**
   - [ ] `improvement/scaffolder.py`: takes a Pattern + sample sessions, builds a prompt to our chosen LLM, asks for an MCP server (Python, stdio), constrained to a fixed template
   - [ ] Generates files under `data_dir/skills/generated/{uuid}/`: `manifest.json`, `server.py`, `pyproject.toml` (with deps pinned)
   - [ ] `py_compile` check; second LLM call reviews code for red flags (network calls, `subprocess`, `os.system`, `eval`, file writes outside scope)
   - [ ] Marks skill `status='draft'` if clean
-- [ ] **10.C Sandbox**
+- [ ] **11.C Sandbox**
   - [ ] `improvement/sandbox.py`: subprocess invocation of generated server, with per-call timeout, **no network** (per-platform: Linux namespaces via `unshare`, macOS `pf` rule, Windows outbound firewall rule — pick one and document), read-only FS except `data_dir/skills/generated/{uuid}/`
   - [ ] Smoke test the sandbox on each platform (CI matrix if feasible)
-- [ ] **10.D Approval API**
+- [ ] **11.D Approval API**
   - [ ] `GET /v1/improvement/inbox`: lists Pattern + draft Skill pairs (preview payload includes code + risk flags)
   - [ ] `POST /v1/skills/{id}/approve`: `draft → active`, registers in MCP loader; audit log entry
   - [ ] `POST /v1/skills/{id}/reject`: marks `rejected`, archives pattern; audit log
   - [ ] Contracts frozen here and posted to colleague via `docs/api.md` (this is the [SYNC] boundary)
-- [ ] Tests: full e2e: seed pattern → scaffolder → sandbox runs → pending in inbox → approve → active in registry
+  - [ ] Tests: full e2e: seed pattern → scaffolder → sandbox runs → pending in inbox → approve → active in registry
 
 ---
 
-## Section 11 — Permissions & Security Hardening
+## Section 12 — Permissions & Security Hardening
 
 ### Description
 Cross-cutting. Some items are colocated with the section that introduces them — this section is the audit + final pass before any release work.
@@ -252,13 +321,14 @@ Cross-cutting. Some items are colocated with the section that introduces them �
 - [ ] Tool-call allowlist per session: by default only manifest-declared tools; deny rest
 - [ ] Auto-skill risk flags: at minimum must flag `urllib.request`, `socket.*`, `requests.`, `subprocess`, `shutil.rmtree`, `os.remove`, `eval`/`exec`, `open(path, 'w')` outside manifest `writable_paths`
 - [ ] Rate limit: `/v1/chat` per session (default 30 req/min, configurable)
+- [ ] Tighten the **playground (§8)** gate: per-binding origin check, rate limit, refuse when `TOM_AUTO_APPROVE=1`
 - [ ] Audit log: every state-changing API writes an `audit_log` row
 - [ ] `.env.example` documents required env vars without values
 - [ ] Threat-model doc in `docs/security.md` (frontend developer may need to read it — link from colleague's plan)
 
 ---
 
-## Section 12 — Testing Strategy
+## Section 13 — Testing Strategy
 
 ### Description
 Continuous through every section, consolidated here. You run unit + e2e before each PR; CI gates the merge.
@@ -272,12 +342,12 @@ Continuous through every section, consolidated here. You run unit + e2e before e
 - [ ] `ruff check` and `ruff format --check` in CI
 - [ ] E2E tests in `tests/e2e/`: each is a Python script using `httpx` against `localhost:7878`
 - [ ] Fixture data directory generated in tempdir for test isolation
-- [ ] Smoke checklist per section appended to `docs/smoke-checks.md`
+- [ ] Smoke checklist per section appended to `docs/smoke-checks.md` (the playground smoke block in §8 is the template)
 - [ ] Make `make test` the single command backend runs locally before push
 
 ---
 
-## Section 13 — Release Readiness (Documentation, Backup/Restore, Cleanup)
+## Section 14 — Release Readiness (Documentation, Backup/Restore, Cleanup)
 
 ### Description
 Backend deliverable for Phase 8 minus packaging. Docs that the colleague needs to integrate, backup/restore tested, license clean.
@@ -289,10 +359,11 @@ Backend deliverable for Phase 8 minus packaging. Docs that the colleague needs t
 - [ ] `docs/api.md`: full REST contract with curl examples for every endpoint (this is the contract colleague consumes)
 - [ ] `docs/memory.md`: user-facing description of the 3 tiers + how core_memory.json is edited
 - [ ] `docs/skills.md`: how MCP servers are written, where they live, how to enable
+- [ ] `docs/dev-playground.md` (from §8): how to enable, security note, curl examples
 - [ ] `scripts/backup.sh` and `scripts/restore.sh`: tar/untar data_dir, encrypt with `age`/`gpg` optional; smoke-test restore against tempdir
 - [ ] `scripts/dev.sh`: starts backend + spawns any built-in MCP servers; readable by colleague
 - [ ] LICENSE audit: confirm every runtime dep is MIT/BSD/Apache-compatible; flag any GPL
-- [ ] `README.md` of backend: how to run, how to test, how to add a provider, how to add a skill
+- [ ] `README.md` of backend: how to run, how to test, how to add a provider, how to add a skill, how to use the playground
 - [ ] Hand off `docs/api.md` to colleague via PR comment
 
 ---
@@ -310,5 +381,6 @@ Backend deliverable for Phase 8 minus packaging. Docs that the colleague needs t
 
 - Which Langflow pin? (record in Section 2 Feedback once known)
 - Skill scaffolder: which model does the drafting? Same as user's chat provider, or a separate "system" provider configured in `provider_configs`?
-- Sandbox on Windows: firewall rule vs WSL — pick one and lock in Section 10.C Feedback
-- Where do we draw the API contract freeze deadlines relative to Section 10 (so colleague has time)?
+- Sandbox on Windows: firewall rule vs WSL — pick one and lock in Section 11.C Feedback
+- Where do we draw the API contract freeze deadlines relative to Section 11 (so colleague has time)?
+- Playground (§8) default port + whether the HTML page needs file uploads — record in §8 Feedback.

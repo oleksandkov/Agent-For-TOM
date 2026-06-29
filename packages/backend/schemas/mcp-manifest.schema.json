@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tom.local/schemas/mcp-manifest.schema.json",
+  "title": "TOM MCP server manifest",
+  "description": "Schema for an MCP server bundled or auto-generated for TOM.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "version", "entrypoint", "capabilities"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{1,63}$",
+      "description": "Unique server name. Lowercase, stable across builds."
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+([.-].*)?$"
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 1024
+    },
+    "entrypoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "args"],
+      "properties": {
+        "command": {"type": "string", "minLength": 1},
+        "args": {
+          "type": "array",
+          "items": {"type": "string"},
+          "minItems": 1
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        },
+        "cwd": {"type": "string"}
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["tools", "resources", "prompts"]
+      },
+      "minItems": 1
+    },
+    "permissions": {
+      "type": "array",
+      "items": {"type": "string"},
+      "default": []
+    },
+    "risk_flags": {
+      "type": "array",
+      "items": {"type": "string"},
+      "default": []
+    },
+    "writable_paths": {
+      "type": "array",
+      "items": {"type": "string"},
+      "default": []
+    },
+    "tool_timeout_seconds": {
+      "type": "number",
+      "minimum": 1,
+      "maximum": 600,
+      "default": 30
+    }
+  }
+}

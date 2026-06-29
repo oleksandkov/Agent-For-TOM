@@ -218,18 +218,13 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# docx
+# docx (pre-built artifacts only; do not commit authored docs)
 
 *.docx
 
 
-# Html
+# TOC of removed legacy references:
 
-.html
-
-!app/frontend/index.html
-
-
-
-# Oleksandkov 
+# !app/frontend/index.html    ← was an exception for the old `app/` project;
+#                                directory has been removed, rule is no-op
 
