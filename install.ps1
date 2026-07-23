@@ -4,11 +4,11 @@
 .DESCRIPTION
     Installs the TOMAS coding agent globally. Works both:
       - Locally:   powershell -ExecutionPolicy Bypass -File install.ps1
-      - Remote:    powershell -c "iex (iwr -Uri https://raw.githubusercontent.com/YOUR_USER/TOMAS/main/install.ps1)"
+      - Remote:    powershell -c "iex (iwr -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)"
 .PARAMETER InstallDir
     Where to install TOMAS (default: ~/.tomas).
 .PARAMETER RepoUrl
-    GitHub archive URL to download (default: https://github.com/USER/TOMAS/archive/main.zip).
+    GitHub archive URL to download (default: https://github.com/oleksandkov/Agent-For-TOM/archive/prototype2-refactoring.zip).
     Leave as default to skip remote download (local install mode).
 .PARAMETER NoPrompt
     Skip interactive prompts.
@@ -16,7 +16,7 @@
 
 param(
     [string]$InstallDir = "",
-    [string]$RepoUrl = "https://github.com/USER/TOMAS/archive/main.zip",
+    [string]$RepoUrl = "https://github.com/oleksandkov/Agent-For-TOM/archive/prototype2-refactoring.zip",
     [switch]$NoPrompt
 )
 
@@ -112,7 +112,7 @@ else {
         # Extract archive
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $env:TEMP)
-        $extracted = Get-ChildItem (Join-Path $env:TEMP "TOMAS-*") -Directory | Select-Object -First 1
+        $extracted = Get-ChildItem (Join-Path $env:TEMP "Agent-For-TOM-*") -Directory | Select-Object -First 1
         if ($extracted) {
             # Remove old src, copy new
             if (Test-Path $SrcDir) { Remove-Item -Path $SrcDir -Recurse -Force }
@@ -177,7 +177,7 @@ $python = Join-Path $tomasDir ".venv" "Scripts" "python.exe"
 $cli = Join-Path $tomasDir "src" "agent_cli.py"
 if (-not (Test-Path $python)) {{
     Write-Host "ERROR: TOMAS venv not found at $python" -ForegroundColor Red
-    Write-Host "Reinstall with: powershell -c `"iex (iwr -Uri <install-url>)`"" -ForegroundColor Yellow
+    Write-Host "Reinstall with: powershell -c `"iex (iwr -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)`"" -ForegroundColor Yellow
     exit 1
 }}
 & $python $cli @args

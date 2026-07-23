@@ -8,13 +8,11 @@ An AI coding agent that runs in your terminal. Built on the same architecture as
 # ═══════════════════════════════════════════════════════════
 
 # Windows (PowerShell)
-powershell -ExecutionPolicy Bypass -c "iex (iwr -Uri https://raw.githubusercontent.com/YOUR_USER/TOMAS/main/install.ps1)"
+powershell -ExecutionPolicy Bypass -c "iex (iwr -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)"
 
 # Linux / macOS / WSL
-curl -fsSL https://raw.githubusercontent.com/YOUR_USER/TOMAS/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.sh | bash
 ```
-
-> **Note:** Replace `YOUR_USER` with the actual GitHub username or organization hosting the repo.
 
 After install, open a **new terminal** and run:
 
@@ -142,12 +140,12 @@ Re-run the same install command — it will download the latest version:
 
 ```powershell
 # Windows
-powershell -c "iex (iwr -Uri https://raw.githubusercontent.com/YOUR_USER/TOMAS/main/install.ps1)"
+powershell -c "iex (iwr -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)"
 ```
 
 ```bash
 # Linux/macOS
-curl -fsSL https://raw.githubusercontent.com/YOUR_USER/TOMAS/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.sh | bash
 ```
 
 ---
@@ -157,8 +155,8 @@ curl -fsSL https://raw.githubusercontent.com/YOUR_USER/TOMAS/main/install.sh | b
 If you want to hack on TOMAS locally:
 
 ```bash
-git clone https://github.com/YOUR_USER/TOMAS.git
-cd TOMAS
+git clone https://github.com/oleksandkov/Agent-For-TOM.git
+cd Agent-For-TOM
 python -m venv .venv
 # Windows: .venv\Scripts\activate
 # Linux/macOS: source .venv/bin/activate

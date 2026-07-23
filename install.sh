@@ -3,14 +3,14 @@
 # TOMAS Agent Installer — for Linux / macOS / WSL
 #
 # Usage:
-#   Remote:  curl -fsSL https://raw.githubusercontent.com/USER/TOMAS/main/install.sh | bash
+#   Remote:  curl -fsSL https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.sh | bash
 #   Local:   bash install.sh
 #
 # Config — edit these before running if you fork the repo:
 # ============================================================================
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/USER/TOMAS/archive/main.zip}"
+REPO_URL="${REPO_URL:-https://github.com/oleksandkov/Agent-For-TOM/archive/prototype2-refactoring.zip}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.tomas}"
 
 BIN_DIR="$INSTALL_DIR/bin"
@@ -113,8 +113,8 @@ else
     
     unzip -q -o "$TMP_ZIP" -d "$TMP_DIR" || fail "Extraction failed"
     
-    # Find extracted directory (GitHub creates a folder like TOMAS-main/)
-    EXTRACTED=$(find "$TMP_DIR" -maxdepth 1 -type d -name "TOMAS-*" | head -1)
+    # Find extracted directory (GitHub creates a folder like Agent-For-TOM-prototype2-refactoring/)
+    EXTRACTED=$(find "$TMP_DIR" -maxdepth 1 -type d -name "Agent-For-TOM-*" | head -1)
     if [ -z "$EXTRACTED" ]; then
         # Try alternate naming
         EXTRACTED=$(find "$TMP_DIR" -maxdepth 1 -type d ! -path "$TMP_DIR" | head -1)
@@ -179,7 +179,7 @@ fi
 
 if [ ! -f "\$PYTHON" ]; then
     echo "ERROR: TOMAS venv not found"
-    echo "Reinstall with: curl -fsSL <install-url> | bash"
+    echo "Reinstall with: curl -fsSL https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.sh | bash"
     exit 1
 fi
 
