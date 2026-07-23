@@ -150,6 +150,19 @@ if (-not (Test-Path $VenvDir)) {
 # ── Install dependencies ───────────────────────────────────────────────────
 Write-Host ""
 Write-Host "  [5/7] Installing Python dependencies..." -ForegroundColor Cyan
+
+# Check that pip exists before using it
+if (-not (Test-Path $PipExe)) {
+    Write-Host "  [INFO] pip not found in venv, running ensurepip..." -ForegroundColor Yellow
+    & $PythonExe -m ensurepip --upgrade 2>&1 | Out-Null
+    if (-not (Test-Path $PipExe)) {
+        Write-Host "  [FAIL] pip is not available in the virtual environment" -ForegroundColor Red
+        Write-Host "         Try deleting $VenvDir and re-running the installer" -ForegroundColor Yellow
+        exit 1
+    }
+    Write-Host "  [OK] pip installed in virtual environment" -ForegroundColor Green
+}
+
 & $PipExe install --quiet --upgrade pip 2>&1 | Out-Null
 $reqFile = Join-Path $SrcDir "requirements.txt"
 if (Test-Path $reqFile) {
@@ -174,11 +187,12 @@ $ps1Content = @'
 # TOMAS.ps1 — TOMAS Agent Launcher (installed)
 $ErrorActionPreference = "Stop"
 $tomasDir = "{InstallDir}"
-$python = Join-Path $tomasDir ".venv" "Scripts" "python.exe"
-$cli = Join-Path $tomasDir "src" "agent_cli.py"
+$venvDir = Join-Path $tomasDir ".venv"
+$python = Join-Path (Join-Path $venvDir "Scripts") "python.exe"
+$cli = Join-Path (Join-Path $tomasDir "src") "agent_cli.py"
 if (-not (Test-Path $python)) {{
     Write-Host "ERROR: TOMAS venv not found at $python" -ForegroundColor Red
-    Write-Host "Reinstall with: powershell -c `"iex (iwr -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)`"" -ForegroundColor Yellow
+    Write-Host "Reinstall with: powershell -c `"iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)`"" -ForegroundColor Yellow
     exit 1
 }}
 & $python $cli @args
