@@ -8,7 +8,7 @@ An AI coding agent that runs in your terminal. Built on the same architecture as
 # ═══════════════════════════════════════════════════════════
 
 # Windows (PowerShell)
-powershell -ExecutionPolicy Bypass -c "iex (iwr -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)"
+powershell -ExecutionPolicy Bypass -c "iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)"
 
 # Linux / macOS / WSL
 curl -fsSL https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.sh | bash
@@ -140,7 +140,7 @@ Re-run the same install command — it will download the latest version:
 
 ```powershell
 # Windows
-powershell -c "iex (iwr -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)"
+powershell -c "iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)"
 ```
 
 ```bash
