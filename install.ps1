@@ -267,14 +267,14 @@ $tomasDir = "{InstallDir}"
 $venvDir = Join-Path $tomasDir ".venv"
 # Detect Scripts vs bin directory (Windows vs MSYS2/MinGW venvs)
 $venvBin = "Scripts"
-if (Test-Path (Join-Path $venvDir "bin")) {{ $venvBin = "bin" }}
+if (Test-Path (Join-Path $venvDir "bin")) { $venvBin = "bin" }
 $python = Join-Path (Join-Path $venvDir $venvBin) "python.exe"
 $cli = Join-Path (Join-Path $tomasDir "src") "agent_cli.py"
-if (-not (Test-Path $python)) {{
+if (-not (Test-Path $python)) {
     Write-Host "ERROR: TOMAS venv not found at $python" -ForegroundColor Red
     Write-Host "Reinstall with: powershell -c `"iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)`"" -ForegroundColor Yellow
     exit 1
-}}
+}
 & $python $cli @args
 exit $LASTEXITCODE
 '@ -replace '{InstallDir}', $InstallDir
@@ -421,10 +421,10 @@ $paths = $currentPath -split ';' | Where-Object { $_ -ne $binDir }
 Write-Host "  [OK] Removed $binDir from PATH" -ForegroundColor Green
 
 # Remove install directory
-if (Test-Path $tomasDir) {{
+if (Test-Path $tomasDir) {
     Remove-Item -Path $tomasDir -Recurse -Force
     Write-Host "  [OK] Deleted $tomasDir" -ForegroundColor Green
-}}
+}
 
 Write-Host ""
 Write-Host "  TOMAS has been uninstalled." -ForegroundColor Green
