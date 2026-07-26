@@ -28,9 +28,19 @@ $BinDir      = Join-Path $InstallDir "bin"
 $SrcDir      = Join-Path $InstallDir "src"
 $VenvDir     = Join-Path $InstallDir ".venv"
 $EnvFile     = Join-Path $InstallDir ".env"
-$PythonExe   = Join-Path (Join-Path $VenvDir "Scripts") "python.exe"
-$PipExe      = Join-Path (Join-Path $VenvDir "Scripts") "pip.exe"
+
 $LauncherPs1 = Join-Path $BinDir "TOMAS.ps1"
+
+# Helper: detect whether the venv uses bin/ (MSYS2) or Scripts/ (Windows)
+function Get-VenvScriptsDir {
+    param([string]$VenvDir)
+    if (Test-Path (Join-Path $VenvDir "bin"))      { return "bin" }
+    if (Test-Path (Join-Path $VenvDir "Scripts"))  { return "Scripts" }
+    return $null
+}
+# Default to Windows path; will be corrected after venv validation/creation.
+$PythonExe = Join-Path (Join-Path $VenvDir "Scripts") "python.exe"
+$PipExe    = Join-Path (Join-Path $VenvDir "Scripts") "pip.exe"
 $LauncherCmd = Join-Path $BinDir "TOMAS.cmd"
 $LauncherBat = Join-Path $BinDir "TOMAS.bat"
 
@@ -136,7 +146,22 @@ else {
 Write-Host ""
 Write-Host "  [4/7] Creating virtual environment..." -ForegroundColor Cyan
 
-if (-not (Test-Path $VenvDir)) {
+# Check if existing venv has a working Python executable (bin or Scripts)
+$venvScriptsDir = Get-VenvScriptsDir $VenvDir
+$venvPythonOk = $false
+if ($venvScriptsDir) {
+    $PythonExe = Join-Path (Join-Path $VenvDir $venvScriptsDir) "python.exe"
+    $PipExe    = Join-Path (Join-Path $VenvDir $venvScriptsDir) "pip.exe"
+    try {
+        $ver = & $PythonExe -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
+        if ($ver) { $venvPythonOk = $true }
+    } catch {}
+}
+if (-not $venvPythonOk) {
+    if (Test-Path $VenvDir) {
+        Write-Host "  [WARN] Existing venv is corrupted, removing..." -ForegroundColor Yellow
+        Remove-Item -Path $VenvDir -Recurse -Force
+    }
     & $pythonPath -m venv $VenvDir
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  [FAIL] Failed to create virtual environment" -ForegroundColor Red
@@ -147,6 +172,15 @@ if (-not (Test-Path $VenvDir)) {
     Write-Host "  [OK] Virtual environment already exists" -ForegroundColor Green
 }
 
+# Detect venv script directory (Scripts on Windows, bin on MSYS2/MinGW)
+$scriptsDir = Get-VenvScriptsDir $VenvDir
+if (-not $scriptsDir) {
+    Write-Host "  [FAIL] Could not detect venv script directory" -ForegroundColor Red
+    exit 1
+}
+$PythonExe = Join-Path (Join-Path $VenvDir $scriptsDir) "python.exe"
+$PipExe    = Join-Path (Join-Path $VenvDir $scriptsDir) "pip.exe"
+
 # ── Install dependencies ───────────────────────────────────────────────────
 Write-Host ""
 Write-Host "  [5/7] Installing Python dependencies..." -ForegroundColor Cyan
@@ -154,6 +188,24 @@ Write-Host "  [5/7] Installing Python dependencies..." -ForegroundColor Cyan
 # Check that pip exists before using it
 if (-not (Test-Path $PipExe)) {
     Write-Host "  [INFO] pip not found in venv, running ensurepip..." -ForegroundColor Yellow
+    if (-not (Test-Path $PythonExe)) {
+        Write-Host "  [FAIL] Python executable missing in venv" -ForegroundColor Red
+        Write-Host "         Deleting corrupted venv and recreating..." -ForegroundColor Yellow
+        Remove-Item -Path $VenvDir -Recurse -Force
+        & $pythonPath -m venv $VenvDir
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  [FAIL] Failed to recreate virtual environment" -ForegroundColor Red
+            exit 1
+        }
+        # Re-detect Scripts vs bin after recreation (MSYS2 uses bin)
+        $scriptsDir = Get-VenvScriptsDir $VenvDir
+        if (-not $scriptsDir) {
+            Write-Host "  [FAIL] Could not detect venv script directory after recreation" -ForegroundColor Red
+            exit 1
+        }
+        $PythonExe = Join-Path (Join-Path $VenvDir $scriptsDir) "python.exe"
+        $PipExe    = Join-Path (Join-Path $VenvDir $scriptsDir) "pip.exe"
+    }
     & $PythonExe -m ensurepip --upgrade 2>&1 | Out-Null
     if (-not (Test-Path $PipExe)) {
         Write-Host "  [FAIL] pip is not available in the virtual environment" -ForegroundColor Red
@@ -163,7 +215,7 @@ if (-not (Test-Path $PipExe)) {
     Write-Host "  [OK] pip installed in virtual environment" -ForegroundColor Green
 }
 
-& $PipExe install --quiet --upgrade pip 2>&1 | Out-Null
+& $PipExe install --quiet --upgrade pip setuptools wheel 2>&1 | Out-Null
 $reqFile = Join-Path $SrcDir "requirements.txt"
 if (Test-Path $reqFile) {
     & $PipExe install --quiet -r $reqFile
@@ -171,7 +223,13 @@ if (Test-Path $reqFile) {
         Write-Host "  [OK] Dependencies installed successfully" -ForegroundColor Green
     } else {
         Write-Host "  [FAIL] Failed to install some dependencies" -ForegroundColor Red
-        Write-Host "         Run manually: $PipExe install -r $reqFile"
+        Write-Host "         Run manually: $PipExe install -r $reqFile" -ForegroundColor Yellow
+        if ($PipExe -like "*\bin\*") {
+            Write-Host "         Note: MSYS2 Python detected (bin/ venv). Some Rust-based" -ForegroundColor Yellow
+            Write-Host "               packages (e.g. jiter) may need python.org Python for" -ForegroundColor Yellow
+            Write-Host "               pre-built wheels." -ForegroundColor Yellow
+            Write-Host "         Try using python.org Python 3.12 if you see build errors." -ForegroundColor Yellow
+        }
     }
 } else {
     Write-Host "  [WARN] No requirements.txt found" -ForegroundColor Yellow
@@ -188,7 +246,10 @@ $ps1Content = @'
 $ErrorActionPreference = "Stop"
 $tomasDir = "{InstallDir}"
 $venvDir = Join-Path $tomasDir ".venv"
-$python = Join-Path (Join-Path $venvDir "Scripts") "python.exe"
+# Detect Scripts vs bin directory (Windows vs MSYS2/MinGW venvs)
+$venvBin = "Scripts"
+if (Test-Path (Join-Path $venvDir "bin")) {{ $venvBin = "bin" }}
+$python = Join-Path (Join-Path $venvDir $venvBin) "python.exe"
 $cli = Join-Path (Join-Path $tomasDir "src") "agent_cli.py"
 if (-not (Test-Path $python)) {{
     Write-Host "ERROR: TOMAS venv not found at $python" -ForegroundColor Red
@@ -203,11 +264,13 @@ exit $LASTEXITCODE
 Write-Host "  [OK] $LauncherPs1" -ForegroundColor Green
 
 # TOMAS.cmd — CMD launcher (so `TOMAS` works from cmd.exe)
+# Detect Scripts vs bin directory (Windows vs MSYS2/MinGW venvs)
+$venvBin = "Scripts"; if (Test-Path (Join-Path $VenvDir "bin")) { $venvBin = "bin" }
 $cmdContent = @'
 @echo off
 set "TOMAS_DIR={InstallDir}"
-"{InstallDir}\.venv\Scripts\python.exe" "{InstallDir}\src\agent_cli.py" %*
-'@ -replace '{InstallDir}', $InstallDir
+"{InstallDir}\.venv\{VenvBin}\python.exe" "{InstallDir}\src\agent_cli.py" %*
+'@ -replace '{InstallDir}', $InstallDir -replace '\{VenvBin\}', $venvBin
 
 [System.IO.File]::WriteAllText($LauncherCmd, $cmdContent, [System.Text.Encoding]::UTF8)
 Write-Host "  [OK] $LauncherCmd" -ForegroundColor Green
@@ -215,6 +278,45 @@ Write-Host "  [OK] $LauncherCmd" -ForegroundColor Green
 # TOMAS.bat — also create in bin (some environments prefer .bat)
 Copy-Item $LauncherCmd $LauncherBat -Force
 Write-Host "  [OK] $LauncherBat" -ForegroundColor Green
+
+# ── Create upgrade & uninstall commands ──────────────────────────────────
+# TOMAS-upgrade.cmd — re-run remote install
+$upgradeBat = Join-Path $BinDir "TOMAS-upgrade.cmd"
+$upgradeContent = @'
+@echo off
+echo   ==========================================
+echo       TOMAS Upgrade
+echo   ==========================================
+echo.
+echo   Upgrading TOMAS from GitHub...
+echo.
+powershell -ExecutionPolicy Bypass -c "iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)"
+if %ERRORLEVEL% neq 0 (
+    echo   Upgrade failed. See messages above.
+    pause
+)
+'@
+[System.IO.File]::WriteAllText($upgradeBat, $upgradeContent, [System.Text.Encoding]::UTF8)
+Write-Host "  [OK] $upgradeBat" -ForegroundColor Green
+
+# TOMAS-uninstall.cmd — call uninstall.ps1
+$uninstallBat = Join-Path $BinDir "TOMAS-uninstall.cmd"
+$uninstallContent = @'
+@echo off
+echo   ==========================================
+echo       TOMAS Uninstall
+echo   ==========================================
+echo.
+echo   This will remove TOMAS completely from your system.
+echo.
+powershell -ExecutionPolicy Bypass -File "{UninstallPs1}"
+if %ERRORLEVEL% neq 0 (
+    echo   Uninstall may have failed. See messages above.
+    pause
+)
+'@ -replace '{UninstallPs1}', (Join-Path $BinDir "uninstall.ps1")
+[System.IO.File]::WriteAllText($uninstallBat, $uninstallContent, [System.Text.Encoding]::UTF8)
+Write-Host "  [OK] $uninstallBat" -ForegroundColor Green
 
 # ── Set up .env ─────────────────────────────────────────────────────────────
 Write-Host ""
@@ -326,23 +428,14 @@ Write-Host "    Source code:   $SrcDir" -ForegroundColor White
 Write-Host "    Python venv:   $VenvDir" -ForegroundColor White
 Write-Host "    Launchers:     $BinDir" -ForegroundColor White
 Write-Host ""
-
-if ($changed -or -not $isPiped) {
-    Write-Host "  ----------------------------------------------" -ForegroundColor DarkGray
-    Write-Host "  To use TOMAS now:" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "    1. Close this terminal and open a NEW one" -ForegroundColor White
-    Write-Host "    2. Type:  TOMAS" -ForegroundColor Cyan
-    Write-Host "    3. First time? Edit your API key in:" -ForegroundColor White
-    Write-Host "       $EnvFile" -ForegroundColor DarkGray
-    Write-Host ""
-    Write-Host "  Or run this in your current terminal:" -ForegroundColor Yellow
-    Write-Host "    TOMAS --help" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "  To update TOMAS, re-run the install command." -ForegroundColor DarkGray
-    Write-Host "  To uninstall:  uninstall-tomas" -ForegroundColor DarkGray
-    Write-Host "  ----------------------------------------------" -ForegroundColor DarkGray
-} else {
-    Write-Host "  Close and reopen your terminal, then run: TOMAS" -ForegroundColor Yellow
-}
+Write-Host "  Commands:" -ForegroundColor Yellow
+Write-Host "    TOMAS              Run the agent" -ForegroundColor Cyan
+Write-Host "    TOMAS-upgrade      Update TOMAS from GitHub" -ForegroundColor Cyan
+Write-Host "    TOMAS-uninstall    Remove TOMAS completely" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "  First time? Edit your API key in:" -ForegroundColor White
+Write-Host "    $EnvFile" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "  Close this terminal, open a NEW one, then run: TOMAS" -ForegroundColor Yellow
+Write-Host ""
 Write-Host ""
