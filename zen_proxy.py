@@ -472,11 +472,11 @@ class ZenProxyHandler(BaseHTTPRequestHandler):
         self._send_json(200, zen_json)
 
     def log_message(self, format, *args):
-        """Log all non-2xx responses for diagnostics."""
-        msg = args[0] if args else ""
-        if " 2" in msg:  # 200, 201 etc → quiet
-            return
-        sys.stderr.write(f"{DIM}[ZEN PROXY] {msg}{RESET}\n")
+        """Silent logger — proxy noise is suppressed from user output.
+        
+        Upstream errors are logged separately in the request handler.
+        """
+        pass
 
 
 def start_proxy(port: int = DEFAULT_PORT, daemon: bool = False) -> HTTPServer:

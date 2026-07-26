@@ -6,7 +6,7 @@ Inspired by the Hermes AI self-improvement approach: the agent monitors
 conversations, identifies repetitive patterns, generates reusable skills,
 and produces tips to improve its own behaviour over time.
 
-Data is stored under .agent/self-improve/:
+Data is stored under ~/.tomas/self-improve/:
   - interactions.jsonl   — every user message + tool call, timestamped
   - patterns.json         — detected repetitive patterns with metadata
   - tips.json             — generated self-improvement tips
@@ -26,7 +26,7 @@ from typing import Any, Optional
 
 # ── Constants ──────────────────────────────────────────────────────────
 
-SELF_IMPROVE_DIR = Path.cwd() / ".agent" / "self-improve"
+SELF_IMPROVE_DIR = Path.home() / ".tomas" / "self-improve"
 INTERACTIONS_FILE = SELF_IMPROVE_DIR / "interactions.jsonl"
 PATTERNS_FILE = SELF_IMPROVE_DIR / "patterns.json"
 TIPS_FILE = SELF_IMPROVE_DIR / "tips.json"
@@ -553,7 +553,7 @@ count: {count}
 def _register_skill(skill_name: str, skill_file: Path) -> None:
     """
     Register the auto-generated skill so it appears in skill listings.
-    We put a copy into the .agent/self-improve/skills/ directory.
+    We put a copy into the ~/.tomas/self-improve/skills/ directory.
     The skills_manager already scans global dirs, so we also add a
     reference in a local registry file that build_skills_section can read.
     """

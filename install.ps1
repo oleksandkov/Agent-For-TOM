@@ -95,9 +95,15 @@ Write-Host "  [OK] Python $ver found at: $pythonPath" -ForegroundColor Green
 
 # ── Create directory structure ─────────────────────────────────────────────
 Write-Host ""
-Write-Host "  [2/7] Setting up directories..." -ForegroundColor Cyan
+Write-Host "  [2/9] Setting up directories..." -ForegroundColor Cyan
 $null = New-Item -ItemType Directory -Path $BinDir -Force
 $null = New-Item -ItemType Directory -Path $SrcDir -Force
+$null = New-Item -ItemType Directory -Path (Join-Path $InstallDir "sessions") -Force
+$null = New-Item -ItemType Directory -Path (Join-Path $InstallDir "self-improve") -Force
+$null = New-Item -ItemType Directory -Path (Join-Path $InstallDir "memory") -Force
+$null = New-Item -ItemType Directory -Path (Join-Path $InstallDir "self-notes") -Force
+$null = New-Item -ItemType Directory -Path (Join-Path $InstallDir "instructions") -Force
+$null = New-Item -ItemType Directory -Path (Join-Path (Join-Path $InstallDir "instructions") "project") -Force
 Write-Host "  [OK] Install directory: $InstallDir" -ForegroundColor Green
 
 # ── Get source code ────────────────────────────────────────────────────────
@@ -106,7 +112,7 @@ $hasLocalSource = $localSource -and (Test-Path (Join-Path $localSource "agent.py
 
 if ($hasLocalSource) {
     Write-Host ""
-    Write-Host "  [3/7] Copying local source..." -ForegroundColor Cyan
+    Write-Host "  [3/9] Copying local source..." -ForegroundColor Cyan
     # Copy all project files except excluded patterns
     $exclude = @('.venv', '__pycache__', '.git', '.agent', '*.pyc', '.gitignore')
     Get-ChildItem -Path $localSource -File | Where-Object {
@@ -120,7 +126,7 @@ if ($hasLocalSource) {
 }
 else {
     Write-Host ""
-    Write-Host "  [3/7] Downloading from GitHub..." -ForegroundColor Cyan
+    Write-Host "  [3/9] Downloading from GitHub..." -ForegroundColor Cyan
     Write-Host "       URL: $RepoUrl" -ForegroundColor DarkGray
 
     $zipPath = Join-Path $env:TEMP "tomas-$(Get-Random).zip"
@@ -159,7 +165,7 @@ else {
 
 # ── Create virtual environment ─────────────────────────────────────────────
 Write-Host ""
-Write-Host "  [4/7] Creating virtual environment..." -ForegroundColor Cyan
+Write-Host "  [4/9] Creating virtual environment..." -ForegroundColor Cyan
 
 # Check if existing venv has a working Python executable (bin or Scripts)
 $existingPythonExe = Get-VenvPythonExe $VenvDir
@@ -201,7 +207,7 @@ if (-not $script:PipExe) {
 
 # ── Install dependencies ───────────────────────────────────────────────────
 Write-Host ""
-Write-Host "  [5/7] Installing Python dependencies..." -ForegroundColor Cyan
+Write-Host "  [5/9] Installing Python dependencies..." -ForegroundColor Cyan
 
 # Check that pip exists before using it; if not, run ensurepip
 if (-not $script:PipExe) {
@@ -256,7 +262,7 @@ if (Test-Path $reqFile) {
 
 # ── Create launcher scripts ────────────────────────────────────────────────
 Write-Host ""
-Write-Host "  [6/7] Creating launcher scripts..." -ForegroundColor Cyan
+Write-Host "  [6/9] Creating launcher scripts..." -ForegroundColor Cyan
 
 # TOMAS.ps1 — PowerShell launcher (used by the PATH entry)
 $ps1Content = @'
@@ -337,9 +343,112 @@ if %ERRORLEVEL% neq 0 (
 [System.IO.File]::WriteAllText($uninstallBat, $uninstallContent, [System.Text.Encoding]::UTF8)
 Write-Host "  [OK] $uninstallBat" -ForegroundColor Green
 
+# ── Create default instructions and sessions dir ──────────────────────────
+Write-Host ""
+Write-Host "  [7/9] Setting up agent instructions..." -ForegroundColor Cyan
+
+$InstructionsDir = Join-Path $InstallDir "instructions"
+$ProjectsDir = Join-Path $InstructionsDir "project"
+$SessionsDir = Join-Path $InstallDir "sessions"
+$SelfImproveDir = Join-Path $InstallDir "self-improve"
+$MemoryDir = Join-Path $InstallDir "memory"
+$SelfNotesDir = Join-Path $InstallDir "self-notes"
+$null = New-Item -ItemType Directory -Path $InstructionsDir -Force
+$null = New-Item -ItemType Directory -Path $ProjectsDir -Force
+$null = New-Item -ItemType Directory -Path $SessionsDir -Force
+$null = New-Item -ItemType Directory -Path $SelfImproveDir -Force
+$null = New-Item -ItemType Directory -Path $MemoryDir -Force
+$null = New-Item -ItemType Directory -Path $SelfNotesDir -Force
+
+# Create default global instruction file
+$defaultInstrFile = Join-Path $InstructionsDir "default.md"
+if (-not (Test-Path $defaultInstrFile)) {
+    @"
+# Default Agent Behaviour
+
+- You are a helpful coding assistant.
+- Always read files before editing them.
+- Prefer making surgical edits over rewriting entire files.
+- Keep responses concise and focused on the code.
+- If a task is done, stop calling tools and summarise the result.
+
+## Safety
+
+- Never run destructive commands without confirmation.
+- Never auto-commit or auto-push changes. The user will review and commit
+  them manually.
+- Don't modify files outside the project directory without asking.
+
+## Communication
+
+- Be direct and technical.
+- Show code rather than explaining at length.
+- Use tools proactively to explore and understand the codebase.
+"@ | Out-File -FilePath $defaultInstrFile -Encoding utf8
+    Write-Host "  [OK] Created default instructions: $defaultInstrFile" -ForegroundColor Green
+} else {
+    Write-Host "  [OK] Instructions already exist (keeping existing)" -ForegroundColor Green
+}
+
+# Create default AGENT.md (local-level agent identity)
+$agentInstrFile = Join-Path $InstructionsDir "AGENT.md"
+if (-not (Test-Path $agentInstrFile)) {
+    @"
+# Agent Identity
+
+- Your name is TOMAS agent.
+- Each report must be ended with My Lord.
+"@ | Out-File -FilePath $agentInstrFile -Encoding utf8
+    Write-Host "  [OK] Created agent identity: $agentInstrFile" -ForegroundColor Green
+} else {
+    Write-Host "  [OK] Agent identity file already exists (keeping existing)" -ForegroundColor Green
+}
+
+# Create README for the instructions folder
+$readmeFile = Join-Path $InstructionsDir "README.md"
+if (-not (Test-Path $readmeFile)) {
+    @"
+# TOMAS Agent Instructions
+
+This folder contains **global instructions** that apply to every TOMAS
+session, regardless of the project you're working on.
+
+## How it works
+
+- Every `.md` file in this folder is loaded in alphabetical order and
+  merged into the agent's system prompt.
+- Use these files to set persistent preferences, coding standards, and
+  default behaviour.
+
+## Project-level instructions
+
+You can also add instructions per project:
+
+1. Place `AGENT.md` or `agent.md` in the project root directory.
+2. OR place `<project-name>.md` in the `project/` subfolder here.
+
+Project-level instructions are loaded on top of global instructions.
+
+## Example files
+
+- `default.md` — built-in defaults (safe to edit or delete)
+- `AGENT.md` — local agent identity (safe to edit or delete)
+- `project/` — per-project instruction files
+"@ | Out-File -FilePath $readmeFile -Encoding utf8
+    Write-Host "  [OK] Created instructions README: $readmeFile" -ForegroundColor Green
+}
+
+# Create .gitkeep in project instructions dir
+$gitkeep = Join-Path $ProjectsDir ".gitkeep"
+if (-not (Test-Path $gitkeep)) {
+    "" | Out-File -FilePath $gitkeep -Encoding utf8
+}
+
+Write-Host "  [OK] Sessions directory: $SessionsDir" -ForegroundColor Green
+
 # ── Set up .env ─────────────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "       Configuring environment..." -ForegroundColor Cyan
+Write-Host "  [8/9] Configuring environment..." -ForegroundColor Cyan
 
 if (-not (Test-Path $EnvFile)) {
     @"
@@ -381,7 +490,7 @@ if (-not $NoPrompt -and $host.Name -ne 'Default Host' -and -not $isPiped) {
 
 # ── Add to PATH ─────────────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "  [7/7] Finalizing setup..." -ForegroundColor Cyan
+Write-Host "  [9/9] Finalizing setup..." -ForegroundColor Cyan
 Write-Host "       Adding to system PATH..." -ForegroundColor DarkGray
 
 $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -444,11 +553,18 @@ Write-Host "    Installed to:  $InstallDir" -ForegroundColor White
 Write-Host "    Source code:   $SrcDir" -ForegroundColor White
 Write-Host "    Python venv:   $VenvDir" -ForegroundColor White
 Write-Host "    Launchers:     $BinDir" -ForegroundColor White
+Write-Host "    Instructions:  $(Join-Path $InstallDir 'instructions')" -ForegroundColor White
+Write-Host "    Sessions:      $(Join-Path $InstallDir 'sessions')" -ForegroundColor White
 Write-Host ""
 Write-Host "  Commands:" -ForegroundColor Yellow
 Write-Host "    TOMAS              Run the agent" -ForegroundColor Cyan
 Write-Host "    TOMAS-upgrade      Update TOMAS from GitHub" -ForegroundColor Cyan
 Write-Host "    TOMAS-uninstall    Remove TOMAS completely" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "  New features:" -ForegroundColor Yellow
+Write-Host "    💾 Sessions         Auto-saved on exit. Browse/continue from menu." -ForegroundColor Cyan
+Write-Host "    📋 Instructions     Edit ~/.tomas/instructions/ for global agent rules." -ForegroundColor Cyan
+Write-Host "    📄 Project config   Put AGENT.md in your project root for per-project rules." -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  To use TOMAS in this terminal, run:" -ForegroundColor White
 Write-Host "    `$env:Path = '$BinDir;' + `$env:Path; tomas" -ForegroundColor DarkGray

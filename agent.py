@@ -10,7 +10,7 @@ Features:
   - Agent loop with tool use
   - Tools: read_file, write_file, edit_file, list_files, run_command, search_code
   - Project context re-injection (CLAUDE.md / AGENT.md)
-  - Three-layer memory system (.agent/memory/)
+  - Three-layer memory system (~/.tomas/memory/)
   - Risk-tiered permission system (low / medium / high)
   - Auto-compaction when the context window fills up
 
@@ -65,13 +65,27 @@ from skills_manager import build_skills_section, discover_skills, cmd_skill_list
 # Self-improving system
 import self_improve
 
+# Self-notes system
+import self_notes
+
+# Session management
+from session_manager import (
+    save_session, list_sessions, load_session,
+    continue_session, delete_session, get_latest_session,
+)
+
+# Instructions management
+from instructions_manager import (
+    build_instructions_section, get_global_instructions,
+)
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 MODEL = os.environ.get("AGENT_MODEL")
 PROJECT_DIR = Path(os.environ.get("AGENT_PROJECT_DIR", os.getcwd())).resolve()
-MEMORY_DIR = PROJECT_DIR / ".agent" / "memory"
+MEMORY_DIR = Path.home() / ".tomas" / "memory"
 MAX_TOKENS = 8192
 COMPACTION_THRESHOLD = 0.75  # compact when total budget (msg_tok + TOOL_TOKENS + MAX_TOKENS) exceeds this fraction of CONTEXT_WINDOW
 DEFAULT_CONTEXT_WINDOW = 128_000  # fallback if API doesn't report context window
@@ -107,6 +121,10 @@ YOLO_MODE = False  # when True, all tools are auto-approved without any prompt
 # ── Session token tracking ──
 _session_tokens = {"input": 0, "output": 0, "calls": 0}
 _last_turn_usage = {"input": 0, "output": 0}
+
+# ── Session continuation ──
+# Set by agent_cli.py before calling main() to continue a previous session.
+CONTINUE_SESSION_ID: Optional[str] = None
 
 # ── Client factory: supports ANTHROPIC_EXTRA_HEADERS env var (JSON) ──
 _client_instance = None
@@ -729,11 +747,15 @@ def build_system_prompt() -> str:
             prompt += f"\n\n# Agent Instructions ({candidate.name})\n{candidate.read_text(encoding='utf-8')}"
             break
     # project guidelines
-    for candidate in [PROJECT_DIR / "CLAUDE.md", PROJECT_DIR / "AGENT.md",
+    for candidate in [PROJECT_DIR / "CLAUDE.md",
                       PROJECT_DIR / ".claude" / "CLAUDE.md"]:
         if candidate.exists():
             prompt += f"\n\n# Project guidelines ({candidate.name})\n{candidate.read_text(encoding='utf-8')}"
             break
+    # global + project-level instructions (from .tomas/instructions/ and AGENT.md)
+    instructions_section = build_instructions_section(PROJECT_DIR)
+    if instructions_section:
+        prompt += f"\n\n{instructions_section}"
     # memory index
     memory = load_memory_index()
     if memory:
@@ -927,6 +949,11 @@ SLASH_COMMANDS = {
     "zen":          {"desc": "OpenCode Zen proxy status",         "icon": "◉"},
     "self-improve": {"desc": "Self-improvement system status",    "icon": "🧠"},
     "si":           {"desc": "Alias for /self-improve",           "icon": "🧠"},
+    "save":         {"desc": "Save current session",              "icon": "💾"},
+    "load":         {"desc": "Load a saved session: /load <id>",  "icon": "📂"},
+    "sessions":     {"desc": "List saved sessions",               "icon": "📋"},
+    "note":         {"desc": "Create a self-note: /note <title> <content>", "icon": "📝"},
+    "notes":        {"desc": "List all self-notes",               "icon": "📒"},
     "exit":         {"desc": "Exit TOMAS",                        "icon": "✕"},
 }
 
@@ -1164,6 +1191,97 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
         except Exception as e:
             return f'  {RED}⚠{RESET} PDF report failed: {e}'
 
+    # ── Session commands ──
+    if cmd == "session":
+        sub = parts[1].lower() if len(parts) > 1 else ""
+
+        if sub in ("list", "ls"):
+            sessions = list_sessions(limit=20)
+            if not sessions:
+                return f'  {DIM}No saved sessions.{RESET}'
+            lines = [f'  {BOLD}Saved Sessions ({len(sessions)}){RESET}']
+            lines.append(f'  {DIM}{"─" * 60}{RESET}')
+            for s in sessions:
+                sid = s.get("id", "?")[:22]
+                ts = s.get("timestamp_str", "?")
+                proj = s.get("project", "?")
+                msgs = s.get("message_count", 0)
+                model = s.get("model", "?")[:25]
+                summary = s.get("summary", "")[:60]
+                lines.append(
+                    f'  {CYAN}{sid}{RESET}  {DIM}{ts}{RESET}  '
+                    f'{GREEN}{proj}{RESET}  {msgs}msgs'
+                )
+                if summary:
+                    lines.append(f'  {DIM}  {summary}{RESET}')
+                lines.append('')
+            return '\n'.join(lines)
+
+        elif sub in ("save",):
+            sid = save_session(messages)
+            s = _session_tokens
+            return (
+                f'  {GREEN}✓{RESET} Session saved: {CYAN}{sid}{RESET}\n'
+                f'  {DIM}  Tokens: {s["input"]:,} in · {s["output"]:,} out'
+                f' ({s["calls"]} calls){RESET}'
+            )
+
+        elif sub in ("continue", "load") and len(parts) > 2:
+            sid = parts[2]
+            loaded = continue_session(sid)
+            if loaded is None:
+                return f'  {RED}✗{RESET} Session not found: {sid}'
+            # Replace current messages with the loaded ones
+            messages.clear()
+            messages.extend(loaded)
+            return (
+                f'  {GREEN}✓{RESET} Continuing session {CYAN}{sid}{RESET} '
+                f'({len(loaded)} messages loaded).\n'
+                f'  {DIM}Type your next message to continue the conversation.{RESET}'
+            )
+
+        elif sub in ("delete", "rm") and len(parts) > 2:
+            sid = parts[2]
+            if delete_session(sid):
+                return f'  {GREEN}✓{RESET} Session deleted: {sid}'
+            else:
+                return f'  {RED}✗{RESET} Session not found: {sid}'
+
+        elif sub in ("latest",):
+            latest = get_latest_session()
+            if latest is None:
+                return f'  {DIM}No saved sessions.{RESET}'
+            sid = latest.get("id", "?")
+            ts = latest.get("timestamp_str", "?")
+            proj = latest.get("project", "?")
+            msgs = latest.get("message_count", 0)
+            summary = latest.get("summary", "")[:80]
+            lines = [
+                f'  {BOLD}Latest Session{RESET}',
+                f'  {DIM}{"─" * 50}{RESET}',
+                f'  ID:      {CYAN}{sid}{RESET}',
+                f'  When:    {ts}',
+                f'  Project: {GREEN}{proj}{RESET}',
+                f'  Messages: {msgs}',
+            ]
+            if summary:
+                lines.append(f'  Summary: {DIM}{summary}{RESET}')
+            lines.append('')
+            lines.append(f'  {YELLOW}Tip:{RESET} Use {CYAN}/session continue {sid}{RESET} to pick up where you left off.')
+            return '\n'.join(lines)
+
+        else:
+            lines = [
+                f'  {BOLD}Session Management{RESET}',
+                f'  {DIM}{"─" * 50}{RESET}',
+                f'  {CYAN}/session list{RESET}       — List saved sessions',
+                f'  {CYAN}/session save{RESET}       — Save current conversation',
+                f'  {CYAN}/session continue <id>{RESET}  — Load and continue a session',
+                f'  {CYAN}/session latest{RESET}     — Show latest session info',
+                f'  {CYAN}/session delete <id>{RESET}  — Delete a session',
+            ]
+            return '\n'.join(lines)
+
     # ── Self-improvement commands ──
     if cmd in ("self-improve", "si"):
         sub = parts[1].lower() if len(parts) > 1 else ""
@@ -1225,6 +1343,37 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
 
         # Default: show status
         return self_improve.get_self_improve_status()
+
+    # ── Self-note commands ──
+    if cmd == "note":
+        if len(parts) < 3:
+            return (
+                f'  {YELLOW}Usage:{RESET} {CYAN}/note <title> <content>{RESET}\n'
+                f'  {DIM}Create a self-note about something the agent learned.{RESET}'
+            )
+        title = parts[1]
+        content = " ".join(parts[2:])
+        note_id = self_notes.create_note(
+            title=title,
+            content=content,
+            note_type="insight",
+        )
+        return f'  {GREEN}✓{RESET} Note created: {CYAN}{note_id}{RESET}'
+
+    if cmd == "notes":
+        notes = self_notes.list_notes(limit=20)
+        if not notes:
+            return f'  {DIM}No self-notes yet. Use /note <title> <content> to create one.{RESET}'
+        lines = [f'  {BOLD}Self-Notes ({len(notes)}){RESET}']
+        lines.append(f'  {DIM}{"─" * 50}{RESET}')
+        for n in notes:
+            nid = n.get("id", "?")[:22]
+            title = n.get("title", "?")[:50]
+            ntype = n.get("type", "insight")
+            tags = n.get("tags", [])
+            tag_str = f' [{", ".join(tags)}]' if tags else ""
+            lines.append(f'  {DIM}[{ntype}]{RESET} {title} {DIM}{nid}{RESET}{tag_str}')
+        return "\n".join(lines)
 
     if cmd == "exit":
         return "__exit__"
@@ -1524,7 +1673,7 @@ def read_input_with_suggestions(prompt: str) -> str:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    global mcp_manager, _current_context_window, CONTEXT_WINDOW
+    global mcp_manager, _current_context_window, CONTEXT_WINDOW, CONTINUE_SESSION_ID
 
     # ── Auto-start Zen proxy if needed ──
     _ensure_zen_proxy()
@@ -1638,6 +1787,18 @@ def main() -> int:
     print()
 
     messages: list = []
+
+    # ── Continue previous session if requested ──
+    if CONTINUE_SESSION_ID:
+        try:
+            from session_manager import continue_session
+            loaded = continue_session(CONTINUE_SESSION_ID)
+            if loaded:
+                messages = loaded
+                print(f'  {GREEN}✓{RESET}  Continuing session {CYAN}{CONTINUE_SESSION_ID[:16]}{RESET} ({len(loaded)} messages)')
+        except Exception as e:
+            print(f'  {YELLOW}⚠{RESET}  Could not load session: {e}')
+
     try:
         while True:
             try:
@@ -1687,6 +1848,19 @@ def main() -> int:
         print()
         print(f'  {DIM}Bye!{RESET}')
     finally:
+        # ── Save session on exit ──
+        if messages:
+            try:
+                sid = save_session(
+                    messages,
+                    model=_get_model(),
+                    token_usage=dict(_session_tokens),
+                    session_id=CONTINUE_SESSION_ID,
+                )
+                print(f'  {DIM}💾 Session saved: {sid}{RESET}')
+            except Exception as e:
+                print(f'  {DIM}⚠  Session save skipped: {e}{RESET}')
+            CONTINUE_SESSION_ID = None
         # ── Clean up MCP connections ──
         if mcp_manager:
             mcp_manager.disconnect_all()

@@ -23,6 +23,12 @@ import sys
 import subprocess
 from pathlib import Path
 
+# Session and instructions management
+from session_manager import (
+    list_sessions, load_session, continue_session,
+    delete_session, get_session_count, clear_all_sessions,
+)
+
 # ── Force UTF-8 for stdout (handles Unicode in skills descriptions) ──
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -939,6 +945,278 @@ def page_skills():
     show_info_page('Installed Skills', lines)
 
 
+def _launch_agent(session_id: str = ""):
+    """Launch the agent, optionally continuing a session."""
+    clear_screen()
+    print(f'{BOLD}Starting TOMAS Agent{RESET}')
+    print('─' * 50)
+    print("Type 'quit' or 'exit' to leave. Ctrl+C also works.")
+    print()
+
+    import agent as agent_mod
+
+    # Set session to continue if specified
+    if session_id:
+        agent_mod.CONTINUE_SESSION_ID = session_id
+
+    agent_mod.main()
+
+
+def _format_message_content(content, max_len: int = 100) -> str:
+    """Format a message's content for display — handles str, list of blocks, etc."""
+    if isinstance(content, str):
+        return content[:max_len].replace('\n', ' ')
+    elif isinstance(content, list):
+        texts = []
+        for block in content:
+            if isinstance(block, dict):
+                t = block.get("type", "")
+                if t == "text":
+                    texts.append(block.get("text", "")[:max_len])
+                elif t == "tool_use":
+                    texts.append(f"[tool: {block.get('name', '?')}]")
+                elif t == "tool_result":
+                    texts.append("[result]")
+            elif hasattr(block, "type"):
+                t = getattr(block, "type", "")
+                if t == "text":
+                    texts.append(getattr(block, "text", "")[:max_len])
+                elif t == "tool_use":
+                    texts.append(f"[tool: {getattr(block, 'name', '?')}]")
+                elif t == "tool_result":
+                    texts.append("[result]")
+        combined = " ".join(texts)
+        return combined[:max_len] if combined else str(content)[:max_len]
+    return str(content)[:max_len]
+
+
+def _show_full_conversation(data: dict) -> None:
+    """Display the full conversation from a session using show_info_page."""
+    msgs = data.get("messages", [])
+    if not msgs:
+        show_info_page("Full Conversation", ["  (no messages)"])
+        return
+
+    lines = []
+    lines.append(f'  Total: {len(msgs)} messages  ·  {data.get("project", "?")}  ·  {data.get("timestamp_str", "?")}')
+    lines.append('')
+    for i, m in enumerate(msgs):
+        role = m.get("role", "?")
+        content = m.get("content", "")
+        icon = '◆' if role == 'user' else '▌' if role == 'assistant' else '·'
+        formatted = _format_message_content(content, max_len=120)
+        lines.append(f'  [{i+1}] {icon} {DIM}{role}{RESET}: {formatted}')
+        # If content is a list of tool results, show them expanded
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    result_text = str(block.get("content", ""))[:80].replace('\n', ' ')
+                    lines.append(f'       {DIM}↳ result: {result_text}{RESET}')
+                elif hasattr(block, "type") and getattr(block, "type", "") == "tool_result":
+                    result_text = str(getattr(block, "content", ""))[:80].replace('\n', ' ')
+                    lines.append(f'       {DIM}↳ result: {result_text}{RESET}')
+
+    show_info_page(f'Full Conversation ({len(msgs)} messages)', lines)
+
+
+def _session_detail(sid: str) -> None:
+    """Show session detail and allow continue/delete actions."""
+    while True:
+        data = load_session(sid)
+        if data is None:
+            show_info_page('Error', [f'  Could not load session.'])
+            return
+
+        ts = data.get("timestamp_str", "?")
+        proj = data.get("project", "?")
+        model = data.get("model", "?")
+        msgs = data.get("message_count", 0)
+        summary = data.get("summary", "")
+        tokens = data.get("token_usage", {})
+
+        # Build detail header lines
+        lines = [
+            f'  {DIM}ID:{RESET}      {CYAN}{sid}{RESET}',
+            f'  {DIM}When:{RESET}    {ts}',
+            f'  {DIM}Project:{RESET} {GREEN}{proj}{RESET}',
+            f'  {DIM}Model:{RESET}   {model}',
+            f'  {DIM}Messages:{RESET} {msgs}',
+            f'  {DIM}Tokens:{RESET}  {tokens.get("input", 0):,} in \u00b7 {tokens.get("output", 0):,} out ({tokens.get("calls", 0)} calls)',
+        ]
+        if summary:
+            lines.append('')
+            lines.append(f'  {DIM}Summary:{RESET}')
+            lines.append(f'  {DIM}{summary[:120]}{RESET}')
+
+        # Full conversation preview — all messages (truncated for display)
+        msgs_list = data.get("messages", [])
+        if msgs_list:
+            lines.append('')
+            lines.append(f'  {BOLD}Conversation ({len(msgs_list)} messages):{RESET}')
+            # Show last 5 messages as preview
+            preview_count = min(5, len(msgs_list))
+            if len(msgs_list) > preview_count:
+                lines.append(f'  {DIM}  (… {len(msgs_list) - preview_count} earlier messages …){RESET}')
+            for m in msgs_list[-preview_count:]:
+                role = m.get("role", "?")
+                content = m.get("content", "")
+                if isinstance(content, list):
+                    # Extract text from block list
+                    texts = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text":
+                                texts.append(block.get("text", "")[:60])
+                            elif block.get("type") == "tool_use":
+                                texts.append(f"[tool: {block.get('name', '?')}]")
+                            elif block.get("type") == "tool_result":
+                                texts.append("[result]")
+                        elif hasattr(block, "type"):
+                            if getattr(block, "type", "") == "text":
+                                texts.append(getattr(block, "text", "")[:60])
+                            elif getattr(block, "type", "") == "tool_use":
+                                texts.append(f"[tool: {getattr(block, 'name', '?')}]")
+                            elif getattr(block, "type", "") == "tool_result":
+                                texts.append("[result]")
+                    content = " ".join(texts)[:100]
+                elif isinstance(content, str):
+                    content = content[:100].replace('\n', ' ')
+                icon = f'{GREEN}◆{RESET}' if role == 'user' else f'{MAGENTA}▌{RESET}'
+                lines.append(f'  {icon} {DIM}{role}{RESET}: {content}')
+
+        header = [
+            f'  {BOLD}Session Detail{RESET}',
+            '─' * 50,
+        ] + lines + ['']
+
+        actions = [
+            f'  {CYAN}▶{RESET}  Continue this session',
+            f'  {CYAN}📋{RESET}  View full conversation ({len(msgs_list)} messages)',
+            f'  {RED}✕{RESET}  Delete this session',
+            '',
+            '  ← Back to list',
+        ]
+
+        idx = arrow_menu('', actions, header_lines=header,
+                         footer='↑↓ navigate · Enter select · Esc back')
+
+        if idx < 0 or idx == len(actions) - 1:
+            return
+
+        if idx == 0:  # Continue
+            _launch_agent(session_id=sid)
+            return  # after agent exits, go back to session list
+
+        if idx == 1:  # View full conversation
+            _show_full_conversation(data)
+            continue  # refresh the detail view
+
+        if idx == 2:  # Delete
+            header_confirm = [
+                f'  {BOLD}Delete Session{RESET}',
+                '─' * 50,
+                f'  Delete this session?',
+                '',
+            ]
+            confirm_items = ['  Yes, delete', '  No, cancel']
+            cidx = arrow_menu('', confirm_items, header_lines=header_confirm,
+                              footer='Enter select · Esc cancel')
+            if cidx == 0:
+                delete_session(sid)
+                show_info_page('Done', [f'  ✓ Session deleted.'])
+            return
+
+
+def page_sessions():
+    """Interactive session browser."""
+    while True:
+        sessions = list_sessions(limit=20)
+        total = get_session_count()
+
+        # Build menu items: numbered sessions first, then actions
+        items = []
+        session_indices = {}  # maps menu index → session index
+
+        if not sessions:
+            items.append('  (no sessions saved yet)')
+        else:
+            for i, s in enumerate(sessions):
+                num = i + 1
+                ts = s.get("timestamp_str", "?")
+                proj = s.get("project", "?")
+                msgs = s.get("message_count", 0)
+                summary = s.get("summary", "")[:55]
+
+                # Single-line session entry
+                label = f'  {GREEN}{num:>2}.{RESET} {DIM}{ts}{RESET}  {CYAN}{proj}{RESET}  {DIM}({msgs} msgs){RESET}'
+                if summary:
+                    label += f'\n      {DIM}{summary}{RESET}'
+                items.append(label)
+                session_indices[len(items) - 1] = i  # track session index
+
+        # Separator + session actions
+        items.append('')
+        if sessions:
+            items.append(f'  {BOLD}─ Actions ─{RESET}')
+            items.append(f'  {YELLOW}▶{RESET}  Continue latest session')
+            items.append(f'  {DIM}⟳{RESET}  Refresh list')
+            items.append(f'  {RED}✕{RESET}  Delete all sessions')
+
+        items.append('')
+        items.append('  ← Back to main menu')
+
+        header = [
+            f'  {BOLD}Sessions{RESET}{DIM}  ({total} total){RESET}',
+            '─' * 50,
+        ]
+
+        idx = arrow_menu('', items, header_lines=header,
+                         footer='↑↓ navigate · Enter select · Esc back')
+
+        if idx < 0 or idx == len(items) - 1:  # Back
+            return
+
+        # No sessions: only "Back" is available
+        # Check if a session entry was selected
+        if idx in session_indices:
+            s = sessions[session_indices[idx]]
+            sid = s.get("id", "")
+            if sid:
+                _session_detail(sid)
+            continue
+
+        # Calculate action indices (after sessions list)
+        base = len(sessions) + 2  # sessions + blank line
+        continue_latest_idx = base
+        refresh_idx = base + 1
+        delete_all_idx = base + 2
+
+        if idx == continue_latest_idx:
+            latest = sessions[0]
+            sid = latest.get("id", "")
+            if sid:
+                _launch_agent(session_id=sid)
+            continue
+
+        if idx == refresh_idx:
+            continue  # loop will refresh
+
+        if idx == delete_all_idx:
+            header_confirm = [
+                f'  {BOLD}Delete All Sessions{RESET}',
+                '─' * 50,
+                f'  This will delete all {total} sessions permanently.',
+                '',
+            ]
+            confirm_items = ['  Yes, delete everything', '  No, cancel']
+            cidx = arrow_menu('', confirm_items, header_lines=header_confirm,
+                              footer='Enter select · Esc cancel')
+            if cidx == 0:
+                cleared = clear_all_sessions()
+                show_info_page('Done', [f'  ✓ {cleared} session(s) deleted.'])
+            continue
+
+
 def page_edit_instructions():
     """View/edit AGENT_INSTRUCTIONS.md."""
     inst_file = AGENT_PROJECT_DIR / "AGENT_INSTRUCTIONS.md"
@@ -1624,6 +1902,7 @@ MENU_ITEMS = [
     f'  {YELLOW}⬡{RESET}  Check available MCPs',
     f'  {YELLOW}⬡{RESET}  Check available tools',
     f'  {YELLOW}⬡{RESET}  Check installed skills',
+    f'  {CYAN}◈{RESET}  Sessions & Notes',
     f'  {BLUE}✎{RESET}  View/Edit agent instructions',
     f'  {BLUE}✎{RESET}  View/Edit project guidelines',
     f'  {MAGENTA}▶{RESET}  {BOLD}Run agent (interactive){RESET}',
@@ -1639,13 +1918,14 @@ MENU_ACTIONS = [
     page_mcps,
     page_tools,
     page_skills,
+    page_sessions,
     page_edit_instructions,
     page_edit_claude,
     page_run_agent,
     None,  # exit
 ]
 
-EXIT_INDEX = len(MENU_ITEMS) - 1  # 11
+EXIT_INDEX = len(MENU_ITEMS) - 1  # 12
 
 
 def run_menu():

@@ -68,8 +68,15 @@ if ! command -v unzip &>/dev/null; then
 fi
 
 # ── Create directories ──
+INSTRUCTIONS_DIR="$INSTALL_DIR/instructions"
+PROJECTS_DIR="$INSTRUCTIONS_DIR/project"
+SESSIONS_DIR="$INSTALL_DIR/sessions"
+SELF_IMPROVE_DIR="$INSTALL_DIR/self-improve"
+MEMORY_DIR="$INSTALL_DIR/memory"
+SELF_NOTES_DIR="$INSTALL_DIR/self-notes"
+
 header "Creating directories..."
-mkdir -p "$BIN_DIR" "$SRC_DIR"
+mkdir -p "$BIN_DIR" "$SRC_DIR" "$INSTRUCTIONS_DIR" "$PROJECTS_DIR" "$SESSIONS_DIR" "$SELF_IMPROVE_DIR" "$MEMORY_DIR" "$SELF_NOTES_DIR"
 ok "Install dir: $INSTALL_DIR"
 
 # ── Get source code ──
@@ -193,6 +200,86 @@ if [ ! -f "$BIN_DIR/TOMAS" ]; then
     ln -sf "$LAUNCHER" "$BIN_DIR/TOMAS" 2>/dev/null || true
 fi
 
+# ── Create default instructions ──
+DEFAULT_INSTR_FILE="$INSTRUCTIONS_DIR/default.md"
+if [ ! -f "$DEFAULT_INSTR_FILE" ]; then
+    cat > "$DEFAULT_INSTR_FILE" << 'EOF'
+# Default Agent Behaviour
+
+- You are a helpful coding assistant.
+- Always read files before editing them.
+- Prefer making surgical edits over rewriting entire files.
+- Keep responses concise and focused on the code.
+- If a task is done, stop calling tools and summarise the result.
+
+## Safety
+
+- Never run destructive commands without confirmation.
+- Never auto-commit or auto-push changes. The user will review and commit
+  them manually.
+- Don't modify files outside the project directory without asking.
+
+## Communication
+
+- Be direct and technical.
+- Show code rather than explaining at length.
+- Use tools proactively to explore and understand the codebase.
+EOF
+    ok "Created default instructions: $DEFAULT_INSTR_FILE"
+else
+    ok "Instructions already exist (keeping existing)"
+fi
+
+# Default AGENT.md (local-level agent identity)
+AGENT_INSTR_FILE="$INSTRUCTIONS_DIR/AGENT.md"
+if [ ! -f "$AGENT_INSTR_FILE" ]; then
+    cat > "$AGENT_INSTR_FILE" << 'EOF'
+# Agent Identity
+
+- Your name is TOMAS agent.
+- Each report must be ended with My Lord.
+EOF
+    ok "Created agent identity: $AGENT_INSTR_FILE"
+else
+    ok "Agent identity file already exists (keeping existing)"
+fi
+
+# Instructions README
+INSTR_README="$INSTRUCTIONS_DIR/README.md"
+if [ ! -f "$INSTR_README" ]; then
+    cat > "$INSTR_README" << 'EOF'
+# TOMAS Agent Instructions
+
+This folder contains **global instructions** that apply to every TOMAS
+session, regardless of the project you're working on.
+
+## How it works
+
+- Every `.md` file in this folder is loaded in alphabetical order and
+  merged into the agent's system prompt.
+- Use these files to set persistent preferences, coding standards, and
+  default behaviour.
+
+## Project-level instructions
+
+You can also add instructions per project:
+
+1. Place `AGENT.md` or `agent.md` in the project root directory.
+2. OR place `<project-name>.md` in the `project/` subfolder here.
+
+Project-level instructions are loaded on top of global instructions.
+
+## Example files
+
+- `default.md` — built-in defaults (safe to edit or delete)
+- `AGENT.md` — local agent identity (safe to edit or delete)
+- `project/` — per-project instruction files
+EOF
+    ok "Created instructions README: $INSTR_README"
+fi
+
+ok "Sessions directory: $SESSIONS_DIR"
+
 # ── Set up .env ──
 header "Configuring environment..."
 if [ ! -f "$ENV_FILE" ]; then
@@ -283,6 +370,20 @@ echo ""
 echo -e "  ${BOLD}📍 Installed to:${RESET} $INSTALL_DIR"
 echo -e "  ${BOLD}🐍 Python:${RESET}       $VENV_DIR"
 echo -e "  ${BOLD}🔧 Launchers:${RESET}    $BIN_DIR"
+echo -e "  ${BOLD}📋 Instructions:${RESET} $INSTRUCTIONS_DIR"
+echo -e "  ${BOLD}💾 Sessions:${RESET}     $SESSIONS_DIR"
+echo -e "  ${BOLD}🧠 Self-improve:${RESET}  $SELF_IMPROVE_DIR"
+echo -e "  ${BOLD}📝 Memory:${RESET}        $MEMORY_DIR"
+echo -e "  ${BOLD}📒 Self-notes:${RESET}    $SELF_NOTES_DIR"
+echo ""
+echo -e "  ${YELLOW}─────────────────────────────────────────────${RESET}"
+echo -e "  ${YELLOW}New features:${RESET}"
+echo -e "  ${CYAN}💾 Sessions${RESET}     Auto-saved on exit. Browse/continue from menu."
+echo -e "  ${CYAN}🧠 Self-improve${RESET}  Patterns, tips, and auto-generated skills."
+echo -e "  ${CYAN}📝 Memory${RESET}        Agent memory persists across projects."
+echo -e "  ${CYAN}📒 Self-notes${RESET}    The agent can write and retrieve notes about itself."
+echo -e "  ${CYAN}📋 Instructions${RESET} Edit ~/.tomas/instructions/ for global agent rules."
+echo -e "  ${CYAN}📄 Project config${RESET} Put AGENT.md in your project root for per-project rules."
 echo ""
 echo -e "  ${YELLOW}─────────────────────────────────────────────${RESET}"
 echo -e "  ${YELLOW}To use TOMAS now:${RESET}"
