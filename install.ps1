@@ -31,16 +31,32 @@ $EnvFile     = Join-Path $InstallDir ".env"
 
 $LauncherPs1 = Join-Path $BinDir "TOMAS.ps1"
 
-# Helper: detect whether the venv uses bin/ (MSYS2) or Scripts/ (Windows)
-function Get-VenvScriptsDir {
+# Helper: find the python.exe in the venv (bin/ on MSYS2, Scripts/ on Windows)
+function Get-VenvPythonExe {
     param([string]$VenvDir)
-    if (Test-Path (Join-Path $VenvDir "bin"))      { return "bin" }
-    if (Test-Path (Join-Path $VenvDir "Scripts"))  { return "Scripts" }
+    $candidates = @(
+        Join-Path (Join-Path $VenvDir "bin") "python.exe"
+        Join-Path (Join-Path $VenvDir "Scripts") "python.exe"
+    )
+    foreach ($p in $candidates) {
+        if (Test-Path $p) { return $p }
+    }
+    return $null
+}
+function Get-VenvPipExe {
+    param([string]$VenvDir)
+    $candidates = @(
+        Join-Path (Join-Path $VenvDir "bin") "pip.exe"
+        Join-Path (Join-Path $VenvDir "Scripts") "pip.exe"
+    )
+    foreach ($p in $candidates) {
+        if (Test-Path $p) { return $p }
+    }
     return $null
 }
 # Default to Windows path; will be corrected after venv validation/creation.
-$PythonExe = Join-Path (Join-Path $VenvDir "Scripts") "python.exe"
-$PipExe    = Join-Path (Join-Path $VenvDir "Scripts") "pip.exe"
+$script:PythonExe = Join-Path (Join-Path $VenvDir "Scripts") "python.exe"
+$script:PipExe    = Join-Path (Join-Path $VenvDir "Scripts") "pip.exe"
 $LauncherCmd = Join-Path $BinDir "TOMAS.cmd"
 $LauncherBat = Join-Path $BinDir "TOMAS.bat"
 
@@ -48,7 +64,6 @@ $LauncherBat = Join-Path $BinDir "TOMAS.bat"
 $isPiped = $MyInvocation.MyCommand.Name -eq "__remote_exec__" -or
            $MyInvocation.MyCommand.Path -eq "" -or
            [Console]::IsInputRedirected
-$isRemote = $isPiped -or (-not $PSCommandPath) -or (-not (Test-Path (Split-Path -Parent $PSCommandPath)))
 
 Write-Host ""
 Write-Host "  ==========================================" -ForegroundColor Cyan
@@ -147,13 +162,13 @@ Write-Host ""
 Write-Host "  [4/7] Creating virtual environment..." -ForegroundColor Cyan
 
 # Check if existing venv has a working Python executable (bin or Scripts)
-$venvScriptsDir = Get-VenvScriptsDir $VenvDir
+$existingPythonExe = Get-VenvPythonExe $VenvDir
 $venvPythonOk = $false
-if ($venvScriptsDir) {
-    $PythonExe = Join-Path (Join-Path $VenvDir $venvScriptsDir) "python.exe"
-    $PipExe    = Join-Path (Join-Path $VenvDir $venvScriptsDir) "pip.exe"
+if ($existingPythonExe) {
+    $script:PythonExe = $existingPythonExe
+    $script:PipExe    = Get-VenvPipExe $VenvDir
     try {
-        $ver = & $PythonExe -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
+        $ver = & $script:PythonExe -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
         if ($ver) { $venvPythonOk = $true }
     } catch {}
 }
@@ -172,23 +187,26 @@ if (-not $venvPythonOk) {
     Write-Host "  [OK] Virtual environment already exists" -ForegroundColor Green
 }
 
-# Detect venv script directory (Scripts on Windows, bin on MSYS2/MinGW)
-$scriptsDir = Get-VenvScriptsDir $VenvDir
-if (-not $scriptsDir) {
-    Write-Host "  [FAIL] Could not detect venv script directory" -ForegroundColor Red
+# Detect venv python/pip executables (Scripts on Windows, bin on MSYS2/MinGW)
+$script:PythonExe = Get-VenvPythonExe $VenvDir
+$script:PipExe    = Get-VenvPipExe $VenvDir
+if (-not $script:PythonExe) {
+    Write-Host "  [FAIL] Could not detect python.exe in venv" -ForegroundColor Red
+    Write-Host "         Checked: bin/python.exe and Scripts/python.exe" -ForegroundColor Yellow
     exit 1
 }
-$PythonExe = Join-Path (Join-Path $VenvDir $scriptsDir) "python.exe"
-$PipExe    = Join-Path (Join-Path $VenvDir $scriptsDir) "pip.exe"
+if (-not $script:PipExe) {
+    Write-Host "  [WARN] Could not detect pip.exe in venv" -ForegroundColor Yellow
+}
 
 # ── Install dependencies ───────────────────────────────────────────────────
 Write-Host ""
 Write-Host "  [5/7] Installing Python dependencies..." -ForegroundColor Cyan
 
-# Check that pip exists before using it
-if (-not (Test-Path $PipExe)) {
+# Check that pip exists before using it; if not, run ensurepip
+if (-not $script:PipExe) {
     Write-Host "  [INFO] pip not found in venv, running ensurepip..." -ForegroundColor Yellow
-    if (-not (Test-Path $PythonExe)) {
+    if (-not $script:PythonExe) {
         Write-Host "  [FAIL] Python executable missing in venv" -ForegroundColor Red
         Write-Host "         Deleting corrupted venv and recreating..." -ForegroundColor Yellow
         Remove-Item -Path $VenvDir -Recurse -Force
@@ -197,17 +215,18 @@ if (-not (Test-Path $PipExe)) {
             Write-Host "  [FAIL] Failed to recreate virtual environment" -ForegroundColor Red
             exit 1
         }
-        # Re-detect Scripts vs bin after recreation (MSYS2 uses bin)
-        $scriptsDir = Get-VenvScriptsDir $VenvDir
-        if (-not $scriptsDir) {
-            Write-Host "  [FAIL] Could not detect venv script directory after recreation" -ForegroundColor Red
+        # Re-detect after recreation
+        $script:PythonExe = Get-VenvPythonExe $VenvDir
+        $script:PipExe    = Get-VenvPipExe $VenvDir
+        if (-not $script:PythonExe) {
+            Write-Host "  [FAIL] Could not detect venv python.exe after recreation" -ForegroundColor Red
             exit 1
         }
-        $PythonExe = Join-Path (Join-Path $VenvDir $scriptsDir) "python.exe"
-        $PipExe    = Join-Path (Join-Path $VenvDir $scriptsDir) "pip.exe"
     }
-    & $PythonExe -m ensurepip --upgrade 2>&1 | Out-Null
-    if (-not (Test-Path $PipExe)) {
+    & $script:PythonExe -m ensurepip --upgrade 2>&1 | Out-Null
+    # Re-detect pip after ensurepip
+    $script:PipExe = Get-VenvPipExe $VenvDir
+    if (-not $script:PipExe) {
         Write-Host "  [FAIL] pip is not available in the virtual environment" -ForegroundColor Red
         Write-Host "         Try deleting $VenvDir and re-running the installer" -ForegroundColor Yellow
         exit 1
@@ -215,16 +234,16 @@ if (-not (Test-Path $PipExe)) {
     Write-Host "  [OK] pip installed in virtual environment" -ForegroundColor Green
 }
 
-& $PipExe install --quiet --upgrade pip setuptools wheel 2>&1 | Out-Null
+& $script:PipExe install --quiet --upgrade pip setuptools wheel 2>&1 | Out-Null
 $reqFile = Join-Path $SrcDir "requirements.txt"
 if (Test-Path $reqFile) {
-    & $PipExe install --quiet -r $reqFile
+    & $script:PipExe install --quiet -r $reqFile
     if ($LASTEXITCODE -eq 0) {
         Write-Host "  [OK] Dependencies installed successfully" -ForegroundColor Green
     } else {
         Write-Host "  [FAIL] Failed to install some dependencies" -ForegroundColor Red
-        Write-Host "         Run manually: $PipExe install -r $reqFile" -ForegroundColor Yellow
-        if ($PipExe -like "*\bin\*") {
+        Write-Host "         Run manually: $script:PipExe install -r $reqFile" -ForegroundColor Yellow
+        if ($script:PipExe -like "*\bin\*") {
             Write-Host "         Note: MSYS2 Python detected (bin/ venv). Some Rust-based" -ForegroundColor Yellow
             Write-Host "               packages (e.g. jiter) may need python.org Python for" -ForegroundColor Yellow
             Write-Host "               pre-built wheels." -ForegroundColor Yellow
@@ -367,13 +386,11 @@ Write-Host "       Adding to system PATH..." -ForegroundColor DarkGray
 
 $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
 $paths = $currentPath -split ';'
-$changed = $false
 
 if ($paths -notcontains $BinDir) {
     $newPath = $BinDir + ';' + $currentPath
     [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
     Write-Host "  [OK] Added $BinDir to user PATH" -ForegroundColor Green
-    $changed = $true
 } else {
     Write-Host "  [OK] Already in PATH: $BinDir" -ForegroundColor Green
 }
