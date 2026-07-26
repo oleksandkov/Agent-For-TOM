@@ -450,9 +450,11 @@ Write-Host "    TOMAS              Run the agent" -ForegroundColor Cyan
 Write-Host "    TOMAS-upgrade      Update TOMAS from GitHub" -ForegroundColor Cyan
 Write-Host "    TOMAS-uninstall    Remove TOMAS completely" -ForegroundColor Cyan
 Write-Host ""
+Write-Host "  To use TOMAS in this terminal, run:" -ForegroundColor White
+Write-Host "    `$env:Path = '$BinDir;' + `$env:Path; tomas" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "  Or close this terminal and open a NEW one, then run: TOMAS" -ForegroundColor Yellow
+Write-Host ""
 Write-Host "  First time? Edit your API key in:" -ForegroundColor White
 Write-Host "    $EnvFile" -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "  Close this terminal, open a NEW one, then run: TOMAS" -ForegroundColor Yellow
-Write-Host ""
 Write-Host ""
