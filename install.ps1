@@ -319,7 +319,13 @@ powershell -ExecutionPolicy Bypass -c "iex (iwr -UseBasicParsing -Uri https://ra
 if %ERRORLEVEL% neq 0 (
     echo   Upgrade failed. See messages above.
     pause
+    exit /b %ERRORLEVEL%
 )
+
+rem ── Refresh PATH so `tomas` works immediately in this session ──
+set "PATH=%USERPROFILE%\.tomas\bin;%PATH%"
+echo.
+echo   Upgrade complete! You can now run: TOMAS
 '@
 [System.IO.File]::WriteAllText($upgradeBat, $upgradeContent, [System.Text.Encoding]::UTF8)
 Write-Host "  [OK] $upgradeBat" -ForegroundColor Green
@@ -359,36 +365,6 @@ $null = New-Item -ItemType Directory -Path $SessionsDir -Force
 $null = New-Item -ItemType Directory -Path $SelfImproveDir -Force
 $null = New-Item -ItemType Directory -Path $MemoryDir -Force
 $null = New-Item -ItemType Directory -Path $SelfNotesDir -Force
-
-# Create default global instruction file
-$defaultInstrFile = Join-Path $InstructionsDir "default.md"
-if (-not (Test-Path $defaultInstrFile)) {
-    @"
-# Default Agent Behaviour
-
-- You are a helpful coding assistant.
-- Always read files before editing them.
-- Prefer making surgical edits over rewriting entire files.
-- Keep responses concise and focused on the code.
-- If a task is done, stop calling tools and summarise the result.
-
-## Safety
-
-- Never run destructive commands without confirmation.
-- Never auto-commit or auto-push changes. The user will review and commit
-  them manually.
-- Don't modify files outside the project directory without asking.
-
-## Communication
-
-- Be direct and technical.
-- Show code rather than explaining at length.
-- Use tools proactively to explore and understand the codebase.
-"@ | Out-File -FilePath $defaultInstrFile -Encoding utf8
-    Write-Host "  [OK] Created default instructions: $defaultInstrFile" -ForegroundColor Green
-} else {
-    Write-Host "  [OK] Instructions already exist (keeping existing)" -ForegroundColor Green
-}
 
 # Create default AGENT.md (local-level agent identity)
 $agentInstrFile = Join-Path $InstructionsDir "AGENT.md"
@@ -431,7 +407,6 @@ Project-level instructions are loaded on top of global instructions.
 
 ## Example files
 
-- `default.md` — built-in defaults (safe to edit or delete)
 - `AGENT.md` — local agent identity (safe to edit or delete)
 - `project/` — per-project instruction files
 "@ | Out-File -FilePath $readmeFile -Encoding utf8
@@ -569,7 +544,10 @@ Write-Host ""
 Write-Host "  To use TOMAS in this terminal, run:" -ForegroundColor White
 Write-Host "    `$env:Path = '$BinDir;' + `$env:Path; tomas" -ForegroundColor DarkGray
 Write-Host ""
-Write-Host "  Or close this terminal and open a NEW one, then run: TOMAS" -ForegroundColor Yellow
+Write-Host "  Or if you ran from cmd.exe with install.cmd" -ForegroundColor White
+Write-Host "  the PATH is already updated — just type: TOMAS" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "  (New terminals will find TOMAS automatically.)" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  First time? Edit your API key in:" -ForegroundColor White
 Write-Host "    $EnvFile" -ForegroundColor DarkGray

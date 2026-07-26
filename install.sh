@@ -201,35 +201,6 @@ if [ ! -f "$BIN_DIR/TOMAS" ]; then
 fi
 
 # ── Create default instructions ──
-DEFAULT_INSTR_FILE="$INSTRUCTIONS_DIR/default.md"
-if [ ! -f "$DEFAULT_INSTR_FILE" ]; then
-    cat > "$DEFAULT_INSTR_FILE" << 'EOF'
-# Default Agent Behaviour
-
-- You are a helpful coding assistant.
-- Always read files before editing them.
-- Prefer making surgical edits over rewriting entire files.
-- Keep responses concise and focused on the code.
-- If a task is done, stop calling tools and summarise the result.
-
-## Safety
-
-- Never run destructive commands without confirmation.
-- Never auto-commit or auto-push changes. The user will review and commit
-  them manually.
-- Don't modify files outside the project directory without asking.
-
-## Communication
-
-- Be direct and technical.
-- Show code rather than explaining at length.
-- Use tools proactively to explore and understand the codebase.
-EOF
-    ok "Created default instructions: $DEFAULT_INSTR_FILE"
-else
-    ok "Instructions already exist (keeping existing)"
-fi
-
 # Default AGENT.md (local-level agent identity)
 AGENT_INSTR_FILE="$INSTRUCTIONS_DIR/AGENT.md"
 if [ ! -f "$AGENT_INSTR_FILE" ]; then
@@ -271,7 +242,6 @@ Project-level instructions are loaded on top of global instructions.
 
 ## Example files
 
-- `default.md` — built-in defaults (safe to edit or delete)
 - `AGENT.md` — local agent identity (safe to edit or delete)
 - `project/` — per-project instruction files
 EOF

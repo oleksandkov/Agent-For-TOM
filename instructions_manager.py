@@ -148,28 +148,6 @@ def build_instructions_section(project_dir: Path | None = None) -> str:
 #  Default instructions (for install.ps1)
 # ═══════════════════════════════════════════════════════════════════════
 
-DEFAULT_INSTRUCTIONS = """# Default Agent Behaviour
-
-- You are a helpful coding assistant.
-- Always read files before editing them.
-- Prefer making surgical edits over rewriting entire files.
-- Keep responses concise and focused on the code.
-- If a task is done, stop calling tools and summarise the result.
-
-## Safety
-
-- Never run destructive commands without confirmation.
-- Never auto-commit or auto-push changes. The user will review and commit
-  them manually.
-- Don't modify files outside the project directory without asking.
-
-## Communication
-
-- Be direct and technical.
-- Show code rather than explaining at length.
-- Use tools proactively to explore and understand the codebase.
-"""
-
 DEFAULT_AGENT_INSTRUCTIONS = """# Agent Identity
 
 - Your name is TOMAS agent.
@@ -200,11 +178,6 @@ def create_default_instructions(force: bool = False):
     instr_dir = get_global_instructions_dir()
     project_dir = PROJECT_INSTRUCTIONS_DIR
     project_dir.mkdir(parents=True, exist_ok=True)
-
-    # Default global instructions
-    default_file = instr_dir / "default.md"
-    if not default_file.exists() or force:
-        default_file.write_text(DEFAULT_INSTRUCTIONS.strip(), encoding="utf-8")
 
     # Default AGENT.md (local-level agent identity)
     agent_file = instr_dir / "AGENT.md"
@@ -237,7 +210,6 @@ Project-level instructions are loaded on top of global instructions.
 
 ## Example files
 
-- `default.md` — built-in defaults (safe to edit or delete)
 - `AGENT.md` — local agent identity (safe to edit or delete)
 - `project/` — per-project instruction files
 """

@@ -40,8 +40,17 @@ if %ERRORLEVEL% neq 0 (
     exit /b %ERRORLEVEL%
 )
 
+rem ── Add ~\.tomas\bin to current session PATH so `tomas` works immediately ──
+set "PATH=%USERPROFILE%\.tomas\bin;%PATH%"
+
 echo.
-echo   Installation complete.
-echo   Close and reopen your terminal, then run: TOMAS
+echo   ==========================================
+echo         Installation Complete!
+echo   ==========================================
+echo.
+echo    You can now run: TOMAS
+echo.
+echo    (New terminals will find TOMAS automatically.
+echo     This terminal is already set up.)
 echo.
 pause
