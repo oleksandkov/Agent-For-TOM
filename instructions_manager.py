@@ -7,9 +7,9 @@ Two tiers:
    coding standards, and default agent behaviour.
 
 2. Project-level instructions — loaded from the project directory:
-   - AGENT.md  (in project root, checked first)
-   - agent.md  (in project root, fallback)
-   - ~/.tomas/instructions/project/AGENT.md (per-project via .tomas dir)
+    - AGENTS.md  (in project root, checked first)
+    - agent.md   (in project root, fallback)
+    - ~/.tomas/instructions/project/AGENTS.md (per-project via .tomas dir)
 
 The merged instructions are injected into the system prompt.
 """
@@ -75,9 +75,9 @@ def get_project_instructions(project_dir: Path | None = None) -> str:
     """Load project-level instructions from the project directory.
 
     Checks, in order of priority (first match wins):
-    1. <project_dir>/AGENT.md
+    1. <project_dir>/AGENTS.md
     2. <project_dir>/agent.md
-    3. ~/.tomas/instructions/project/AGENT.md
+    3. ~/.tomas/instructions/project/AGENTS.md
        (if a matching file for the project exists there)
 
     Returns the content string, or empty string if nothing found.
@@ -90,7 +90,7 @@ def get_project_instructions(project_dir: Path | None = None) -> str:
             project_dir = Path.cwd()
 
     candidates = [
-        project_dir / "AGENT.md",
+        project_dir / "AGENTS.md",
         project_dir / "agent.md",
     ]
 
@@ -124,7 +124,7 @@ def build_instructions_section(project_dir: Path | None = None) -> str:
 
     Order in the prompt:
     1. Global instructions (from ~/.tomas/instructions/)
-    2. Project-level instructions (from AGENT.md / agent.md)
+    2. Project-level instructions (from AGENTS.md / agent.md)
 
     Returns the merged markdown string, or empty string if nothing found.
     """
@@ -203,7 +203,7 @@ session, regardless of the project you're working on.
 
 You can also add instructions per project:
 
-1. Place `AGENT.md` or `agent.md` in the project root directory.
+1. Place `AGENTS.md` or `agent.md` in the project root directory.
 2. OR place `<project-name>.md` in the `project/` subfolder here.
 
 Project-level instructions are loaded on top of global instructions.

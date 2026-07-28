@@ -74,15 +74,83 @@ Write-Host ""
 # ── Prerequisites ───────────────────────────────────────────────────────────
 $pythonPath = ""
 
-# Try python first, then python3
-foreach ($cmd in @("python", "python3")) {
+# Helper: test a Python executable and return its path if >= 3.10
+function Test-PythonExe {
+    param([string]$ExePath)
+    if (-not $ExePath -or -not (Test-Path $ExePath)) { return $null }
     try {
-        $ver = & $cmd -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
-        if ([version]$ver -ge [version]"3.10") {
-            $pythonPath = (Get-Command $cmd -ErrorAction SilentlyContinue).Source
-            break
-        }
+        $ver = & $ExePath -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
+        if ([version]$ver -ge [version]"3.10") { return $ExePath }
     } catch {}
+    return $null
+}
+
+# Strategy 1: Use the Python launcher (py) — always points to python.org Python on Windows
+try {
+    $pyExe = (Get-Command "py" -ErrorAction SilentlyContinue).Source
+    if ($pyExe) {
+        # Try specific versions in descending order (3.12, 3.11, 3.10)
+        foreach ($ver in @("3.12", "3.11", "3.10")) {
+            $result = & $pyExe "-$ver" -c "import sys; print(sys.executable)" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $result) {
+                $candidate = $result.Trim()
+                $pythonPath = Test-PythonExe $candidate
+                if ($pythonPath) { break }
+            }
+        }
+    }
+} catch {}
+
+# Strategy 2: Try python from PATH, preferring python.org over MSYS2
+if (-not $pythonPath) {
+    $pythonCandidates = @()
+    try {
+        $pythonCandidates = @(Get-Command "python" -ErrorAction SilentlyContinue -TotalCount 5 | Select-Object -ExpandProperty Source)
+    } catch {}
+
+    # First pass: prefer python.org paths (in AppData\Local\Programs\Python)
+    foreach ($p in $pythonCandidates) {
+        if ($p -match 'AppData\\Local\\Programs\\Python') {
+            $pythonPath = Test-PythonExe $p
+            if ($pythonPath) { break }
+        }
+    }
+    # Second pass: accept any non-MSYS2 python
+    if (-not $pythonPath) {
+        foreach ($p in $pythonCandidates) {
+            if ($p -notmatch 'msys64|ucrt64|mingw') {
+                $pythonPath = Test-PythonExe $p
+                if ($pythonPath) { break }
+            }
+        }
+    }
+    # Third pass: accept any python (including MSYS2 as last resort)
+    if (-not $pythonPath) {
+        foreach ($p in $pythonCandidates) {
+            $pythonPath = Test-PythonExe $p
+            if ($pythonPath) { break }
+        }
+    }
+}
+
+# Strategy 3: Try python3 from PATH
+if (-not $pythonPath) {
+    $python3Candidates = @()
+    try {
+        $python3Candidates = @(Get-Command "python3" -ErrorAction SilentlyContinue -TotalCount 5 | Select-Object -ExpandProperty Source)
+    } catch {}
+    foreach ($p in $python3Candidates) {
+        if ($p -notmatch 'msys64|ucrt64|mingw|WindowsApps') {
+            $pythonPath = Test-PythonExe $p
+            if ($pythonPath) { break }
+        }
+    }
+    if (-not $pythonPath) {
+        foreach ($p in $python3Candidates) {
+            $pythonPath = Test-PythonExe $p
+            if ($pythonPath) { break }
+        }
+    }
 }
 
 if (-not $pythonPath) {
@@ -496,18 +564,60 @@ Write-Host "  Removing TOMAS..." -ForegroundColor Cyan
 
 $tomasDir = "{InstallDir}"
 $binDir = Join-Path $tomasDir "bin"
+$venvDir = Join-Path $tomasDir ".venv"
 
 # Remove from PATH
 $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
 $paths = $currentPath -split ';' | Where-Object { $_ -ne $binDir }
 [Environment]::SetEnvironmentVariable("Path", ($paths -join ';'), "User")
-
 Write-Host "  [OK] Removed $binDir from PATH" -ForegroundColor Green
 
-# Remove install directory
+# Kill any Python processes running from this venv (they lock .pyd files)
+if (Test-Path $venvDir) {
+    $venvPython = (Get-ChildItem -Path $venvDir -Recurse -Filter "python.exe" -Depth 2 -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+    if ($venvPython) {
+        $lockedProcs = Get-Process | Where-Object { $_.Path -eq $venvPython } -ErrorAction SilentlyContinue
+        if ($lockedProcs) {
+            Write-Host "  [INFO] Stopping $($lockedProcs.Count) running Python process(es)..." -ForegroundColor Yellow
+            $lockedProcs | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 1
+        }
+    }
+}
+
+# Remove install directory (with retry for locked files)
 if (Test-Path $tomasDir) {
-    Remove-Item -Path $tomasDir -Recurse -Force
-    Write-Host "  [OK] Deleted $tomasDir" -ForegroundColor Green
+    $maxRetries = 3
+    $deleted = $false
+    for ($i = 0; $i -lt $maxRetries; $i++) {
+        try {
+            Remove-Item -Path $tomasDir -Recurse -Force -ErrorAction Stop
+            $deleted = $true
+            break
+        } catch {
+            if ($i -lt ($maxRetries - 1)) {
+                Write-Host "  [WARN] Retry $($i+1): some files still locked, waiting..." -ForegroundColor Yellow
+                Start-Sleep -Seconds 2
+                # Force-kill any remaining Python processes
+                Get-Process -Name "python*" -ErrorAction SilentlyContinue | Where-Object {
+                    $_.Path -like "$venvDir\*" -or $_.CommandLine -like "*$venvDir*"
+                } -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 1
+            } else {
+                Write-Host "  [WARN] Could not delete all files. Trying cmd /c rmdir..." -ForegroundColor Yellow
+                & cmd /c "rmdir /s /q `"$tomasDir`" 2>nul"
+                if (Test-Path $tomasDir) {
+                    Write-Host "  [FAIL] Some files could not be removed." -ForegroundColor Red
+                    Write-Host "         Delete manually: $tomasDir" -ForegroundColor Yellow
+                } else {
+                    $deleted = $true
+                }
+            }
+        }
+    }
+    if ($deleted) {
+        Write-Host "  [OK] Deleted $tomasDir" -ForegroundColor Green
+    }
 }
 
 Write-Host ""
@@ -517,6 +627,17 @@ Write-Host "  Close and reopen your terminal for PATH changes to take effect."
 
 [System.IO.File]::WriteAllText($uninstallScript, $uninstallContent, [System.Text.Encoding]::UTF8)
 Write-Host "  [OK] Created uninstaller: $uninstallScript" -ForegroundColor Green
+
+# ── Run setup to install default MCPs ──
+Write-Host ""
+Write-Host "  [10/10] Running TOMAS setup (default MCPs)..." -ForegroundColor Cyan
+try {
+    & $script:PythonExe "$SrcDir\agent_cli.py" setup
+    Write-Host "  [OK] Default MCPs configured" -ForegroundColor Green
+} catch {
+    Write-Host "  [WARN] Setup MCPs skipped: $_" -ForegroundColor Yellow
+    Write-Host "         Run 'TOMAS setup' later to configure default MCPs." -ForegroundColor Yellow
+}
 
 # ── Done ────────────────────────────────────────────────────────────────────
 Write-Host ""

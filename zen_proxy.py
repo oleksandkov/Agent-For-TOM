@@ -37,16 +37,154 @@ DIM = '\033[2m'
 RESET = '\033[0m'
 
 # Models available via the free Zen tier
-# (as of July 2026 — some models may be removed by upstream)
+# (as of July 2026 — fetched from upstream API, may change)
 ZEN_MODELS = [
+    # Claude
+    "claude-fable-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+    "claude-opus-4-1",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4",
+    "claude-haiku-4-5",
+    # Gemini
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.1-pro",
+    "gemini-3-flash",
+    # GPT / OpenAI
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.5-pro",
+    "gpt-5.4",
+    "gpt-5.4-pro",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.3-codex-spark",
+    "gpt-5.3-codex",
+    "gpt-5.2",
+    "gpt-5.2-codex",
+    "gpt-5.1",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-mini",
+    "gpt-5",
+    "gpt-5-codex",
+    "gpt-5-nano",
+    # Grok
+    "grok-build-0.1",
+    "grok-4.5",
+    # DeepSeek
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
     "deepseek-v4-flash-free",
+    # GLM / Zhipu
+    "glm-5.2",
+    "glm-5.1",
+    "glm-5",
+    # MiniMax
+    "minimax-m3",
+    "minimax-m2.7",
+    "minimax-m2.5",
+    # Kimi / Moonshot
+    "kimi-k2.7-code",
+    "kimi-k2.6",
+    "kimi-k2.5",
+    "kimi-k3",
+    # Qwen / Alibaba
+    "qwen3.6-plus",
+    "qwen3.5-plus",
+    # OpenCode Zen free tier
     "big-pickle",
+    "mimo-v2.5-free",
+    "ling-3.0-flash-free",
+    "nemotron-3-ultra-free",
+    "north-mini-code-free",
+    "laguna-s-2.1-free",
 ]
 
 # Context windows for each Zen model (tokens)
+# Models not listed here default to 128_000
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
-    "deepseek-v4-flash-free": 1_000_000,  # 1M context
-    "big-pickle": 128_000,                # 128K context
+    # Claude — most have 200K context
+    "claude-sonnet-4-5": 200_000,
+    "claude-sonnet-4-6": 200_000,
+    "claude-sonnet-4": 200_000,
+    "claude-sonnet-5": 200_000,
+    "claude-opus-4-1": 200_000,
+    "claude-opus-4-5": 200_000,
+    "claude-opus-4-6": 200_000,
+    "claude-opus-4-7": 200_000,
+    "claude-opus-4-8": 200_000,
+    "claude-opus-5": 200_000,
+    "claude-fable-5": 200_000,
+    "claude-haiku-4-5": 200_000,
+    # Gemini — 1M context
+    "gemini-3.6-flash": 1_000_000,
+    "gemini-3.5-flash": 1_000_000,
+    "gemini-3.5-flash-lite": 1_000_000,
+    "gemini-3.1-pro": 1_000_000,
+    "gemini-3-flash": 1_000_000,
+    # DeepSeek — 1M context
+    "deepseek-v4-pro": 1_000_000,
+    "deepseek-v4-flash": 1_000_000,
+    "deepseek-v4-flash-free": 1_000_000,
+    # GPT-5.6 — 1M context
+    "gpt-5.6-sol": 1_000_000,
+    "gpt-5.6-terra": 1_000_000,
+    "gpt-5.6-luna": 1_000_000,
+    # Other GPT — 128K context
+    "gpt-5.5": 128_000,
+    "gpt-5.5-pro": 128_000,
+    "gpt-5.4": 128_000,
+    "gpt-5.4-pro": 128_000,
+    "gpt-5.4-mini": 128_000,
+    "gpt-5.4-nano": 128_000,
+    "gpt-5.3-codex-spark": 128_000,
+    "gpt-5.3-codex": 128_000,
+    "gpt-5.2": 128_000,
+    "gpt-5.2-codex": 128_000,
+    "gpt-5.1": 128_000,
+    "gpt-5.1-codex-max": 128_000,
+    "gpt-5.1-codex": 128_000,
+    "gpt-5.1-codex-mini": 128_000,
+    "gpt-5": 128_000,
+    "gpt-5-codex": 128_000,
+    "gpt-5-nano": 128_000,
+    # Grok — 128K context
+    "grok-build-0.1": 128_000,
+    "grok-4.5": 128_000,
+    # GLM — 128K context
+    "glm-5.2": 128_000,
+    "glm-5.1": 128_000,
+    "glm-5": 128_000,
+    # MiniMax — 128K context
+    "minimax-m3": 128_000,
+    "minimax-m2.7": 128_000,
+    "minimax-m2.5": 128_000,
+    # Kimi — 128K context
+    "kimi-k2.7-code": 128_000,
+    "kimi-k2.6": 128_000,
+    "kimi-k2.5": 128_000,
+    "kimi-k3": 128_000,
+    # Qwen — 128K context
+    "qwen3.6-plus": 128_000,
+    "qwen3.5-plus": 128_000,
+    # OpenCode Zen free tier
+    "big-pickle": 128_000,
+    "mimo-v2.5-free": 128_000,
+    "ling-3.0-flash-free": 128_000,
+    "nemotron-3-ultra-free": 128_000,
+    "north-mini-code-free": 128_000,
+    "laguna-s-2.1-free": 128_000,
 }
 
 
@@ -200,7 +338,7 @@ def openai_to_anthropic(oai_resp: dict, model: str, input_tokens: int) -> dict:
     content: list[dict] = []
     if choice.get("message", {}).get("content"):
         content.append({"type": "text", "text": choice["message"]["content"]})
-    for tc in choice.get("message", {}).get("tool_calls", []):
+    for tc in (choice.get("message", {}).get("tool_calls") or []):
         try:
             inp = json.loads(tc["function"]["arguments"])
         except (json.JSONDecodeError, KeyError):
@@ -305,12 +443,6 @@ class ZenProxyHandler(BaseHTTPRequestHandler):
             return
 
         model = ant_body.get("model", ZEN_MODELS[0])
-        if model not in ZEN_MODELS:
-            self._send_json(400, {
-                "type": "error",
-                "error": {"type": "invalid_request_error", "message": f"Unknown model: {model}. Available: {', '.join(ZEN_MODELS)}"},
-            })
-            return
 
         stream = ant_body.get("stream", False)
         self._ensure_session()
@@ -335,33 +467,19 @@ class ZenProxyHandler(BaseHTTPRequestHandler):
         try:
             zen_raw = _upstream_request(zen_req)
         except URLError as e:
-            # Log the full upstream error for diagnostics
+            # Log a SHORT one-line error (no request body dump to avoid terminal flooding)
             err_body = ""
             if isinstance(e, HTTPError):
                 try:
-                    err_body = e.read().decode('utf-8', errors='replace')[:500]
+                    err_body = e.read().decode('utf-8', errors='replace')[:200]
                 except Exception:
                     pass
             status = getattr(e, 'code', 0)
+            req_size = len(zen_data) if zen_data else 0
             sys.stderr.write(
-                f"{YELLOW}[ZEN PROXY] Upstream error (exhausted): {status} {e.reason}"
-                f"{(' · ' + err_body) if err_body else ''}{RESET}\n"
+                f"{YELLOW}[ZEN PROXY] Upstream error: {status} {e.reason}"
+                f" (request: {req_size:,} bytes){RESET}\n"
             )
-            # Log the request body for debugging
-            try:
-                body_summary = json.dumps(oai_body, indent=2, ensure_ascii=False)
-                # Truncate to avoid huge logs
-                if len(body_summary) > 5000:
-                    body_summary = body_summary[:5000] + f"\n... ({len(json.dumps(oai_body))} total chars)"
-                sys.stderr.write(
-                    f"{YELLOW}[ZEN PROXY] === REQUEST BODY (first 5000 chars) ==={RESET}\n"
-                    f"{body_summary}\n"
-                    f"{YELLOW}[ZEN PROXY] === END REQUEST BODY ==={RESET}\n"
-                )
-            except Exception as log_exc:
-                sys.stderr.write(
-                    f"{YELLOW}[ZEN PROXY] Could not log request body: {log_exc}{RESET}\n"
-                )
             self._send_json(502, {
                 "type": "error",
                 "error": {
@@ -404,9 +522,6 @@ class ZenProxyHandler(BaseHTTPRequestHandler):
             return
 
         model = body.get("model", ZEN_MODELS[0])
-        if model not in ZEN_MODELS:
-            self._send_json(400, {"error": {"message": f"Unknown model: {model}. Available: {', '.join(ZEN_MODELS)}"}})
-            return
 
         self._ensure_session()
         session_id = self.__class__._session_id
@@ -423,32 +538,19 @@ class ZenProxyHandler(BaseHTTPRequestHandler):
         try:
             zen_raw = _upstream_request(zen_req)
         except URLError as e:
-            # Log the full upstream error
+            # Log a SHORT one-line error (no request body dump)
             err_body = ""
             if isinstance(e, HTTPError):
                 try:
-                    err_body = e.read().decode('utf-8', errors='replace')[:500]
+                    err_body = e.read().decode('utf-8', errors='replace')[:200]
                 except Exception:
                     pass
             status = getattr(e, 'code', 0)
+            req_size = len(zen_data) if zen_data else 0
             sys.stderr.write(
-                f"{YELLOW}[ZEN PROXY] Upstream error (exhausted): {status} {e.reason}"
-                f"{(' · ' + err_body) if err_body else ''}{RESET}\n"
+                f"{YELLOW}[ZEN PROXY] Upstream error: {status} {e.reason}"
+                f" (request: {req_size:,} bytes){RESET}\n"
             )
-            # Log the request body for debugging
-            try:
-                body_summary = json.dumps(body, indent=2, ensure_ascii=False)
-                if len(body_summary) > 5000:
-                    body_summary = body_summary[:5000] + f"\n... ({len(json.dumps(body))} total chars)"
-                sys.stderr.write(
-                    f"{YELLOW}[ZEN PROXY] === REQUEST BODY (first 5000 chars) ==={RESET}\n"
-                    f"{body_summary}\n"
-                    f"{YELLOW}[ZEN PROXY] === END REQUEST BODY ==={RESET}\n"
-                )
-            except Exception as log_exc:
-                sys.stderr.write(
-                    f"{YELLOW}[ZEN PROXY] Could not log request body: {log_exc}{RESET}\n"
-                )
             self._send_json(502, {
                 "error": {
                     "message": str(e.reason),

@@ -367,6 +367,7 @@ class MCPManager:
     def __init__(self):
         self.servers: dict[str, MCPServer] = {}
         self._all_tools: list[dict] = []
+        self.failed_servers: dict[str, str] = {}  # name -> error message
 
     def discover_and_connect(self, config: dict[str, dict] = None) -> list[dict]:
         """
@@ -385,6 +386,8 @@ class MCPManager:
                 # Convert tools to Anthropic-compatible format
                 for t in server.tools:
                     self._all_tools.append(self._to_anthropic_tool(t))
+            else:
+                self.failed_servers[name] = server._last_error or "unknown error"
         return self._all_tools
 
     @property
@@ -399,6 +402,14 @@ class MCPManager:
                 if t["name"] == tool_name:
                     return server.call_tool(tool_name, arguments)
         return f"Error: MCP tool '{tool_name}' not found on any connected server."
+
+    def get_server_for_tool(self, tool_name: str) -> str | None:
+        """Return the server name that owns the given tool, or None."""
+        for server in self.servers.values():
+            for t in server.tools:
+                if t["name"] == tool_name:
+                    return server.name
+        return None
 
     @staticmethod
     def _to_anthropic_tool(tool: dict) -> dict:

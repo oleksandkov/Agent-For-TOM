@@ -5,9 +5,10 @@ TOMAS CLI — Interactive TUI + subcommand interface for the TOMAS agent.
 Usage:
     TOMAS                          Interactive TUI menu (arrow keys + Enter)
     TOMAS --run                    Launch agent directly
+    TOMAS setup                    Install default MCPs and configure environment
     TOMAS mcp list                 List configured MCP servers
-    TOMAS mcp add --transport http <name> <url>
-    TOMAS mcp add --transport stdio <name> -- <command> [args...]
+    TOMAS mcp add <name> -- <command> [args...]   (stdio, default)
+    TOMAS mcp add --transport http <name> <url>   (HTTP)
     TOMAS mcp remove <name>        Remove an MCP server
     TOMAS mcp disable <name>       Disable an MCP server (skipped at startup)
     TOMAS mcp enable <name>        Re-enable a disabled MCP server
@@ -15,7 +16,13 @@ Usage:
     TOMAS mcp env <server> KEY=VALUE   Set an env var (e.g. auth token)
     TOMAS mcp env <server> --unset KEY  Remove an env var
     TOMAS skill list               List installed skills
+    TOMAS skill install <name> -- <command> [args...]  Install a skill from npm
+    TOMAS update                   Update TOMAS from GitHub
+    TOMAS uninstall                Remove TOMAS completely
     TOMAS --help                   Show this help
+
+Note:
+    TOMAS upgrade is an alias for TOMAS update.
 """
 
 import os
@@ -38,11 +45,13 @@ import msvcrt
 
 # Add project directory to path
 PROJECT_DIR = Path(__file__).parent.resolve()
+TOMAS_DIR = Path.home() / ".tomas"
 sys.path.insert(0, str(PROJECT_DIR))
 
-# Load .env
+# Load .env — first from TOMAS install dir, then from src dir (project overrides)
 from dotenv import load_dotenv
-load_dotenv(PROJECT_DIR / ".env", override=True)
+load_dotenv(TOMAS_DIR / ".env")  # main config (API key, etc.)
+load_dotenv(PROJECT_DIR / ".env", override=True)  # project overrides (model)
 
 # Import agent modules
 from agent import (
@@ -153,6 +162,10 @@ def clear_screen():
 #  GENERIC ARROW-KEY MENU
 # ═══════════════════════════════════════════════════════════
 
+CURSOR_UP_N = '\033[{}A'  # move cursor up N lines
+ERASE_DOWN = '\033[J'     # erase from cursor to end of screen
+
+
 def arrow_menu(title: str, items: list, header_lines: list = None,
                footer: str = None) -> int:
     """
@@ -160,15 +173,12 @@ def arrow_menu(title: str, items: list, header_lines: list = None,
     Returns the index of the selected item, or -1 if cancelled.
     """
     n = len(items)
+    if n == 0:
+        return -1
     selected = 0
-    prev_selected = -1  # force redraw
 
-    def draw():
-        nonlocal prev_selected
-        # Redraw only the items (assumes they're at fixed position)
-        for i in range(n):
-            sys.stdout.write(CURSOR_UP + CLEAR_LINE)
-        # Now write over them
+    def draw_all():
+        """Draw (or redraw) the full items list + footer."""
         for i in range(n):
             prefix = f'{GREEN}▶{RESET} ' if i == selected else '  '
             label = f'{BOLD}{items[i]}{RESET}' if i == selected else items[i]
@@ -176,64 +186,46 @@ def arrow_menu(title: str, items: list, header_lines: list = None,
         if footer:
             sys.stdout.write(CLEAR_LINE + DIM + footer + RESET + '\n')
         sys.stdout.flush()
-        prev_selected = selected
+
+    def draw_header():
+        """Print the title/header lines (used before each draw_all)."""
+        if header_lines:
+            for line in header_lines:
+                print(line)
+        else:
+            print(f'{BOLD}{title}{RESET}')
+            print('─' * 50)
 
     # ── First draw ──
+    sys.stdout.write(HIDE_CURSOR)
     clear_screen()
-    # Header
-    if header_lines:
-        for line in header_lines:
-            print(line)
-    else:
-        print(f'{BOLD}{title}{RESET}')
-        print('─' * 50)
-    # Draw items
-    for i in range(n):
-        prefix = f'{GREEN}▶{RESET} ' if i == selected else '  '
-        label = f'{BOLD}{items[i]}{RESET}' if i == selected else items[i]
-        sys.stdout.write(f'{CLEAR_LINE}{prefix}{label}\n')
-    if footer:
-        sys.stdout.write(CLEAR_LINE + DIM + footer + RESET + '\n')
-    sys.stdout.flush()
-    prev_selected = selected
+    draw_header()
+    draw_all()
+
+    # Number of lines the items+footer occupy (used for smooth redraw)
+    block_lines = n + (1 if footer else 0)
 
     # ── Event loop ──
     while True:
         key = get_key()
-        if key == 'UP':
-            selected = (selected - 1) % n
-            min_l = min(prev_selected, selected)
-            up_count = n - min_l
-            for _ in range(up_count + (1 if footer else 0)):
-                sys.stdout.write(CURSOR_UP + CLEAR_LINE)
-            for i in range(min_l, n):
-                prefix = f'{GREEN}▶{RESET} ' if i == selected else '  '
-                label = f'{BOLD}{items[i]}{RESET}' if i == selected else items[i]
-                sys.stdout.write(f'{CLEAR_LINE}{prefix}{label}\n')
-            if footer:
-                sys.stdout.write(CLEAR_LINE + DIM + footer + RESET + '\n')
-            sys.stdout.flush()
-            prev_selected = selected
-
-        elif key == 'DOWN':
-            selected = (selected + 1) % n
-            min_l = min(prev_selected, selected)
-            up_count = n - min_l
-            for _ in range(up_count + (1 if footer else 0)):
-                sys.stdout.write(CURSOR_UP + CLEAR_LINE)
-            for i in range(min_l, n):
-                prefix = f'{GREEN}▶{RESET} ' if i == selected else '  '
-                label = f'{BOLD}{items[i]}{RESET}' if i == selected else items[i]
-                sys.stdout.write(f'{CLEAR_LINE}{prefix}{label}\n')
-            if footer:
-                sys.stdout.write(CLEAR_LINE + DIM + footer + RESET + '\n')
-            sys.stdout.flush()
-            prev_selected = selected
+        if key in ('UP', 'DOWN'):
+            if key == 'UP':
+                selected = (selected - 1) % n
+            else:
+                selected = (selected + 1) % n
+            # Smooth redraw: move cursor up to the first item line and
+            # re-render each line in place using CLEAR_LINE. This avoids
+            # the full-screen flash that clear_screen() (os.system('cls'))
+            # causes on every keypress.
+            sys.stdout.write(CURSOR_UP_N.format(block_lines))
+            draw_all()
 
         elif key in ('ENTER',):
+            sys.stdout.write(SHOW_CURSOR)
             return selected
 
         elif key in ('ESC', 'q', 'CTRL_C'):
+            sys.stdout.write(SHOW_CURSOR)
             return -1
 
 
@@ -1218,10 +1210,10 @@ def page_sessions():
 
 
 def page_edit_instructions():
-    """View/edit AGENT_INSTRUCTIONS.md."""
-    inst_file = AGENT_PROJECT_DIR / "AGENT_INSTRUCTIONS.md"
+    """View/edit ~/.tomas/instructions/AGENT.md (global agent instructions)."""
+    inst_file = TOMAS_DIR / "instructions" / "AGENT.md"
     clear_screen()
-    print(f'{BOLD}Agent Instructions (AGENT_INSTRUCTIONS.md){RESET}')
+    print(f'{BOLD}Agent Instructions (AGENT.md ~ global){RESET}')
     print('─' * 50)
     if inst_file.exists():
         print(inst_file.read_text(encoding="utf-8"))
@@ -1235,14 +1227,14 @@ def page_edit_instructions():
         os.startfile(inst_file) if inst_file.exists() else None
 
 
-def page_edit_claude():
-    """View/edit CLAUDE.md."""
-    claude_file = AGENT_PROJECT_DIR / "CLAUDE.md"
+def page_edit_project_agent():
+    """View/edit AGENTS.md in the project root (project-level guidelines)."""
+    agent_file = AGENT_PROJECT_DIR / "AGENTS.md"
     clear_screen()
-    print(f'{BOLD}Project Guidelines (CLAUDE.md){RESET}')
+    print(f'{BOLD}Project Guidelines (AGENTS.md ~ project level){RESET}')
     print('─' * 50)
-    if claude_file.exists():
-        print(claude_file.read_text(encoding="utf-8"))
+    if agent_file.exists():
+        print(agent_file.read_text(encoding="utf-8"))
     else:
         print('  (file does not exist yet)')
     print()
@@ -1250,7 +1242,7 @@ def page_edit_claude():
     sys.stdout.flush()
     key = msvcrt.getch()
     if key in (b'e', b'E'):
-        os.startfile(claude_file) if claude_file.exists() else None
+        os.startfile(agent_file) if agent_file.exists() else None
 
 
 def page_configure_provider():
@@ -1517,6 +1509,31 @@ def _detect_provider() -> str:
     return "other"
 
 
+# Map from providers.json 'type' field to _detect_provider() return values
+# Used as fallback when env-var detection fails
+PROVIDER_TYPE_TO_DETECT = {
+    "openrouter": "openrouter",
+    "zen": "zen",
+    "anthropic": "anthropic",
+    "openai": "openai",
+}
+
+
+def _detect_provider_from_config() -> str:
+    """Fallback: detect provider from saved multi-provider config.
+
+    Used when _detect_provider() returns 'other' — checks the active
+    provider's 'type' field in providers.json.
+    """
+    config = _load_providers_config()
+    active = config.get("active")
+    if active:
+        provider_info = config.get("providers", {}).get(active, {})
+        ptype = provider_info.get("type", "")
+        return PROVIDER_TYPE_TO_DETECT.get(ptype, "other")
+    return "other"
+
+
 PROVIDER_LABELS = {
     "openrouter": "OpenRouter",
     "zen": "OpenCode Zen",
@@ -1699,6 +1716,9 @@ def _update_provider_model(model: str):
 def page_choose_model():
     """Arrow-key menu to select a model."""
     provider = _detect_provider()
+    # Fallback: if env-var detection returns 'other', check saved config
+    if provider == "other":
+        provider = _detect_provider_from_config()
     label = PROVIDER_LABELS.get(provider, "Generic")
 
     # For OpenRouter: auto-fetch all models from API, fall back to static list
@@ -1865,8 +1885,44 @@ def _fetch_openrouter_models():
         show_info_page('Done', [f'  ✓ Model set to: {model}'])
 
 
+def _ensure_api_configured() -> bool:
+    """Ensure ANTHROPIC_API_KEY is set. If not, try to use the Zen proxy.
+    Returns True if API is ready, False if user should go back to menu."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if api_key:
+        return True
+
+    # No API key configured — try to start/use the Zen proxy
+    try:
+        from zen_proxy import check_status, start_proxy
+        if check_status():
+            print(f"  {GREEN}◈{RESET} Using OpenCode Zen proxy (already running)")
+        else:
+            print(f"  {CYAN}◈{RESET} Starting OpenCode Zen proxy...")
+            try:
+                start_proxy(6446, daemon=True)
+            except Exception as e:
+                print(f"  {YELLOW}⚠{RESET} Could not start Zen proxy: {e}")
+                print(f"  {YELLOW}⚠{RESET} Set ANTHROPIC_API_KEY in {TOMAS_DIR / '.env'} or start Zen manually.")
+                return False
+        update_dotenv("ANTHROPIC_API_KEY", "zen-proxy-key")
+        update_dotenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:6446")
+        update_dotenv("ANTHROPIC_EXTRA_HEADERS", "")
+        from agent import reinit_client
+        reinit_client()
+        return True
+    except ImportError:
+        print(f"  {RED}✗{RESET} No API key configured and Zen proxy not available.")
+        print(f"  {RED}✗{RESET} Set ANTHROPIC_API_KEY in {TOMAS_DIR / '.env'} to use TOMAS.")
+        return False
+
+
 def page_run_agent():
-    """Launch the agent."""
+    """Launch the agent from the TUI menu."""
+    if not _ensure_api_configured():
+        print()
+        input(f"{DIM}Press Enter to return to menu...{RESET}")
+        return
     clear_screen()
     print(f'{BOLD}Starting TOMAS Agent{RESET}')
     print('─' * 50)
@@ -1903,8 +1959,8 @@ MENU_ITEMS = [
     f'  {YELLOW}⬡{RESET}  Check available tools',
     f'  {YELLOW}⬡{RESET}  Check installed skills',
     f'  {CYAN}◈{RESET}  Sessions & Notes',
-    f'  {BLUE}✎{RESET}  View/Edit agent instructions',
-    f'  {BLUE}✎{RESET}  View/Edit project guidelines',
+    f'  {BLUE}✎{RESET}  View/Edit global agent instructions (AGENT.md)',
+    f'  {BLUE}✎{RESET}  View/Edit project-level guidelines (AGENTS.md)',
     f'  {MAGENTA}▶{RESET}  {BOLD}Run agent (interactive){RESET}',
     f'  {RED}✕{RESET}  Exit',
 ]
@@ -1920,7 +1976,7 @@ MENU_ACTIONS = [
     page_skills,
     page_sessions,
     page_edit_instructions,
-    page_edit_claude,
+    page_edit_project_agent,
     page_run_agent,
     None,  # exit
 ]
@@ -1964,7 +2020,9 @@ def run_menu():
 # ═══════════════════════════════════════════════════════════
 
 def cmd_run_agent():
-    """Launch the agent directly."""
+    """Launch the agent directly (--run)."""
+    if not _ensure_api_configured():
+        sys.exit(1)
     clear_screen()
     print(f'{BOLD}TOMAS Agent{RESET}')
     print('─' * 50)
@@ -1981,27 +2039,21 @@ def cmd_mcp_list():
 def cmd_mcp_add():
     """Add an MCP server.
     Syntax:
-        TOMAS mcp add --transport http <name> <url>
-        TOMAS mcp add --transport stdio <name> -- <command> [args...]
+        TOMAS mcp add <name> -- <command> [args...]          (stdio, default)
+        TOMAS mcp add --transport http <name> <url>          (HTTP)
+        TOMAS mcp add --transport stdio <name> -- <command>  (explicit stdio)
     """
     from mcp_manager import write_mcp_server
 
     argv = sys.argv[3:]  # skip "TOMAS mcp add"
 
-    # Find --transport flag
-    transport = None
+    # Find --transport flag (optional; default to stdio)
+    transport = "stdio"
     if "--transport" in argv:
         idx = argv.index("--transport")
         if idx + 1 < len(argv):
             transport = argv[idx + 1]
             argv = argv[:idx] + argv[idx + 2:]
-
-    if not transport:
-        print("Error: --transport flag required (http or stdio)")
-        print("Usage:")
-        print("  TOMAS mcp add --transport http <name> <url>")
-        print("  TOMAS mcp add --transport stdio <name> -- <command> [args...]")
-        sys.exit(1)
 
     if transport == "http":
         if len(argv) < 2:
@@ -2014,7 +2066,8 @@ def cmd_mcp_add():
 
     elif transport == "stdio":
         if "--" not in argv:
-            print("Error: TOMAS mcp add --transport stdio <name> -- <command> [args...]")
+            print("Error: TOMAS mcp add <name> -- <command> [args...]")
+            print("  Example: TOMAS mcp add chrome-devtools -- npx -y chrome-devtools-mcp")
             sys.exit(1)
         sep = argv.index("--")
         name = argv[0] if sep > 0 else None
@@ -2094,6 +2147,247 @@ def cmd_mcp_enable():
     print(f"✓ Server '{name}' enabled. It will be connected on next agent start.")
 
 
+def cmd_setup():
+    """Install default MCP servers and configure environment.
+
+    Installs the default set of MCP servers for TOMAS:
+      - playwright: browser automation (npx @playwright/mcp)
+      - context7: up-to-date library documentation search (npx)
+    """
+    from mcp_manager import read_mcp_servers, write_mcp_server
+    import subprocess, sys
+
+    tomas_venv = TOMAS_DIR / ".venv"
+    python_exe = tomas_venv / "Scripts" / "python.exe"
+    if not python_exe.exists():
+        python_exe = sys.executable
+
+    print(f"{BOLD}TOMAS Setup{RESET}")
+    print("─" * 50)
+
+    # ── 1. playwright MCP (always ensure script + config) ──
+    print(f"  {YELLOW}⚙ Installing playwright MCP...{RESET}")
+    src_dir = TOMAS_DIR / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    server_script = src_dir / "playwright_mcp_server.py"
+    # Always (re)create the server script with the latest version
+    server_script.write_text(PLAYWRIGHT_MCP_SOURCE, encoding='utf-8')
+    write_mcp_server("playwright", {
+        "type": "stdio",
+        "command": str(python_exe),
+        "args": [str(server_script)],
+    })
+    print(f"  {GREEN}✓{RESET} playwright MCP configured")
+
+    # ── 2. context7 MCP ──
+    existing = read_mcp_servers()
+    if "context7" in existing:
+        print(f"  {GREEN}✓{RESET} context7 MCP already configured")
+    else:
+        write_mcp_server("context7", {
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "@upstash/context7-mcp"],
+        })
+        print(f"  {GREEN}✓{RESET} context7 MCP configured")
+
+    # ── 3. Install Python deps ──
+    print()
+    print(f"  {YELLOW}⚙ Checking Python dependencies...{RESET}")
+    try:
+        subprocess.run(
+            [str(python_exe), "-m", "pip", "install", "playwright"],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+        subprocess.run(
+            [str(python_exe), "-m", "playwright", "install", "chromium"],
+            check=True,
+            capture_output=True,
+            timeout=180,
+        )
+        print(f"  {GREEN}✓{RESET} playwright + chromium installed")
+    except Exception as e:
+        print(f"  {YELLOW}⚠ playwright install skipped: {e}{RESET}")
+        print(f"  {DIM}Run manually: pip install playwright && playwright install chromium{RESET}")
+
+    print()
+    print(f"  {GREEN}✓ Setup complete!{RESET}")
+    print(f"  Run {CYAN}TOMAS --run{RESET} to start the agent.")
+
+
+# ── Playwright MCP server source (embedded) ──
+# Proper MCP protocol server using Playwright for browser automation.
+PLAYWRIGHT_MCP_SOURCE = r'''"""
+Playwright MCP Server — browser automation for TOMAS agent.
+Implements the Model Context Protocol (MCP) over stdio.
+"""
+import asyncio, json, sys
+from playwright.async_api import async_playwright
+
+browser = None
+page = None
+_request_id = 0
+
+
+def next_id():
+    global _request_id
+    _request_id += 1
+    return _request_id
+
+
+TOOLS = [
+    {
+        "name": "browser_navigate",
+        "description": "Navigate to a URL in the browser",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The URL to navigate to"}
+            },
+            "required": ["url"]
+        }
+    },
+    {
+        "name": "browser_click",
+        "description": "Click an element on the page by CSS selector",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string", "description": "CSS selector of the element to click"}
+            },
+            "required": ["selector"]
+        }
+    },
+    {
+        "name": "browser_type",
+        "description": "Type text into an input field",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string", "description": "CSS selector of the input element"},
+                "text": {"type": "string", "description": "Text to type"}
+            },
+            "required": ["selector", "text"]
+        }
+    },
+    {
+        "name": "browser_snapshot",
+        "description": "Get the current page text content and title",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "browser_screenshot",
+        "description": "Take a screenshot of the current page",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Optional file path to save the screenshot"}
+            }
+        }
+    },
+    {
+        "name": "browser_evaluate",
+        "description": "Run JavaScript in the browser and return the result",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string", "description": "JavaScript expression to evaluate"}
+            },
+            "required": ["expression"]
+        }
+    },
+]
+
+
+async def handle_request(request: dict) -> dict:
+    global page
+    req_id = request.get("id", 0)
+    method = request.get("method", "")
+    params = request.get("params", {})
+
+    try:
+        if method == "initialize":
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "serverInfo": {"name": "playwright-mcp", "version": "1.0.0"},
+                    "capabilities": {"tools": {}}
+                }
+            }
+        elif method == "notifications/initialized":
+            return None  # no response for notifications
+        elif method == "tools/list":
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"tools": TOOLS}
+            }
+        elif method == "tools/call":
+            name = params.get("name", "")
+            args = params.get("arguments", {})
+            if not page:
+                p = await async_playwright().start()
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+
+            if name == "browser_navigate":
+                await page.goto(args["url"])
+                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Navigated to {args['url']}"}]}}
+            elif name == "browser_click":
+                await page.click(args["selector"])
+                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "Clicked"}]}}
+            elif name == "browser_type":
+                await page.fill(args["selector"], args["text"])
+                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "Typed"}]}}
+            elif name == "browser_snapshot":
+                title = await page.title()
+                text = await page.evaluate("() => document.body.innerText")
+                url = page.url
+                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Title: {title}\nURL: {url}\n\n{text[:15000]}"}]}}
+            elif name == "browser_screenshot":
+                path = args.get("path")
+                await page.screenshot(path=path or None)
+                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "Screenshot taken"}]}}
+            elif name == "browser_evaluate":
+                result = await page.evaluate(args["expression"])
+                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": str(result)[:5000]}]}}
+            else:
+                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown tool: {name}"}}
+        else:
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown method: {method}"}}
+    except Exception as e:
+        return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": str(e)[:500]}}
+
+
+async def main():
+    loop = asyncio.get_event_loop()
+    while True:
+        line = await loop.run_in_executor(None, sys.stdin.readline)
+        if not line:
+            break
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        response = await handle_request(request)
+        if response is not None:
+            resp_bytes = (json.dumps(response) + "\n").encode()
+            sys.stdout.buffer.write(resp_bytes)
+            sys.stdout.buffer.flush()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+'''
+
+
 def cmd_skill_list():
     """List installed skills with enhanced formatting."""
     from skills_manager import discover_skills, find_skill_dirs
@@ -2146,6 +2440,80 @@ def cmd_skill_list():
         print()
 
 
+def cmd_skill_install():
+    """Install a skill.
+    Syntax:
+        TOMAS skill install <name>          Install from the skills registry
+        TOMAS skill install <name> -- <command> [args...]  Install via custom command
+    """
+    import subprocess
+
+    argv = sys.argv[3:]  # skip "TOMAS skill install"
+    if not argv:
+        print("Error: TOMAS skill install <name> [-- <command> args...]")
+        sys.exit(1)
+
+    if "--" in argv:
+        # Custom install command
+        sep = argv.index("--")
+        name = argv[0] if sep > 0 else None
+        if not name:
+            print("Error: name is required before --")
+            sys.exit(1)
+        cmd_parts = argv[sep + 1:]
+        if not cmd_parts:
+            print("Error: command required after --")
+            sys.exit(1)
+        print(f"  Installing skill '{name}' via: {' '.join(cmd_parts)}...")
+        result = subprocess.run(cmd_parts, capture_output=False)
+        if result.returncode == 0:
+            print(f"  {GREEN}✓{RESET} Skill '{name}' installed!")
+        else:
+            sys.exit(result.returncode)
+    else:
+        # Default: use npx skills add
+        name = argv[0]
+        print(f"  Installing skill '{name}' from registry...")
+        result = subprocess.run(
+            ["npx", "-y", "skills", "add", name],
+            capture_output=False,
+        )
+        if result.returncode == 0:
+            print(f"  {GREEN}✓{RESET} Skill '{name}' installed!")
+        else:
+            print(f"  {RED}✗{RESET} Failed to install skill '{name}'")
+            print(f"  Tip: try {CYAN}TOMAS skill install {name} -- <custom-command>{RESET}")
+            sys.exit(result.returncode)
+
+
+def cmd_uninstall():
+    """Run the uninstall.ps1 script to remove TOMAS completely."""
+    uninstall_ps1 = TOMAS_DIR / "bin" / "uninstall.ps1"
+    if not uninstall_ps1.exists():
+        print(f"  {RED}✗{RESET} Uninstaller not found at: {uninstall_ps1}")
+        print(f"  Delete {TOMAS_DIR} manually to remove TOMAS.")
+        sys.exit(1)
+    print(f"  Running uninstaller...")
+    sys.stdout.flush()
+    result = subprocess.run(
+        ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(uninstall_ps1)],
+    )
+    sys.exit(result.returncode)
+
+
+def cmd_update():
+    """Run the upgrade script to update TOMAS from GitHub."""
+    update_cmd = TOMAS_DIR / "bin" / "TOMAS-upgrade.cmd"
+    if not update_cmd.exists():
+        print(f"  {RED}✗{RESET} Upgrade script not found at: {update_cmd}")
+        print(f"  To reinstall manually: {CYAN}powershell -c \"iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)\"{RESET}")
+        sys.exit(1)
+    print(f"  Upgrading TOMAS from GitHub...")
+    sys.stdout.flush()
+    result = subprocess.run([str(update_cmd)], shell=True)
+    sys.exit(result.returncode)
+
+
 def print_help():
     print(__doc__.strip())
 
@@ -2177,8 +2545,8 @@ def main():
         if len(sys.argv) < 3:
             print("Usage: TOMAS mcp {list|add|remove|env|disable|enable} [...]")
             print("  TOMAS mcp list")
-            print("  TOMAS mcp add --transport http <name> <url>")
-            print("  TOMAS mcp add --transport stdio <name> -- <command> [args...]")
+            print("  TOMAS mcp add <name> -- <command> [args...]      (stdio, default)")
+            print("  TOMAS mcp add --transport http <name> <url>      (HTTP)")
             print("  TOMAS mcp remove <name>")
             print("  TOMAS mcp env <server> [KEY=VALUE|--unset KEY]")
             print("  TOMAS mcp disable <name>")
@@ -2206,16 +2574,34 @@ def main():
     # ── skill subcommand ──
     if arg == 'skill':
         if len(sys.argv) < 3:
-            print("Usage: TOMAS skill {list}")
+            print("Usage: TOMAS skill {list|install}")
             print("  TOMAS skill list")
+            print("  TOMAS skill install <name> -- <command> [args...]")
             sys.exit(1)
         sub = sys.argv[2]
         if sub == 'list':
             cmd_skill_list()
+        elif sub == 'install':
+            cmd_skill_install()
         else:
             print(f"Unknown skill subcommand: {sub}")
-            print("Usage: TOMAS skill {list}")
+            print("Usage: TOMAS skill {list|install}")
             sys.exit(1)
+        return
+
+    # ── setup command ──
+    if arg == 'setup':
+        cmd_setup()
+        return
+
+    # ── update / upgrade command ──
+    if arg in ('update', 'upgrade'):
+        cmd_update()
+        return
+
+    # ── uninstall command ──
+    if arg == 'uninstall':
+        cmd_uninstall()
         return
 
     # ── Unknown argument ──

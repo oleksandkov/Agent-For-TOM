@@ -9,7 +9,7 @@ feeds results back until the model returns plain text.
 Features:
   - Agent loop with tool use
   - Tools: read_file, write_file, edit_file, list_files, run_command, search_code
-  - Project context re-injection (CLAUDE.md / AGENT.md)
+  - Project context re-injection (AGENTS.md / AGENT.md)
   - Three-layer memory system (~/.tomas/memory/)
   - Risk-tiered permission system (low / medium / high)
   - Auto-compaction when the context window fills up
@@ -447,8 +447,38 @@ def handle_edit_file(params: dict) -> str:
     if count > 1:
         return f"Error: old_string matches {count} locations; be more specific."
     new_content = content.replace(old, params["new_string"], 1)
+
+    # ── Generate a unified diff preview ──
+    import difflib
+    old_lines = content.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+    diff = difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=str(path),
+        tofile=str(path),
+        n=3,  # context lines
+    )
+    diff_text = "".join(diff)
+    # Color the diff for terminal display
+    colored_lines = []
+    for line in diff_text.splitlines():
+        if line.startswith('+') and not line.startswith('+++'):
+            colored_lines.append(f'{GREEN}{line}{RESET}')
+        elif line.startswith('-') and not line.startswith('---'):
+            colored_lines.append(f'{RED}{line}{RESET}')
+        elif line.startswith('@@'):
+            colored_lines.append(f'{CYAN}{line}{RESET}')
+        else:
+            colored_lines.append(f'{DIM}{line}{RESET}')
+    colored_diff = "\n".join(colored_lines)
+
+    # Write the new content
     path.write_text(new_content, encoding="utf-8")
-    return f"Successfully edited {path}"
+
+    # Return a summary with the diff
+    n_add = sum(1 for l in diff_text.splitlines() if l.startswith('+') and not l.startswith('+++'))
+    n_del = sum(1 for l in diff_text.splitlines() if l.startswith('-') and not l.startswith('---'))
+    return f"Successfully edited {path} (+{n_add} -{n_del} lines)\n\n{colored_diff}"
 
 def handle_list_files(params: dict) -> str:
     path = _resolve(params.get("path", "."))
@@ -739,40 +769,67 @@ Rules:
 - Use absolute or project-relative paths.
 - If a task is done, stop calling tools and summarize."""
 
+def _truncate_section(text: str, max_chars: int, label: str = "") -> str:
+    """Truncate a section to max_chars, adding a notice if cut."""
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    # Try to cut at a line boundary for readability
+    last_nl = cut.rfind('\n')
+    if last_nl > max_chars * 0.8:
+        cut = cut[:last_nl]
+    notice = f"\n[... truncated: {len(text)} → {len(cut)} chars ...]"
+    if label:
+        notice = f"\n[... {label} truncated: {len(text)} → {len(cut)} chars ...]"
+    return cut + notice
+
+
+# Maximum size for each system-prompt section (in characters)
+MAX_INSTRUCTIONS_CHARS = 8000       # AGENTS.md + global instructions
+MAX_MEMORY_CHARS = 2000             # memory index
+MAX_SKILLS_CHARS = 4000             # skills section
+MAX_SELF_IMPROVE_CHARS = 1500       # self-improvement context
+MAX_TOTAL_SYSTEM_PROMPT = 20000     # hard cap on the entire system prompt
+
+
 def build_system_prompt() -> str:
     prompt = BASE_PROMPT
-    # custom instructions (persistent behavior across sessions)
-    for candidate in [PROJECT_DIR / "AGENT_INSTRUCTIONS.md", PROJECT_DIR / "BEHAVIOR.md"]:
-        if candidate.exists():
-            prompt += f"\n\n# Agent Instructions ({candidate.name})\n{candidate.read_text(encoding='utf-8')}"
-            break
-    # project guidelines
-    for candidate in [PROJECT_DIR / "CLAUDE.md",
-                      PROJECT_DIR / ".claude" / "CLAUDE.md"]:
-        if candidate.exists():
-            prompt += f"\n\n# Project guidelines ({candidate.name})\n{candidate.read_text(encoding='utf-8')}"
-            break
-    # global + project-level instructions (from .tomas/instructions/ and AGENT.md)
+    # project-level instructions from AGENTS.md / agent.md + .tomas/instructions/
     instructions_section = build_instructions_section(PROJECT_DIR)
     if instructions_section:
+        instructions_section = _truncate_section(
+            instructions_section, MAX_INSTRUCTIONS_CHARS, "instructions"
+        )
         prompt += f"\n\n{instructions_section}"
+    # legacy support: AGENT_INSTRUCTIONS.md or BEHAVIOR.md (loaded after for compatibility)
+    for candidate in [PROJECT_DIR / "AGENT_INSTRUCTIONS.md", PROJECT_DIR / "BEHAVIOR.md"]:
+        if candidate.exists():
+            legacy = candidate.read_text(encoding="utf-8")
+            legacy = _truncate_section(legacy, 2000, candidate.name)
+            prompt += f"\n\n# Agent Instructions ({candidate.name})\n{legacy}"
+            break
     # memory index
     memory = load_memory_index()
     if memory:
+        memory = _truncate_section(memory, MAX_MEMORY_CHARS, "memory")
         prompt += f"\n\n# Memory index\n{memory}"
     # installed skills
     skills_section = build_skills_section()
     if skills_section:
+        skills_section = _truncate_section(
+            skills_section, MAX_SKILLS_CHARS, "skills"
+        )
         prompt += f"\n\n{skills_section}"
     # ── Self-improvement context ──
     try:
+        si_parts: list[str] = []
         si_session = self_improve.get_session_analysis()
         if si_session and si_session.get("purpose") != "unknown":
             purpose = si_session.get("purpose", "unknown")
             stage = si_session.get("stage", "unknown")
             keywords = si_session.get("keywords", [])
-            prompt += (
-                f"\n\n# Session Context (self-improving system)\n"
+            si_parts.append(
+                f"# Session Context (self-improving system)\n"
                 f"Current session purpose: {purpose}\n"
                 f"Current task stage: {stage}\n"
                 f"Recent topics: {', '.join(keywords[:8])}\n"
@@ -781,11 +838,23 @@ def build_system_prompt() -> str:
         # Active self-improvement tips
         active_tips = self_improve.get_active_tips()
         if active_tips:
-            prompt += "\n# Self-Improvement Tips for This Session\n"
+            tips_lines = ["# Self-Improvement Tips for This Session"]
             for i, tip in enumerate(active_tips[:5], 1):
-                prompt += f"{i}. {tip.get('message', '')}\n"
+                tips_lines.append(f"{i}. {tip.get('message', '')}")
+            si_parts.append("\n".join(tips_lines))
+        if si_parts:
+            si_text = "\n\n".join(si_parts)
+            si_text = _truncate_section(
+                si_text, MAX_SELF_IMPROVE_CHARS, "self-improvement"
+            )
+            prompt += f"\n\n{si_text}"
     except Exception:
         pass
+    # ── Hard cap on the total system prompt ──
+    if len(prompt) > MAX_TOTAL_SYSTEM_PROMPT:
+        prompt = _truncate_section(
+            prompt, MAX_TOTAL_SYSTEM_PROMPT, "system prompt"
+        )
     return prompt
 
 # ---------------------------------------------------------------------------
@@ -839,11 +908,20 @@ def _estimate_tokens(messages: list) -> int:
             total_chars += len(str(content))
     return total_chars // 3
 
-def maybe_compact(messages: list) -> list:
+def _estimate_system_prompt_tokens(system_prompt: str) -> int:
+    """Estimate tokens for the system prompt string."""
+    return len(system_prompt) // 3
+
+def maybe_compact(messages: list, system_prompt: str = "") -> list:
+    """Compact the conversation if it's getting too large.
+
+    Now accounts for system_prompt + tool definitions + max_tokens in the budget.
+    """
     msg_tok = _estimate_tokens(messages)
-    # Total budget includes tool definitions + max_tokens + messages
+    sys_tok = _estimate_system_prompt_tokens(system_prompt) if system_prompt else 0
+    # Total budget includes system prompt + tool definitions + max_tokens + messages
     total_budget = CONTEXT_WINDOW * COMPACTION_THRESHOLD
-    if msg_tok + TOOL_TOKENS + MAX_TOKENS < total_budget:
+    if msg_tok + sys_tok + TOOL_TOKENS + MAX_TOKENS < total_budget:
         return messages
     print(f'  {DIM}[context] compacting conversation...{RESET}')
     try:
@@ -881,19 +959,115 @@ def maybe_compact(messages: list) -> list:
 # The agent loop
 # ---------------------------------------------------------------------------
 
+MAX_TOOL_CALLS_PER_TURN = 25  # safety limit to prevent infinite tool loops
+_streaming_disabled = False  # set True if provider doesn't support streaming
+
+
+def _is_retryable_error(err: Exception) -> bool:
+    """Return True if the error is transient and worth retrying (429, 5xx, timeout)."""
+    err_msg = str(err)
+    # Rate limits and server errors are retryable
+    if any(k in err_msg for k in ("429", "rate_limit", "Too Many Requests",
+                                    "502", "503", "504", "Bad Gateway",
+                                    "Service Unavailable", "Gateway Timeout",
+                                    "timeout", "timed out")):
+        return True
+    # Check for status code attribute
+    status = getattr(err, 'status_code', None)
+    if status and status >= 500:
+        return True
+    return False
+
+
+def _is_client_error(err: Exception) -> bool:
+    """Return True if the error is a client-side error (400, 401, 403, 422) that should NOT be retried."""
+    err_msg = str(err)
+    if any(k in err_msg for k in ("400", "Bad Request", "invalid_request",
+                                    "401", "Unauthorized", "authentication",
+                                    "403", "Forbidden", "permission",
+                                    "422", "Unprocessable")):
+        return True
+    status = getattr(err, 'status_code', None)
+    if status and 400 <= status < 500 and status != 429:
+        return True
+    return False
+
+
 def agent_loop(system_prompt: str, messages: list) -> str:
-    """Keep calling the model until it stops requesting tools."""
+    """Keep calling the model until it stops requesting tools.
+
+    Includes:
+    - Streaming output (tokens printed as they arrive)
+    - Tool-call loop limit (MAX_TOOL_CALLS_PER_TURN) to prevent infinite loops
+    - Smart retry: retries 429/5xx with exponential backoff, never retries 400/401
+    """
+    import time
+    import anthropic
+
+    max_retries = 3
+    tool_call_count = 0
+    global _streaming_disabled
+
     while True:
         combined_tools = COMBINED_TOOLS
 
-        response = _get_client().messages.create(
-            model=_get_model(),
-            max_tokens=MAX_TOKENS,
-            system=system_prompt,
-            tools=combined_tools,
-            messages=messages,
-        )
-        messages.append({"role": "assistant", "content": response.content})
+        # ── API call with smart retry ──
+        response = None
+        for attempt in range(max_retries + 1):
+            try:
+                # Try streaming for real-time output (only if not previously disabled)
+                if not _streaming_disabled:
+                    try:
+                        stream_result = _agent_loop_streamed(
+                            system_prompt, messages, combined_tools, tool_call_count
+                        )
+                        if stream_result == "__TOOLS__":
+                            # Model requested tools during streaming — fall back to
+                            # non-streaming to get the complete tool_use blocks
+                            pass
+                        else:
+                            return stream_result
+                    except (AttributeError, TypeError):
+                        # Streaming not supported by this provider — disable for rest of session
+                        _streaming_disabled = True
+                    except anthropic.InternalServerError:
+                        raise  # let the retry logic handle it
+
+                response = _get_client().messages.create(
+                    model=_get_model(),
+                    max_tokens=MAX_TOKENS,
+                    system=system_prompt,
+                    tools=combined_tools,
+                    messages=messages,
+                )
+                break  # success
+            except anthropic.InternalServerError as e:
+                if _is_client_error(e) and not _is_retryable_error(e):
+                    # 400/401/403 — don't retry, it's a client error
+                    print(f"\n  {RED}✗{RESET} API client error (not retrying): {e}")
+                    return f"I'm sorry, but the AI service rejected the request. The system prompt or message may be too large. Try /compact to reduce context size."
+                if not _is_retryable_error(e):
+                    # Other non-retryable error
+                    print(f"\n  {RED}✗{RESET} API error: {e}")
+                    return "I'm sorry, but there was an error communicating with the AI service."
+                if attempt < max_retries:
+                    delay = 5 * (2 ** attempt)  # 5, 10, 20 seconds
+                    print(f"\n  {YELLOW}⚠{RESET} Transient error — retrying in {delay}s (attempt {attempt + 1}/{max_retries})...")
+                    time.sleep(delay)
+                else:
+                    print(f"  {RED}✗{RESET} Still failing after {max_retries} retries.")
+                    return "I'm sorry, but the AI service is unavailable right now. Please try again in a few minutes."
+            except Exception as e:
+                if attempt < max_retries and _is_retryable_error(e):
+                    delay = 5 * (2 ** attempt)
+                    print(f"\n  {YELLOW}⚠{RESET} Retrying in {delay}s (attempt {attempt + 1}/{max_retries})...")
+                    time.sleep(delay)
+                else:
+                    print(f"\n  {RED}✗{RESET} Unexpected error: {e}")
+                    return "I'm sorry, but an unexpected error occurred."
+
+        if response is None:
+            return "I'm sorry, but the AI service could not be reached."
 
         # ── Track token usage ──
         global _last_turn_usage, _session_tokens
@@ -905,13 +1079,51 @@ def agent_loop(system_prompt: str, messages: list) -> str:
             _session_tokens["calls"] += 1
 
         if response.stop_reason != "tool_use":
-            return "".join(b.text for b in response.content if hasattr(b, "text"))
+            text = "".join(b.text for b in response.content if hasattr(b, "text"))
+            # Print the response with label (non-streaming path)
+            if text:
+                print(f'  {MAGENTA}{BOLD}▌ TOMAS{RESET}')
+                print(f'  {text}')
+            return text
+
+        # ── Tool-call loop limit ──
+        tool_calls_this_round = sum(
+            1 for b in response.content if b.type == "tool_use"
+        )
+        tool_call_count += tool_calls_this_round
+        if tool_call_count > MAX_TOOL_CALLS_PER_TURN:
+            print(f'    {RED}⚠{RESET}  Tool-call limit reached ({MAX_TOOL_CALLS_PER_TURN}). Stopping to prevent infinite loop.')
+            messages.append({"role": "user", "content": [
+                {"type": "text", "text": f"Tool call limit ({MAX_TOOL_CALLS_PER_TURN}) reached. Please summarize what you've found so far and provide a response to the user."}
+            ]})
+            # One more call to get the final summary
+            try:
+                final_resp = _get_client().messages.create(
+                    model=_get_model(),
+                    max_tokens=MAX_TOKENS,
+                    system=system_prompt,
+                    tools=combined_tools,
+                    messages=messages,
+                )
+                return "".join(b.text for b in final_resp.content if hasattr(b, "text"))
+            except Exception:
+                return "I've reached the tool-call limit. Here's what I found so far — please ask me to continue if you need more."
 
         tool_results = []
         for block in response.content:
             if block.type == "tool_use":
                 args_str = json.dumps(block.input)[:120]
-                print(f'    {YELLOW}⚡{RESET} {BOLD}{block.name}{RESET}({DIM}{args_str}...{RESET})')
+                # Determine tool origin label
+                tool_origin = ""
+                if block.name in HANDLERS:
+                    tool_origin = f"{DIM}[built-in]{RESET}"
+                elif mcp_manager:
+                    # Check renamed MCP tools first, then original names
+                    mcp_orig = MCP_TOOL_NAME_MAP.get(block.name, block.name)
+                    srv = mcp_manager.get_server_for_tool(mcp_orig)
+                    if srv:
+                        tool_origin = f"{DIM}[MCP: {srv}]{RESET}"
+                print(f'    {YELLOW}⚡{RESET} {BOLD}{block.name}{RESET} {tool_origin}({DIM}{args_str}...{RESET})')
                 if not check_permission(block.name, block.input):
                     result = "Error: user denied this tool call."
                 else:
@@ -925,12 +1137,94 @@ def agent_loop(system_prompt: str, messages: list) -> str:
                 if isinstance(result, str) and len(result) > 100_000:
                     print(f'    {RED}⚠{RESET}  tool result truncated: {len(result)} chars → 100K')
                     result = result[:100_000] + f"\n[...truncated, full result was {len(result)} chars]"
+                # ── Show a brief result preview so the user can see the
+                #    tool's output inline in the chat (first 1-2 lines). ──
+                if isinstance(result, str) and result.strip():
+                    preview = result.strip().splitlines()
+                    shown = preview[0][:160] if preview else ""
+                    if len(preview) > 1 or len(result) > 160:
+                        shown += f' {DIM}…{RESET}'
+                    print(f'    {GREEN}↳{RESET} {DIM}{shown}{RESET}')
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
                     "content": result,
                 })
         messages.append({"role": "user", "content": tool_results})
+
+
+def _agent_loop_streamed(
+    system_prompt: str, messages: list, combined_tools: list, tool_call_count: int
+) -> str:
+    """Stream the model response token-by-token for real-time output.
+
+    Only handles the text-streaming part. If the model requests tools,
+    returns the sentinel "__TOOLS__" so the caller can fall back to
+    non-streaming for tool processing.
+
+    Returns:
+        - The full text response (if no tools were called)
+        - "__TOOLS__" sentinel (if the model requested tool calls)
+    """
+    import anthropic
+
+    text_parts: list[str] = []
+    has_tool_use = False
+    stop_reason = None
+    usage_info = None
+
+    print(f'  {MAGENTA}{BOLD}▌ TOMAS{RESET}')
+    print(f'  ', end='', flush=True)
+
+    try:
+        with _get_client().messages.stream(
+            model=_get_model(),
+            max_tokens=MAX_TOKENS,
+            system=system_prompt,
+            tools=combined_tools,
+            messages=messages,
+        ) as stream:
+            for event in stream:
+                if event.type == "content_block_delta":
+                    if event.delta.type == "text_delta":
+                        text = event.delta.text
+                        text_parts.append(text)
+                        sys.stdout.write(text)
+                        sys.stdout.flush()
+                elif event.type == "content_block_start":
+                    if event.content_block.type == "tool_use":
+                        has_tool_use = True
+                elif event.type == "message_stop":
+                    final_msg = stream.get_final_message()
+                    stop_reason = final_msg.stop_reason
+                    usage_info = getattr(final_msg, "usage", None)
+            print()  # end the streamed line
+    except (AttributeError, TypeError) as e:
+        # Provider doesn't support streaming — raise to trigger fallback
+        raise
+    except anthropic.InternalServerError:
+        raise
+    except Exception as e:
+        # Other streaming errors — fall back
+        print(f'\n  {YELLOW}⚠{RESET} Streaming interrupted, falling back...')
+        raise TypeError(f"streaming failed: {e}")
+
+    # Track usage
+    global _last_turn_usage, _session_tokens
+    if usage_info:
+        _last_turn_usage["input"] = usage_info.input_tokens or 0
+        _last_turn_usage["output"] = usage_info.output_tokens or 0
+        _session_tokens["input"] += _last_turn_usage["input"]
+        _session_tokens["output"] += _last_turn_usage["output"]
+        _session_tokens["calls"] += 1
+
+    full_text = "".join(text_parts)
+
+    # If the model requested tools, return sentinel so caller falls back
+    if has_tool_use or stop_reason == "tool_use":
+        return "__TOOLS__"
+
+    return full_text
 
 # ---------------------------------------------------------------------------
 # Slash commands
@@ -951,7 +1245,8 @@ SLASH_COMMANDS = {
     "si":           {"desc": "Alias for /self-improve",           "icon": "🧠"},
     "save":         {"desc": "Save current session",              "icon": "💾"},
     "load":         {"desc": "Load a saved session: /load <id>",  "icon": "📂"},
-    "sessions":     {"desc": "List saved sessions",               "icon": "📋"},
+    "session":      {"desc": "Session mgmt: list/save/continue",  "icon": "📋"},
+    "sessions":     {"desc": "Alias for /session list",            "icon": "📋"},
     "note":         {"desc": "Create a self-note: /note <title> <content>", "icon": "📝"},
     "notes":        {"desc": "List all self-notes",               "icon": "📒"},
     "exit":         {"desc": "Exit TOMAS",                        "icon": "✕"},
@@ -1180,7 +1475,7 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
             return f'  {RED}Skill "{skill_name}" not found. Try{RESET} {CYAN}/skills{RESET}'
         # Inject skill content into the conversation as a user message
         messages.append({"role": "user", "content": result})
-        print(f'  {GREEN}✓{RESET} Loaded skill {CYAN}"{skill_name}"{RESET}')
+        print(f'  {YELLOW}⚡ Skill call:{RESET} {BOLD}{skill_name}{RESET} {DIM}[loaded into conversation]{RESET}')
         return None  # signals main loop to fall through to agent loop
 
     if cmd == "pdf-report":
@@ -1192,8 +1487,17 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
             return f'  {RED}⚠{RESET} PDF report failed: {e}'
 
     # ── Session commands ──
-    if cmd == "session":
-        sub = parts[1].lower() if len(parts) > 1 else ""
+    if cmd in ("session", "sessions"):
+        # "sessions" is an alias that defaults to the "list" subcommand.
+        # parts is split with maxsplit=1, so parts[1] holds "sub [arg]".
+        # Re-split to extract the subcommand and any trailing argument.
+        rest = parts[1] if len(parts) > 1 else ""
+        rest_parts = rest.split(maxsplit=1)
+        sub = rest_parts[0].lower() if rest_parts else ""
+        sid_arg = rest_parts[1].strip() if len(rest_parts) > 1 else ""
+        # /sessions (alias) with no subcommand → list
+        if cmd == "sessions" and not sub:
+            sub = "list"
 
         if sub in ("list", "ls"):
             sessions = list_sessions(limit=20)
@@ -1226,22 +1530,48 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
                 f' ({s["calls"]} calls){RESET}'
             )
 
-        elif sub in ("continue", "load") and len(parts) > 2:
-            sid = parts[2]
+        elif sub in ("continue", "load"):
+            if not sid_arg:
+                return f'  {YELLOW}Usage:{RESET} {CYAN}/session continue <id>{RESET}\n  {DIM}Use{RESET} {CYAN}/session list{RESET} {DIM}to see session IDs.{RESET}'
+            sid = sid_arg
             loaded = continue_session(sid)
             if loaded is None:
                 return f'  {RED}✗{RESET} Session not found: {sid}'
             # Replace current messages with the loaded ones
             messages.clear()
             messages.extend(loaded)
-            return (
+            # Show the full conversation history so the user has context
+            lines = [
                 f'  {GREEN}✓{RESET} Continuing session {CYAN}{sid}{RESET} '
-                f'({len(loaded)} messages loaded).\n'
-                f'  {DIM}Type your next message to continue the conversation.{RESET}'
-            )
+                f'({len(loaded)} messages loaded).',
+                f'  {DIM}{"─" * 50}{RESET}',
+            ]
+            for m in loaded:
+                role = m.get("role", "?")
+                content = m.get("content", "")
+                text = _format_block_content(content)
+                if role == "user":
+                    icon = f'{GREEN}◆{RESET}'
+                    label = f'{GREEN}{BOLD}You{RESET}'
+                elif role == "assistant":
+                    icon = f'{MAGENTA}▌{RESET}'
+                    label = f'{MAGENTA}{BOLD}TOMAS{RESET}'
+                else:
+                    icon = f'{DIM}·{RESET}'
+                    label = f'{DIM}{role}{RESET}'
+                display = text.replace('\n', '\n      ')
+                if len(display) > 300:
+                    display = display[:300] + f' {DIM}…{RESET}'
+                lines.append(f'  {icon} {label}')
+                lines.append(f'      {display}')
+            lines.append(f'  {DIM}{"─" * 50}{RESET}')
+            lines.append(f'  {DIM}Type your next message to continue the conversation.{RESET}')
+            return '\n'.join(lines)
 
-        elif sub in ("delete", "rm") and len(parts) > 2:
-            sid = parts[2]
+        elif sub in ("delete", "rm"):
+            if not sid_arg:
+                return f'  {YELLOW}Usage:{RESET} {CYAN}/session delete <id>{RESET}'
+            sid = sid_arg
             if delete_session(sid):
                 return f'  {GREEN}✓{RESET} Session deleted: {sid}'
             else:
@@ -1346,13 +1676,16 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
 
     # ── Self-note commands ──
     if cmd == "note":
-        if len(parts) < 3:
+        # parts is split with maxsplit=1: parts[1] = "title content..."
+        rest = parts[1] if len(parts) > 1 else ""
+        rest_parts = rest.split(maxsplit=1)
+        if len(rest_parts) < 2:
             return (
                 f'  {YELLOW}Usage:{RESET} {CYAN}/note <title> <content>{RESET}\n'
                 f'  {DIM}Create a self-note about something the agent learned.{RESET}'
             )
-        title = parts[1]
-        content = " ".join(parts[2:])
+        title = rest_parts[0]
+        content = rest_parts[1]
         note_id = self_notes.create_note(
             title=title,
             content=content,
@@ -1385,6 +1718,67 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
 # Real-time input reader with slash suggestions
 # ---------------------------------------------------------------------------
 
+# Input history — persists across calls to read_input_with_suggestions
+_input_history: list[str] = []
+_history_index: int = 0
+
+
+def _read_input_cross_platform(prompt: str) -> str:
+    """Cross-platform input fallback for Linux/macOS.
+
+    Uses standard input() with optional readline support for history.
+    Provides basic slash-command tab completion via readline if available.
+    """
+    global _input_history
+
+    # Try to enable readline for arrow-key history + tab completion
+    try:
+        import readline
+
+        # Set up history file
+        hist_file = Path.home() / ".tomas" / "input_history.txt"
+        hist_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            readline.read_history_file(str(hist_file))
+        except (OSError, FileNotFoundError):
+            pass
+
+        # Tab completion for slash commands
+        def _slash_completer(text: str, state: int):
+            if text.startswith('/'):
+                matches = [f"/{n}" for n in SLASH_COMMANDS if n.startswith(text[1:])]
+                return matches[state] if state < len(matches) else None
+            return None
+
+        readline.set_completer(_slash_completer)
+        readline.parse_and_bind("tab: complete")
+        readline.set_history_length(100)
+    except ImportError:
+        hist_file = None
+
+    try:
+        result = input(prompt).strip()
+    except EOFError:
+        return "exit"
+
+    # Save to history
+    if result and not result.startswith('/'):
+        if not _input_history or _input_history[-1] != result:
+            _input_history.append(result)
+            if len(_input_history) > 100:
+                _input_history.pop(0)
+
+    # Save readline history
+    if hist_file:
+        try:
+            import readline
+            readline.write_history_file(str(hist_file))
+        except (OSError, ImportError):
+            pass
+
+    return result
+
+
 def read_input_with_suggestions(prompt: str) -> str:
     """Read a line of input with live slash-command suggestions beneath the prompt.
 
@@ -1392,23 +1786,24 @@ def read_input_with_suggestions(prompt: str) -> str:
     starts with ``/``, matching ``SLASH_COMMANDS`` are shown on the line
     directly below the prompt and updated after each keystroke.
 
-    **Interactive features** while in command mode (line starts with ``/``):
+    **Interactive features**:
 
-    * ``↑`` / ``↓``  — navigate through suggestion items (selected shown bold)
+    * ``↑`` / ``↓``  — navigate input history (when not in command mode)
+    * ``↑`` / ``↓``  — navigate through suggestion items (in command mode)
     * ``Tab``        — auto-complete to the current match or common prefix
     * ``Enter``      — accept the highlighted suggestion (if any), or submit as-is
     * ``Esc``        — clear the input line
-    * ``←`` / ``→``  — ignored (kept for compatibility)
 
-    Falls back to plain ``input()`` when msvcrt is unavailable.
+    Falls back to a cross-platform input with basic slash-command completion
+    when msvcrt is unavailable (Linux/macOS).
     """
     try:
         import msvcrt  # Windows-only
         import sys
     except ImportError:
-        return input(prompt)
+        return _read_input_cross_platform(prompt)
 
-    global AUTO_APPROVE_LOW, YOLO_MODE  # allow F-key / YOLO mode switching
+    global AUTO_APPROVE_LOW, YOLO_MODE, _history_index  # allow F-key / YOLO mode switching
     base_prompt = prompt
     sys.stdout.write(prompt)
     sys.stdout.flush()
@@ -1416,6 +1811,9 @@ def read_input_with_suggestions(prompt: str) -> str:
     buffer: list[str] = []
     showing = False
     selected: int | None = None  # index of the currently highlighted suggestion
+
+    # Reset history navigation to past-the-end
+    _history_index = len(_input_history)
 
     # ── mode helpers ─────────────────────────────────────────────────┬─
     def _mode_badge() -> str:
@@ -1539,7 +1937,14 @@ def read_input_with_suggestions(prompt: str) -> str:
                     matches = _get_matches()
                     if chosen < len(matches):
                         buffer = ['/', matches[chosen]]
-                return _repr()
+                result = _repr()
+                # Save non-empty, non-command input to history (max 100)
+                if result.strip() and not result.startswith('/'):
+                    if not _input_history or _input_history[-1] != result:
+                        _input_history.append(result)
+                        if len(_input_history) > 100:
+                            _input_history.pop(0)
+                return result
 
             # ── Ctrl+C ────────────────────────────────────────────────────
             if ch == b'\x03':
@@ -1555,13 +1960,29 @@ def read_input_with_suggestions(prompt: str) -> str:
                     matches = _get_matches()
                     if not matches:
                         continue
-                    if ext == b'H':  # ↑ Up arrow
+                    if ext == b'H':  # ↑ Up arrow — navigate suggestions
                         selected = 0 if selected is None else max(0, selected - 1)
                         _show()
-                    elif ext == b'P':  # ↓ Down arrow
+                    elif ext == b'P':  # ↓ Down arrow — navigate suggestions
                         selected = 0 if selected is None else min(len(matches) - 1, selected + 1)
                         _show()
-                    # ← / → are silently consumed
+                elif ext == b'H':  # ↑ Up arrow — history recall
+                    if _input_history:
+                        _hide()
+                        if _history_index > 0:
+                            _history_index -= 1
+                        buffer = list(_input_history[_history_index])
+                        _refresh()
+                elif ext == b'P':  # ↓ Down arrow — history forward
+                    _hide()
+                    if _history_index < len(_input_history) - 1:
+                        _history_index += 1
+                        buffer = list(_input_history[_history_index])
+                    else:
+                        _history_index = len(_input_history)
+                        buffer = []
+                    _refresh()
+                # ← / → are silently consumed
                 continue
 
             # ── F5/F6/F7/F8 — quick mode switch ─────────────────────────
@@ -1669,6 +2090,71 @@ def read_input_with_suggestions(prompt: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Conversation history display (used when continuing a session)
+# ---------------------------------------------------------------------------
+
+def _format_block_content(content, max_len: int = 200) -> str:
+    """Format a message content (str or list of blocks) into a single string."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for block in content:
+            if isinstance(block, dict):
+                t = block.get("type", "")
+                if t == "text":
+                    texts.append(block.get("text", ""))
+                elif t == "tool_use":
+                    name = block.get("name", "?")
+                    inp = json.dumps(block.get("input", {}))[:80]
+                    texts.append(f"[tool_use: {name}({inp})]")
+                elif t == "tool_result":
+                    rc = str(block.get("content", ""))[:120]
+                    texts.append(f"[tool_result: {rc}]")
+            elif hasattr(block, "type"):
+                t = getattr(block, "type", "")
+                if t == "text":
+                    texts.append(getattr(block, "text", ""))
+                elif t == "tool_use":
+                    texts.append(f"[tool_use: {getattr(block, 'name', '?')}]")
+                elif t == "tool_result":
+                    texts.append("[tool_result]")
+        return " ".join(texts)
+    return str(content)
+
+
+def _print_conversation_history(messages: list) -> None:
+    """Pretty-print a full conversation history to the terminal.
+
+    Used when continuing a session so the user can see everything that was
+    said before typing a new message.
+    """
+    for i, m in enumerate(messages):
+        role = m.get("role", "?")
+        content = m.get("content", "")
+        text = _format_block_content(content)
+
+        if role == "user":
+            icon = f'{GREEN}◆{RESET}'
+            label = f'{GREEN}{BOLD}You{RESET}'
+        elif role == "assistant":
+            icon = f'{MAGENTA}▌{RESET}'
+            label = f'{MAGENTA}{BOLD}TOMAS{RESET}'
+        else:
+            icon = f'{DIM}·{RESET}'
+            label = f'{DIM}{role}{RESET}'
+
+        # Truncate very long messages for display, but keep a reasonable preview
+        display = text.replace('\n', '\n      ')
+        if len(display) > 500:
+            display = display[:500] + f' {DIM}…({len(text)} chars total){RESET}'
+
+        print(f'  {icon} {label}')
+        print(f'      {display}')
+        print()
+
+
+# ---------------------------------------------------------------------------
 # REPL
 # ---------------------------------------------------------------------------
 
@@ -1735,6 +2221,10 @@ def main() -> int:
                 parts.append(f"{len(failed)} failed")
             status = ", ".join(parts) if parts else f'{DIM}no servers configured{RESET}'
             print(f'  {DIM}MCP:{RESET} {status}')
+        # Show per-server failure reasons
+        if mcp_manager.failed_servers:
+            for srv_name, err_msg in mcp_manager.failed_servers.items():
+                print(f'  {RED}  ✗{RESET} {srv_name}: {DIM}{err_msg[:120]}{RESET}')
 
         # Pre-compute the final tool list once (not on every turn)
         global TOOL_TOKENS, MCP_TOOL_NAME_MAP
@@ -1791,11 +2281,16 @@ def main() -> int:
     # ── Continue previous session if requested ──
     if CONTINUE_SESSION_ID:
         try:
-            from session_manager import continue_session
+            from session_manager import continue_session, load_session
             loaded = continue_session(CONTINUE_SESSION_ID)
             if loaded:
                 messages = loaded
                 print(f'  {GREEN}✓{RESET}  Continuing session {CYAN}{CONTINUE_SESSION_ID[:16]}{RESET} ({len(loaded)} messages)')
+                print(f'  {DIM}{"─" * 50}{RESET}')
+                _print_conversation_history(loaded)
+                print(f'  {DIM}{"─" * 50}{RESET}')
+                print(f'  {DIM}Type your next message to continue the conversation.{RESET}')
+                print()
         except Exception as e:
             print(f'  {YELLOW}⚠{RESET}  Could not load session: {e}')
 
@@ -1833,10 +2328,24 @@ def main() -> int:
                 messages.append({"role": "user", "content": user_input})
             messages = maybe_compact(messages)
             system_prompt = build_system_prompt()  # re-inject every turn
+            # Re-check compaction with the actual system prompt size
+            messages = maybe_compact(messages, system_prompt)
             result = agent_loop(system_prompt, messages)
-            # Print agent response with label
-            print(f'  {MAGENTA}{BOLD}▌ TOMAS{RESET}')
-            print(f'  {result}')
+            # Streaming already printed the response with the ▌ TOMAS label.
+            # For non-streaming fallback, result is the text — print it.
+            if result and not result.startswith("I'm sorry"):
+                # Check if streaming already output the text (it prints inline)
+                # We detect this by checking if the result was already shown.
+                # The streaming path prints text as it arrives and returns it.
+                # To avoid double-printing, we only print if the result
+                # wasn't streamed. We use a simple heuristic: streaming
+                # sets a flag. For safety, if result contains text not
+                # already shown, print it.
+                pass  # streaming handles output; non-streaming also handles it
+            elif result:
+                # Error messages from the agent loop
+                print(f'  {MAGENTA}{BOLD}▌ TOMAS{RESET}')
+                print(f'  {result}')
             # ── Token usage info ──
             t = _last_turn_usage
             s = _session_tokens

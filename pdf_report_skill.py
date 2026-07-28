@@ -34,25 +34,73 @@ OUTPUT_PDF = PROJECT_DIR / "latest_ai_news_report.pdf"
 
 
 class _PDF(FPDF):
-    """Minimal PDF with header / footer."""
+    """Minimal PDF with header / footer and Unicode support."""
+
+    def __init__(self):
+        super().__init__()
+        # Register a Unicode font (DejaVuSans) for proper character support
+        self._unicode_font = self._try_add_unicode_font()
+
+    @staticmethod
+    def _try_add_unicode_font() -> str:
+        """Try to find and register DejaVuSans.ttf. Returns font name or empty."""
+        candidates = [
+            Path(r"C:\Windows\Fonts\DejaVuSans.ttf"),
+            Path(r"C:\Windows\Fonts\DejaVuSans-Bold.ttf"),
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+            Path("/usr/share/fonts/dejavu/DejaVuSans.ttf"),
+            Path("/System/Library/Fonts/DejaVuSans.ttf"),
+        ]
+        for p in candidates:
+            if p.exists():
+                return "DejaVuSans"
+            bold = p.parent / "DejaVuSans-Bold.ttf"
+            if bold.exists():
+                return "DejaVuSans"
+        return ""
+
+    def _use_font(self, style: str = "", size: int = 10):
+        """Set font: use DejaVu if available, fall back to Helvetica."""
+        if self._unicode_font:
+            self.set_font(self._unicode_font, style, size)
+        else:
+            self.set_font("Helvetica", style, size)
 
     def header(self):
-        self.set_font("Helvetica", "B", 10)
+        self._use_font("B", 10)
         self.set_text_color(100, 100, 100)
         self.cell(0, 8, "AI News Report", align="L")
         self.ln(12)
 
     def footer(self):
         self.set_y(-15)
-        self.set_font("Helvetica", "I", 8)
+        self._use_font("I", 8)
         self.set_text_color(140, 140, 140)
         self.cell(0, 10, f"Page {self.page_no()}/{{nb}}", align="C")
+
+
+def _sanitize_text(text: str) -> str:
+    """Replace Unicode characters not in latin-1 with safe ASCII equivalents."""
+    replacements = {
+        "\u2014": "---",  # em dash
+        "\u2013": "--",   # en dash
+        "\u2018": "'",    # left single quote
+        "\u2019": "'",    # right single quote
+        "\u201c": '"',    # left double quote
+        "\u201d": '"',    # right double quote
+        "\u2026": "...",  # ellipsis
+        "\u00a0": " ",    # non-breaking space
+        "\u2022": "*",    # bullet
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
 
 
 def _fetch_news_text() -> str:
     """Return the AI news text, either from the local file or a fallback."""
     if NEWS_SOURCE.exists():
-        return NEWS_SOURCE.read_text(encoding="utf-8", errors="replace")
+        return _sanitize_text(NEWS_SOURCE.read_text(encoding="utf-8", errors="replace"))
     return (
         "No local AI news file found.\n\n"
         f"Expected at: {NEWS_SOURCE}\n\n"
