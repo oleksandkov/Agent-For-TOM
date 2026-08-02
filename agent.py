@@ -673,12 +673,16 @@ def handle_fetch_url_with_browser(params: dict) -> str:
 
 
 def handle_search_web(params: dict) -> str:
-    """Search the internet using DuckDuckGo (free, no API key needed)."""
+    """Search the internet using DDGS / Playwright by default, with fallbacks."""
     query = params["query"]
     max_results = int(params.get("max_results", 5))
 
+    # ── Primary: DDGS ──
     try:
-        from ddgs import DDGS
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
 
         results = []
         with DDGS() as ddgs:
@@ -688,15 +692,77 @@ def handle_search_web(params: dict) -> str:
                 href = r.get("href", "?")
                 results.append(f"{i+1}. {title}\n   {body}\n   URL: {href}")
 
-        if not results:
-            return f"No results found for '{query}'"
+        if results:
+            return f"Search results for '{query}':\n\n" + "\n\n".join(results)
 
-        return f"Search results for '{query}':\n\n" + "\n\n".join(results)
+    except Exception:
+        pass
 
-    except ImportError:
-        return "Error: duckduckgo_search not installed. Run: pip install duckduckgo_search"
+    # ── Secondary: Playwright Bing / Google Chrome ──
+    try:
+        from playwright.async_api import async_playwright
+        import urllib.parse
+        import asyncio
+
+        encoded_query = urllib.parse.quote_plus(query)
+        search_url = f"https://www.bing.com/search?q={encoded_query}"
+
+        async def _playwright_search():
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                )
+                await page.goto(search_url, timeout=15000, wait_until="domcontentloaded")
+                
+                results = []
+                elements = await page.query_selector_all("li.b_algo")
+                for el in elements:
+                    title_el = await el.query_selector("h2 a")
+                    snippet_el = await el.query_selector("p, div.b_caption")
+                    if title_el:
+                        title = (await title_el.inner_text()).strip()
+                        href = await title_el.get_attribute("href") or ""
+                        snippet = (await snippet_el.inner_text()).strip() if snippet_el else ""
+                        if title and href.startswith("http"):
+                            results.append(f"{len(results)+1}. {title}\n   {snippet}\n   URL: {href}")
+                            if len(results) >= max_results:
+                                break
+                await browser.close()
+                if results:
+                    return f"Search results for '{query}' (via Playwright / Chrome):\n\n" + "\n\n".join(results)
+                return None
+
+        pw_results = asyncio.run(_playwright_search())
+        if pw_results:
+            return pw_results
+    except Exception:
+        pass
+
+    # ── Tertiary fallback: DuckDuckGo HTML ──
+    try:
+        import urllib.request
+        import urllib.parse
+        import re
+
+        encoded = urllib.parse.quote_plus(query)
+        req = urllib.request.Request(
+            f"https://html.duckduckgo.com/html/?q={encoded}",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode('utf-8', errors='ignore')
+            results = []
+            matches = re.findall(r'<a class="result__a" href="([^"]+)">(.*?)</a>', html)
+            for i, (href, title_html) in enumerate(matches[:max_results]):
+                clean_title = re.sub(r'<[^>]+>', '', title_html).strip()
+                results.append(f"{i+1}. {clean_title}\n   URL: {href}")
+            if results:
+                return f"Search results for '{query}':\n\n" + "\n\n".join(results)
     except Exception as e:
         return f"Error searching the web: {e}"
+
+    return f"No results found for '{query}'"
 
 
 HANDLERS: dict[str, Callable[[dict], str]] = {
@@ -1052,19 +1118,19 @@ def agent_loop(system_prompt: str, messages: list) -> str:
                     return "I'm sorry, but there was an error communicating with the AI service."
                 if attempt < max_retries:
                     delay = 5 * (2 ** attempt)  # 5, 10, 20 seconds
-                    print(f"\n  {YELLOW}⚠{RESET} Transient error — retrying in {delay}s (attempt {attempt + 1}/{max_retries})...")
+                    print(f"\n  {YELLOW}⚠{RESET} Transient error ({e}) — retrying in {delay}s (attempt {attempt + 1}/{max_retries})...")
                     time.sleep(delay)
                 else:
-                    print(f"  {RED}✗{RESET} Still failing after {max_retries} retries.")
-                    return "I'm sorry, but the AI service is unavailable right now. Please try again in a few minutes."
+                    print(f"  {RED}✗{RESET} Still failing after {max_retries} retries ({e}).")
+                    return f"I'm sorry, but the AI service is unavailable right now: {e}"
             except Exception as e:
                 if attempt < max_retries and _is_retryable_error(e):
                     delay = 5 * (2 ** attempt)
-                    print(f"\n  {YELLOW}⚠{RESET} Retrying in {delay}s (attempt {attempt + 1}/{max_retries})...")
+                    print(f"\n  {YELLOW}⚠{RESET} Retrying in {delay}s ({e}) (attempt {attempt + 1}/{max_retries})...")
                     time.sleep(delay)
                 else:
                     print(f"\n  {RED}✗{RESET} Unexpected error: {e}")
-                    return "I'm sorry, but an unexpected error occurred."
+                    return f"I'm sorry, but an unexpected error occurred: {e}"
 
         if response is None:
             return "I'm sorry, but the AI service could not be reached."
@@ -2003,7 +2069,7 @@ def read_input_with_suggestions(prompt: str) -> str:
                     _hide()
                 continue
 
-            # ── Tab — auto-complete ───────────────────────────────────────
+            # ── Tab — auto-complete slash commands OR cycle risk mode ──────
             if ch == b'\t':
                 if _is_slash():
                     cf = _cmd_filter()
@@ -2024,18 +2090,8 @@ def read_input_with_suggestions(prompt: str) -> str:
                                 selected = None
                     _refresh()
                     _show()
-                continue
-
-            # ── Shift+Space — cycle mode: auto → default → yolo → auto
-            if ch == b'\x20':
-                shift_held = False
-                try:
-                    import ctypes
-                    shift_held = bool(ctypes.windll.user32.GetAsyncKeyState(0x10) & 0x8000)
-                except Exception:
-                    pass
-                if shift_held:
-                    # Cycle: auto → default → yolo → auto → ...
+                else:
+                    # Tab outside slash command → cycle mode: auto → default → yolo → auto
                     if YOLO_MODE:
                         _set_mode("auto")
                     elif AUTO_APPROVE_LOW:
@@ -2043,12 +2099,8 @@ def read_input_with_suggestions(prompt: str) -> str:
                     else:
                         _set_mode("yolo")
                     _refresh()
-                    if _is_slash():
-                        _show()
-                    else:
-                        _hide()
-                    continue  # Don't insert the space
-                # Normal space: fall through to printable ASCII handler
+                    _hide()
+                continue
 
             # ── Backspace ─────────────────────────────────────────────────
             if ch in (b'\x08', b'\x7f'):
@@ -2250,11 +2302,17 @@ def main() -> int:
             combined = TOOLS + mcp_tools
             if renames:
                 print(f'  {YELLOW}⚠{RESET}  Renamed {renames} MCP tool(s) to avoid built-in name conflicts')
-            if len(combined) > 128:
+            model_name = (_get_model() or "").lower()
+            # Free tier endpoints & OpenRouter models have strict payload limits (max ~32 tools)
+            is_free_tier = "free" in model_name or "openrouter" in os.environ.get("ANTHROPIC_BASE_URL", "").lower() or "127.0.0.1" in os.environ.get("ANTHROPIC_BASE_URL", "")
+            max_allowed = 32 if is_free_tier else 128
+
+            if len(combined) > max_allowed:
                 n_builtin = len(TOOLS)
-                keep = 128 - n_builtin
+                keep = max(0, max_allowed - n_builtin)
                 dropped = len(mcp_tools) - keep
-                print(f'  {YELLOW}⚠{RESET}  Truncated MCP tools: keeping {keep} of {len(mcp_tools)} ({dropped} dropped, API 128-tool limit)')
+                limit_reason = f"{_get_model()} payload limit" if is_free_tier else "API 128-tool limit"
+                print(f'  {YELLOW}⚠{RESET}  Truncated MCP tools: keeping {keep} of {len(mcp_tools)} ({dropped} dropped, {limit_reason})')
                 COMBINED_TOOLS = TOOLS + mcp_tools[:keep]
             else:
                 COMBINED_TOOLS = combined

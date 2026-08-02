@@ -44,14 +44,14 @@ Only `anthropic>=0.40.0`, `python-dotenv>=1.0.0`, `fpdf2>=2.7.0` (see `requireme
 
 ## Important quirks
 
-- **Windows-only REPL** — keyboard input uses `msvcrt` (arrow keys, F5-F8, Shift+Space for mode cycling, Tab completion for slash commands). No cross-platform fallback for the TUI.
+- **Windows-only REPL** — keyboard input uses `msvcrt` (arrow keys, F5-F8, Tab key for mode cycling, Tab completion for slash commands). No cross-platform fallback for the TUI.
 - **UTF-8 forced** on stdout in `agent_cli.py` — handles emoji/Unicode in skill names.
-- **Web search** uses `duckduckgo_search` (free, no API key). Falls back to error if not installed.
+- **Web search** uses Playwright (headless Google Chrome) by default. Falls back to `duckduckgo_search` if Playwright is unavailable.
 - **Zen proxy** (`zen_proxy.py`) auto-starts a local HTTP proxy when `ANTHROPIC_BASE_URL` points to `127.0.0.1:6446`. Converts Anthropic ↔ OpenAI format. Provides free models.
 - **Session system**: auto-saves to `~/.tomas/sessions/` on exit. Max 50 sessions (oldest auto-deleted). Uses custom `SessionJSONEncoder` for Anthropic SDK pydantic types.
-- **No test suite** — `packages/backend/tests/` has only `__pycache__`. No pytest config, no lint/typecheck setup.
+- **Test suite** — Comprehensive unit test suite in `tests/test_agent_units.py` and integration runner in `test_agent.py`. Run: `python -m unittest discover -s tests -p "test_*.py"`.
 - **Provider detection fallback**: `page_choose_model()` in `agent_cli.py` uses `_detect_provider()` (checks `ANTHROPIC_BASE_URL`) but falls back to `_detect_provider_from_config()` if it returns `"other"`. The config fallback reads the active provider's `type` from `providers.json` — this ensures Zen models appear even when `ANTHROPIC_BASE_URL` isn't set in `.env`.
-- **Arrow menu redraw**: `arrow_menu()` now does a full redraw of all items + footer on every UP/DOWN key press (moves cursor up by `n + (1 if footer else 0)` lines and redraws everything). This eliminates "duplicate picker" artifacts from the old partial-redraw math.
+- **Arrow menu redraw**: `arrow_menu()` now uses windowed viewport scrolling to eliminate duplicate picker artifacts when lists exceed terminal height.
 
 ## Slash commands (in-agent)
 

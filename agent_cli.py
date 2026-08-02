@@ -28,6 +28,7 @@ Note:
 import os
 import sys
 import subprocess
+import shutil
 from pathlib import Path
 
 # Session and instructions management
@@ -167,28 +168,53 @@ ERASE_DOWN = '\033[J'     # erase from cursor to end of screen
 
 
 def arrow_menu(title: str, items: list, header_lines: list = None,
-               footer: str = None) -> int:
+               footer: str = None, max_visible: int = 14) -> int:
     """
-    Show an arrow-key navigable menu.
+    Show an arrow-key navigable menu with windowed viewport scrolling.
     Returns the index of the selected item, or -1 if cancelled.
+    Eliminates duplicate menu text artifacts when lists exceed terminal height.
     """
     n = len(items)
     if n == 0:
         return -1
+
+    # Dynamically clamp max_visible to terminal height - header padding
+    try:
+        term_lines = shutil.get_terminal_size().lines
+        max_visible = max(5, min(max_visible, term_lines - 7))
+    except Exception:
+        pass
+
     selected = 0
+    scroll_top = 0
+
+    def get_visible_range(sel: int, top: int) -> tuple[int, int, int]:
+        """Compute (start_idx, end_idx, new_scroll_top) for current selection."""
+        if n <= max_visible:
+            return 0, n, 0
+        if sel < top:
+            top = sel
+        elif sel >= top + max_visible:
+            top = sel - max_visible + 1
+        return top, min(top + max_visible, n), top
 
     def draw_all():
-        """Draw (or redraw) the full items list + footer."""
-        for i in range(n):
+        """Draw (or redraw) the visible window of items + footer."""
+        nonlocal scroll_top
+        start_idx, end_idx, scroll_top = get_visible_range(selected, scroll_top)
+        for i in range(start_idx, end_idx):
             prefix = f'{GREEN}▶{RESET} ' if i == selected else '  '
             label = f'{BOLD}{items[i]}{RESET}' if i == selected else items[i]
             sys.stdout.write(f'{CLEAR_LINE}{prefix}{label}\n')
-        if footer:
-            sys.stdout.write(CLEAR_LINE + DIM + footer + RESET + '\n')
+
+        # Add scroll counter to footer if list is long
+        scroll_indicator = f'  [{selected + 1}/{n}]' if n > max_visible else ''
+        base_footer = footer if footer else '↑↓ navigate · Enter select · Esc cancel'
+        sys.stdout.write(CLEAR_LINE + DIM + base_footer + scroll_indicator + RESET + '\n')
         sys.stdout.flush()
 
     def draw_header():
-        """Print the title/header lines (used before each draw_all)."""
+        """Print the title/header lines (used before first draw)."""
         if header_lines:
             for line in header_lines:
                 print(line)
@@ -202,21 +228,20 @@ def arrow_menu(title: str, items: list, header_lines: list = None,
     draw_header()
     draw_all()
 
-    # Number of lines the items+footer occupy (used for smooth redraw)
-    block_lines = n + (1 if footer else 0)
-
     # ── Event loop ──
     while True:
         key = get_key()
         if key in ('UP', 'DOWN'):
+            old_start, old_end, _ = get_visible_range(selected, scroll_top)
+            visible_count = old_end - old_start
+            block_lines = visible_count + 1  # items + footer
+
             if key == 'UP':
                 selected = (selected - 1) % n
             else:
                 selected = (selected + 1) % n
-            # Smooth redraw: move cursor up to the first item line and
-            # re-render each line in place using CLEAR_LINE. This avoids
-            # the full-screen flash that clear_screen() (os.system('cls'))
-            # causes on every keypress.
+
+            # Move cursor up to top of visible block and re-render
             sys.stdout.write(CURSOR_UP_N.format(block_lines))
             draw_all()
 
@@ -1496,7 +1521,16 @@ def _zen_show_info():
 
 
 def _detect_provider() -> str:
-    """Detect the current AI provider from ANTHROPIC_BASE_URL."""
+    """Detect the current AI provider from active config or ANTHROPIC_BASE_URL."""
+    # First check active provider in providers.json
+    config = _load_providers_config()
+    active = config.get("active")
+    if active:
+        provider_info = config.get("providers", {}).get(active, {})
+        ptype = provider_info.get("type", "")
+        if ptype in PROVIDER_TYPE_TO_DETECT:
+            return PROVIDER_TYPE_TO_DETECT[ptype]
+
     base = os.environ.get("ANTHROPIC_BASE_URL", "").lower()
     if "openrouter" in base:
         return "openrouter"
@@ -1510,21 +1544,17 @@ def _detect_provider() -> str:
 
 
 # Map from providers.json 'type' field to _detect_provider() return values
-# Used as fallback when env-var detection fails
 PROVIDER_TYPE_TO_DETECT = {
     "openrouter": "openrouter",
     "zen": "zen",
     "anthropic": "anthropic",
     "openai": "openai",
+    "google": "google",
 }
 
 
 def _detect_provider_from_config() -> str:
-    """Fallback: detect provider from saved multi-provider config.
-
-    Used when _detect_provider() returns 'other' — checks the active
-    provider's 'type' field in providers.json.
-    """
+    """Fallback: detect provider from saved multi-provider config."""
     config = _load_providers_config()
     active = config.get("active")
     if active:
@@ -1539,6 +1569,7 @@ PROVIDER_LABELS = {
     "zen": "OpenCode Zen",
     "anthropic": "Anthropic Direct",
     "openai": "OpenAI",
+    "google": "Google AI",
     "other": "Generic",
 }
 

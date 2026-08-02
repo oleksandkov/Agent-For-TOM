@@ -190,9 +190,12 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 
 def _zen_headers(session_id: str, request_id: str) -> dict:
     """Build the required x-opencode-* headers for Zen API."""
+    token = os.environ.get("OPENCODE_API_KEY") or os.environ.get("ZEN_API_KEY") or "public"
+    if token.startswith("Bearer "):
+        token = token[7:]
     return {
         "Content-Type": "application/json",
-        "Authorization": "Bearer public",
+        "Authorization": f"Bearer {token}",
         "User-Agent": f"opencode/{OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/python/3.10",
         "x-opencode-client": "cli",
         "x-opencode-project": "global",
@@ -306,12 +309,16 @@ def anthropic_to_openai(ant_body: dict) -> dict:
     # Tools
     tools = []
     for t in ant_body.get("tools", []):
+        schema = t.get("input_schema") or {"type": "object", "properties": {}}
+        if not isinstance(schema, dict) or "type" not in schema:
+            schema = {"type": "object", "properties": {}}
+        desc = t.get("description") or f"Tool {t.get('name', 'mcp')}"
         tools.append({
             "type": "function",
             "function": {
                 "name": t["name"],
-                "description": t.get("description", ""),
-                "parameters": t.get("input_schema", {}),
+                "description": str(desc),
+                "parameters": schema,
             },
         })
 

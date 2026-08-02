@@ -49,7 +49,7 @@ TOMAS skill list    # List installed skills
 | `strict` | Asks before every tool + resets overrides | `F7` / `/mode strict` |
 | `yolo` | **Auto-approves ALL tools** — no prompts | `F8` / `/mode yolo` |
 
-Press **Shift+Space** to cycle through modes.
+Press **Tab** to cycle through modes (or `/mode [auto|default|yolo]`).
 
 ### ⌨️ Slash Commands
 

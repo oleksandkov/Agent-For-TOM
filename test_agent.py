@@ -18,6 +18,13 @@ PROJECT_DIR = Path(__file__).parent.resolve()
 os.chdir(PROJECT_DIR)
 sys.path.insert(0, str(PROJECT_DIR))
 
+# Force UTF-8 encoding on stdout for Windows compatibility
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # Load env
 try:
     from dotenv import load_dotenv

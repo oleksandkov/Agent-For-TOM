@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    TOMAS Agent Installer — install from GitHub or local source.
+    TOMAS Agent Installer вЂ” install from GitHub or local source.
 .DESCRIPTION
     Installs the TOMAS coding agent globally. Works both:
       - Locally:   powershell -ExecutionPolicy Bypass -File install.ps1
@@ -20,7 +20,7 @@ param(
     [switch]$NoPrompt
 )
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# в”Ђв”Ђ Config в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 if (-not $InstallDir) {
     $InstallDir = Join-Path $HOME ".tomas"
 }
@@ -60,7 +60,7 @@ $script:PipExe    = Join-Path (Join-Path $VenvDir "Scripts") "pip.exe"
 $LauncherCmd = Join-Path $BinDir "TOMAS.cmd"
 $LauncherBat = Join-Path $BinDir "TOMAS.bat"
 
-# ── Detect mode ─────────────────────────────────────────────────────────────
+# в”Ђв”Ђ Detect mode в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 $isPiped = $MyInvocation.MyCommand.Name -eq "__remote_exec__" -or
            $MyInvocation.MyCommand.Path -eq "" -or
            [Console]::IsInputRedirected
@@ -71,7 +71,7 @@ Write-Host "       TOMAS Agent Installer v2.0" -ForegroundColor Cyan
 Write-Host "  ==========================================" -ForegroundColor Cyan
 Write-Host ""
 
-# ── Prerequisites ───────────────────────────────────────────────────────────
+# в”Ђв”Ђ Prerequisites в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 $pythonPath = ""
 
 # Helper: test a Python executable and return its path if >= 3.10
@@ -85,37 +85,50 @@ function Test-PythonExe {
     return $null
 }
 
-# Strategy 1: Use the Python launcher (py) — always points to python.org Python on Windows
+# Strategy 1: Use the Python launcher (py) вЂ” always points to python.org Python on Windows
 try {
     $pyExe = (Get-Command "py" -ErrorAction SilentlyContinue).Source
     if ($pyExe) {
-        # Try specific versions in descending order (3.12, 3.11, 3.10)
-        foreach ($ver in @("3.12", "3.11", "3.10")) {
-            $result = & $pyExe "-$ver" -c "import sys; print(sys.executable)" 2>$null
+        # Try default py launcher first, then specific version flags in descending order
+        $pyVersions = @("", "-3.14", "-3.13", "-3.12", "-3.11", "-3.10")
+        foreach ($vFlag in $pyVersions) {
+            $cmd = if ($vFlag) { "$pyExe $vFlag" } else { $pyExe }
+            $result = & $pyExe $vFlag -c "import sys; print(sys.executable)" 2>$null
             if ($LASTEXITCODE -eq 0 -and $result) {
                 $candidate = $result.Trim()
-                $pythonPath = Test-PythonExe $candidate
-                if ($pythonPath) { break }
+                if ($candidate -notmatch 'msys64|ucrt64|mingw') {
+                    $pythonPath = Test-PythonExe $candidate
+                    if ($pythonPath) { break }
+                }
             }
         }
     }
 } catch {}
 
-# Strategy 2: Try python from PATH, preferring python.org over MSYS2
+# Strategy 2: Try python from PATH, preferring standard Python.org installations over MSYS2/venv
 if (-not $pythonPath) {
     $pythonCandidates = @()
     try {
-        $pythonCandidates = @(Get-Command "python" -ErrorAction SilentlyContinue -TotalCount 5 | Select-Object -ExpandProperty Source)
+        $pythonCandidates = @(Get-Command "python" -ErrorAction SilentlyContinue -TotalCount 10 | Select-Object -ExpandProperty Source)
     } catch {}
 
-    # First pass: prefer python.org paths (in AppData\Local\Programs\Python)
+    # First pass: prefer standard python.org paths (AppData\Local\Programs\Python or AppData\Local\Python)
     foreach ($p in $pythonCandidates) {
-        if ($p -match 'AppData\\Local\\Programs\\Python') {
+        if ($p -match 'AppData\\Local\\(Programs\\Python|Python)' -and $p -notmatch 'venv|\.venv') {
             $pythonPath = Test-PythonExe $p
             if ($pythonPath) { break }
         }
     }
-    # Second pass: accept any non-MSYS2 python
+    # Second pass: accept any non-MSYS2, non-venv python
+    if (-not $pythonPath) {
+        foreach ($p in $pythonCandidates) {
+            if ($p -notmatch 'msys64|ucrt64|mingw|venv|\.venv') {
+                $pythonPath = Test-PythonExe $p
+                if ($pythonPath) { break }
+            }
+        }
+    }
+    # Third pass: accept any non-MSYS2 python (even in a venv)
     if (-not $pythonPath) {
         foreach ($p in $pythonCandidates) {
             if ($p -notmatch 'msys64|ucrt64|mingw') {
@@ -124,7 +137,7 @@ if (-not $pythonPath) {
             }
         }
     }
-    # Third pass: accept any python (including MSYS2 as last resort)
+    # Fourth pass: accept any python (including MSYS2 as last resort)
     if (-not $pythonPath) {
         foreach ($p in $pythonCandidates) {
             $pythonPath = Test-PythonExe $p
@@ -140,7 +153,7 @@ if (-not $pythonPath) {
         $python3Candidates = @(Get-Command "python3" -ErrorAction SilentlyContinue -TotalCount 5 | Select-Object -ExpandProperty Source)
     } catch {}
     foreach ($p in $python3Candidates) {
-        if ($p -notmatch 'msys64|ucrt64|mingw|WindowsApps') {
+        if ($p -notmatch 'msys64|ucrt64|mingw|WindowsApps|venv|\.venv') {
             $pythonPath = Test-PythonExe $p
             if ($pythonPath) { break }
         }
@@ -159,9 +172,10 @@ if (-not $pythonPath) {
     Write-Host "         Make sure to check 'Add Python to PATH' during installation."
     exit 1
 }
-Write-Host "  [OK] Python $ver found at: $pythonPath" -ForegroundColor Green
+$pyDisplayVer = & $pythonPath -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" 2>$null
+Write-Host "  [OK] Python $pyDisplayVer found at: $pythonPath" -ForegroundColor Green
 
-# ── Create directory structure ─────────────────────────────────────────────
+# в”Ђв”Ђ Create directory structure в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 Write-Host ""
 Write-Host "  [2/9] Setting up directories..." -ForegroundColor Cyan
 $null = New-Item -ItemType Directory -Path $BinDir -Force
@@ -174,7 +188,7 @@ $null = New-Item -ItemType Directory -Path (Join-Path $InstallDir "instructions"
 $null = New-Item -ItemType Directory -Path (Join-Path (Join-Path $InstallDir "instructions") "project") -Force
 Write-Host "  [OK] Install directory: $InstallDir" -ForegroundColor Green
 
-# ── Get source code ────────────────────────────────────────────────────────
+# в”Ђв”Ђ Get source code в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 $localSource = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { $null }
 $hasLocalSource = $localSource -and (Test-Path (Join-Path $localSource "agent.py"))
 
@@ -231,7 +245,7 @@ else {
     }
 }
 
-# ── Create virtual environment ─────────────────────────────────────────────
+# в”Ђв”Ђ Create virtual environment в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 Write-Host ""
 Write-Host "  [4/9] Creating virtual environment..." -ForegroundColor Cyan
 
@@ -273,7 +287,7 @@ if (-not $script:PipExe) {
     Write-Host "  [WARN] Could not detect pip.exe in venv" -ForegroundColor Yellow
 }
 
-# ── Install dependencies ───────────────────────────────────────────────────
+# в”Ђв”Ђ Install dependencies в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 Write-Host ""
 Write-Host "  [5/9] Installing Python dependencies..." -ForegroundColor Cyan
 
@@ -314,6 +328,10 @@ if (Test-Path $reqFile) {
     & $script:PipExe install --quiet -r $reqFile
     if ($LASTEXITCODE -eq 0) {
         Write-Host "  [OK] Dependencies installed successfully" -ForegroundColor Green
+        try {
+            & $script:PythonExe -m playwright install chromium 2>&1 | Out-Null
+            Write-Host "  [OK] Playwright Chromium browser installed" -ForegroundColor Green
+        } catch {}
     } else {
         Write-Host "  [FAIL] Failed to install some dependencies" -ForegroundColor Red
         Write-Host "         Run manually: $script:PipExe install -r $reqFile" -ForegroundColor Yellow
@@ -328,14 +346,14 @@ if (Test-Path $reqFile) {
     Write-Host "  [WARN] No requirements.txt found" -ForegroundColor Yellow
 }
 
-# ── Create launcher scripts ────────────────────────────────────────────────
+# в”Ђв”Ђ Create launcher scripts в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 Write-Host ""
 Write-Host "  [6/9] Creating launcher scripts..." -ForegroundColor Cyan
 
-# TOMAS.ps1 — PowerShell launcher (used by the PATH entry)
+# TOMAS.ps1 вЂ” PowerShell launcher (used by the PATH entry)
 $ps1Content = @'
 #!/usr/bin/env pwsh
-# TOMAS.ps1 — TOMAS Agent Launcher (installed)
+# TOMAS.ps1 вЂ” TOMAS Agent Launcher (installed)
 $ErrorActionPreference = "Stop"
 $tomasDir = "{InstallDir}"
 $venvDir = Join-Path $tomasDir ".venv"
@@ -356,7 +374,7 @@ exit $LASTEXITCODE
 [System.IO.File]::WriteAllText($LauncherPs1, $ps1Content, [System.Text.Encoding]::UTF8)
 Write-Host "  [OK] $LauncherPs1" -ForegroundColor Green
 
-# TOMAS.cmd — CMD launcher (so `TOMAS` works from cmd.exe)
+# TOMAS.cmd вЂ” CMD launcher (so `TOMAS` works from cmd.exe)
 # Detect Scripts vs bin directory (Windows vs MSYS2/MinGW venvs)
 $venvBin = "Scripts"; if (Test-Path (Join-Path $VenvDir "bin")) { $venvBin = "bin" }
 $cmdContent = @'
@@ -368,12 +386,12 @@ set "TOMAS_DIR={InstallDir}"
 [System.IO.File]::WriteAllText($LauncherCmd, $cmdContent, [System.Text.Encoding]::UTF8)
 Write-Host "  [OK] $LauncherCmd" -ForegroundColor Green
 
-# TOMAS.bat — also create in bin (some environments prefer .bat)
+# TOMAS.bat вЂ” also create in bin (some environments prefer .bat)
 Copy-Item $LauncherCmd $LauncherBat -Force
 Write-Host "  [OK] $LauncherBat" -ForegroundColor Green
 
-# ── Create upgrade & uninstall commands ──────────────────────────────────
-# TOMAS-upgrade.cmd — re-run remote install
+# в”Ђв”Ђ Create upgrade & uninstall commands в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+# TOMAS-upgrade.cmd вЂ” re-run remote install
 $upgradeBat = Join-Path $BinDir "TOMAS-upgrade.cmd"
 $upgradeContent = @'
 @echo off
@@ -390,7 +408,7 @@ if %ERRORLEVEL% neq 0 (
     exit /b %ERRORLEVEL%
 )
 
-rem ── Refresh PATH so `tomas` works immediately in this session ──
+rem в”Ђв”Ђ Refresh PATH so `tomas` works immediately in this session в”Ђв”Ђ
 set "PATH=%USERPROFILE%\.tomas\bin;%PATH%"
 echo.
 echo   Upgrade complete! You can now run: TOMAS
@@ -398,7 +416,7 @@ echo   Upgrade complete! You can now run: TOMAS
 [System.IO.File]::WriteAllText($upgradeBat, $upgradeContent, [System.Text.Encoding]::UTF8)
 Write-Host "  [OK] $upgradeBat" -ForegroundColor Green
 
-# TOMAS-uninstall.cmd — call uninstall.ps1
+# TOMAS-uninstall.cmd вЂ” call uninstall.ps1
 $uninstallBat = Join-Path $BinDir "TOMAS-uninstall.cmd"
 $uninstallContent = @'
 @echo off
@@ -417,7 +435,7 @@ if %ERRORLEVEL% neq 0 (
 [System.IO.File]::WriteAllText($uninstallBat, $uninstallContent, [System.Text.Encoding]::UTF8)
 Write-Host "  [OK] $uninstallBat" -ForegroundColor Green
 
-# ── Create default instructions and sessions dir ──────────────────────────
+# в”Ђв”Ђ Create default instructions and sessions dir в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 Write-Host ""
 Write-Host "  [7/9] Setting up agent instructions..." -ForegroundColor Cyan
 
@@ -475,8 +493,8 @@ Project-level instructions are loaded on top of global instructions.
 
 ## Example files
 
-- `AGENT.md` — local agent identity (safe to edit or delete)
-- `project/` — per-project instruction files
+- `AGENT.md` вЂ” local agent identity (safe to edit or delete)
+- `project/` вЂ” per-project instruction files
 "@ | Out-File -FilePath $readmeFile -Encoding utf8
     Write-Host "  [OK] Created instructions README: $readmeFile" -ForegroundColor Green
 }
@@ -489,7 +507,7 @@ if (-not (Test-Path $gitkeep)) {
 
 Write-Host "  [OK] Sessions directory: $SessionsDir" -ForegroundColor Green
 
-# ── Set up .env ─────────────────────────────────────────────────────────────
+# в”Ђв”Ђ Set up .env в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 Write-Host ""
 Write-Host "  [8/9] Configuring environment..." -ForegroundColor Cyan
 
@@ -510,7 +528,7 @@ ANTHROPIC_API_KEY=
     Write-Host "  [OK] .env already exists (keeping existing)" -ForegroundColor Green
 }
 
-# ── Configure API key (if running interactively) ────────────────────────────
+# ─── Configure API key (if running interactively) ─────────────────────────────
 if (-not $NoPrompt -and $host.Name -ne 'Default Host' -and -not $isPiped) {
     $currentKey = (Select-String -Path $EnvFile -Pattern "^ANTHROPIC_API_KEY=(.*)$" | ForEach-Object { $_.Matches.Groups[1].Value }) -replace '"',''
     if (-not $currentKey) {
@@ -531,7 +549,7 @@ if (-not $NoPrompt -and $host.Name -ne 'Default Host' -and -not $isPiped) {
     }
 }
 
-# ── Add to PATH ─────────────────────────────────────────────────────────────
+# ─── Add to PATH ──────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "  [9/9] Finalizing setup..." -ForegroundColor Cyan
 Write-Host "       Adding to system PATH..." -ForegroundColor DarkGray
@@ -547,12 +565,11 @@ if ($paths -notcontains $BinDir) {
     Write-Host "  [OK] Already in PATH: $BinDir" -ForegroundColor Green
 }
 
-# Also update current session PATH
-if ($env:Path -notlike "*$BinDir*") {
-    $env:Path = $BinDir + ';' + $env:Path
-}
+# Always update current session PATH to put $BinDir at the very front and filter legacy paths
+$cleanSessionPaths = $env:Path -split ';' | Where-Object { $_ -and $_ -ne $BinDir -and $_ -notlike "*Agent_for_TOM*" }
+$env:Path = "$BinDir;" + ($cleanSessionPaths -join ';')
 
-# ── Create uninstaller ─────────────────────────────────────────────────────
+# ─── Create uninstaller ───────────────────────────────────────────────────────
 $uninstallScript = Join-Path $BinDir "uninstall.ps1"
 $uninstallContent = @'
 <#
@@ -568,57 +585,22 @@ $venvDir = Join-Path $tomasDir ".venv"
 
 # Remove from PATH
 $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
-$paths = $currentPath -split ';' | Where-Object { $_ -ne $binDir }
+$paths = $currentPath -split ';' | Where-Object { $_ -and $_ -ne $binDir }
 [Environment]::SetEnvironmentVariable("Path", ($paths -join ';'), "User")
 Write-Host "  [OK] Removed $binDir from PATH" -ForegroundColor Green
 
-# Kill any Python processes running from this venv (they lock .pyd files)
-if (Test-Path $venvDir) {
-    $venvPython = (Get-ChildItem -Path $venvDir -Recurse -Filter "python.exe" -Depth 2 -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
-    if ($venvPython) {
-        $lockedProcs = Get-Process | Where-Object { $_.Path -eq $venvPython } -ErrorAction SilentlyContinue
-        if ($lockedProcs) {
-            Write-Host "  [INFO] Stopping $($lockedProcs.Count) running Python process(es)..." -ForegroundColor Yellow
-            $lockedProcs | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 1
-        }
-    }
-}
+# Create a self-deleting background cleanup script in TEMP
+$cleanBat = Join-Path $env:TEMP "tomas-uninstall-clean.cmd"
+$cleanContent = "@echo off`r`nping 127.0.0.1 -n 3 >nul`r`n:retry`r`nrmdir /s /q `"{InstallDir}`" 2>nul`r`nif not exist `"{InstallDir}`" goto done`r`nping 127.0.0.1 -n 2 >nul`r`ngoto retry`r`n:done`r`ndel `"%~f0`" 2>nul".Replace('{InstallDir}', $tomasDir)
+[System.IO.File]::WriteAllText($cleanBat, $cleanContent)
 
-# Remove install directory (with retry for locked files)
-if (Test-Path $tomasDir) {
-    $maxRetries = 3
-    $deleted = $false
-    for ($i = 0; $i -lt $maxRetries; $i++) {
-        try {
-            Remove-Item -Path $tomasDir -Recurse -Force -ErrorAction Stop
-            $deleted = $true
-            break
-        } catch {
-            if ($i -lt ($maxRetries - 1)) {
-                Write-Host "  [WARN] Retry $($i+1): some files still locked, waiting..." -ForegroundColor Yellow
-                Start-Sleep -Seconds 2
-                # Force-kill any remaining Python processes
-                Get-Process -Name "python*" -ErrorAction SilentlyContinue | Where-Object {
-                    $_.Path -like "$venvDir\*" -or $_.CommandLine -like "*$venvDir*"
-                } -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 1
-            } else {
-                Write-Host "  [WARN] Could not delete all files. Trying cmd /c rmdir..." -ForegroundColor Yellow
-                & cmd /c "rmdir /s /q `"$tomasDir`" 2>nul"
-                if (Test-Path $tomasDir) {
-                    Write-Host "  [FAIL] Some files could not be removed." -ForegroundColor Red
-                    Write-Host "         Delete manually: $tomasDir" -ForegroundColor Yellow
-                } else {
-                    $deleted = $true
-                }
-            }
-        }
-    }
-    if ($deleted) {
-        Write-Host "  [OK] Deleted $tomasDir" -ForegroundColor Green
-    }
+# Launch background process decoupled from job object
+try {
+    [void](Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine = "cmd.exe /c `"$cleanBat`""})
+} catch {
+    Start-Process -FilePath "$cleanBat" -WindowStyle Hidden
 }
+Write-Host "  [OK] Deleted $tomasDir" -ForegroundColor Green
 
 Write-Host ""
 Write-Host "  TOMAS has been uninstalled." -ForegroundColor Green
@@ -628,7 +610,7 @@ Write-Host "  Close and reopen your terminal for PATH changes to take effect."
 [System.IO.File]::WriteAllText($uninstallScript, $uninstallContent, [System.Text.Encoding]::UTF8)
 Write-Host "  [OK] Created uninstaller: $uninstallScript" -ForegroundColor Green
 
-# ── Run setup to install default MCPs ──
+# в”Ђв”Ђ Run setup to install default MCPs в”Ђв”Ђ
 Write-Host ""
 Write-Host "  [10/10] Running TOMAS setup (default MCPs)..." -ForegroundColor Cyan
 try {
@@ -639,7 +621,7 @@ try {
     Write-Host "         Run 'TOMAS setup' later to configure default MCPs." -ForegroundColor Yellow
 }
 
-# ── Done ────────────────────────────────────────────────────────────────────
+# в”Ђв”Ђ Done в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 Write-Host ""
 Write-Host "  ==========================================" -ForegroundColor Cyan
 Write-Host "         Installation Complete!" -ForegroundColor Cyan
@@ -658,15 +640,15 @@ Write-Host "    TOMAS-upgrade      Update TOMAS from GitHub" -ForegroundColor Cy
 Write-Host "    TOMAS-uninstall    Remove TOMAS completely" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  New features:" -ForegroundColor Yellow
-Write-Host "    💾 Sessions         Auto-saved on exit. Browse/continue from menu." -ForegroundColor Cyan
-Write-Host "    📋 Instructions     Edit ~/.tomas/instructions/ for global agent rules." -ForegroundColor Cyan
-Write-Host "    📄 Project config   Put AGENT.md in your project root for per-project rules." -ForegroundColor Cyan
+Write-Host "    [Sessions]      Auto-saved on exit. Browse/continue from menu." -ForegroundColor Cyan
+Write-Host "    [Instructions]  Edit ~/.tomas/instructions/ for global agent rules." -ForegroundColor Cyan
+Write-Host "    [Project config] Put AGENT.md in your project root for per-project rules." -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  To use TOMAS in this terminal, run:" -ForegroundColor White
 Write-Host "    `$env:Path = '$BinDir;' + `$env:Path; tomas" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  Or if you ran from cmd.exe with install.cmd" -ForegroundColor White
-Write-Host "  the PATH is already updated — just type: TOMAS" -ForegroundColor DarkGray
+Write-Host "  the PATH is already updated -- just type: TOMAS" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  (New terminals will find TOMAS automatically.)" -ForegroundColor DarkGray
 Write-Host ""
