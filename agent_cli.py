@@ -31,15 +31,26 @@ import subprocess
 import shutil
 from pathlib import Path
 
+# ── Windows console setup (must run before anything can print) ──
+# On a non-UTF-8 console codepage (cp1251/cp1252/cp437) the TUI's box-drawing
+# and symbol glyphs raise UnicodeEncodeError. errors="replace" guarantees a
+# glyph degrades to '?' instead of taking down the process.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    try:
+        os.system("")  # enables ANSI escape processing in legacy consoles
+    except Exception:
+        pass
+
 # Session and instructions management
 from session_manager import (
     list_sessions, load_session, continue_session,
     delete_session, get_session_count, clear_all_sessions,
 )
-
-# ── Force UTF-8 for stdout (handles Unicode in skills descriptions) ──
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8')
 
 # ── Windows msvcrt for keyboard input ──
 import msvcrt

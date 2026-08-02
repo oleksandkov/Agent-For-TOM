@@ -33,6 +33,22 @@ import urllib.error
 from pathlib import Path
 from typing import Callable, Optional
 
+# ── Windows console setup ──
+# The UI prints box-drawing and symbol glyphs (▌ ✧ ⚙ ⚡ ↳). On a console whose
+# codepage is not UTF-8 (cp1251, cp1252, cp437 — common on non-English Windows)
+# print() raises UnicodeEncodeError and kills the agent. Force UTF-8 with a
+# replacement fallback, and enable VT100 so ANSI colours work on legacy conhost.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    try:
+        os.system("")  # enables ANSI escape processing in legacy consoles
+    except Exception:
+        pass
+
 # Try to import Playwright
 try:
     from playwright.async_api import async_playwright
@@ -1097,7 +1113,13 @@ def agent_loop(system_prompt: str, messages: list) -> str:
                         # Streaming not supported by this provider — disable for rest of session
                         _streaming_disabled = True
                     except anthropic.InternalServerError:
-                        raise  # let the retry logic handle it
+                        # A provider whose streaming endpoint 5xxs still works
+                        # fine non-streamed. Disable streaming and fall through
+                        # to the blocking call below instead of re-raising into
+                        # the retry loop, which would retry the *streaming*
+                        # call three times and then give up entirely.
+                        print(f'\n  {YELLOW}⚠{RESET} {DIM}streaming unavailable on this provider — continuing without it{RESET}')
+                        _streaming_disabled = True
 
                 response = _get_client().messages.create(
                     model=_get_model(),
@@ -1146,8 +1168,12 @@ def agent_loop(system_prompt: str, messages: list) -> str:
 
         if response.stop_reason != "tool_use":
             text = "".join(b.text for b in response.content if hasattr(b, "text"))
-            # Print the response with label (non-streaming path)
+            # Record what we said. Without this the model has no memory of its
+            # own replies — every turn would see a transcript of user messages
+            # only, and saved sessions would contain no assistant turns.
             if text:
+                messages.append({"role": "assistant", "content": text})
+                # Print the response with label (non-streaming path)
                 print(f'  {MAGENTA}{BOLD}▌ TOMAS{RESET}')
                 print(f'  {text}')
             return text
@@ -1159,7 +1185,20 @@ def agent_loop(system_prompt: str, messages: list) -> str:
         tool_call_count += tool_calls_this_round
         if tool_call_count > MAX_TOOL_CALLS_PER_TURN:
             print(f'    {RED}⚠{RESET}  Tool-call limit reached ({MAX_TOOL_CALLS_PER_TURN}). Stopping to prevent infinite loop.')
+            # The model asked for tools we are refusing to run. Record the
+            # request and answer every tool_use with a result, or the next
+            # request is malformed (dangling tool_calls) and will be rejected.
+            messages.append({"role": "assistant", "content": response.content})
+            # tool_result blocks first, then the instruction — one user message,
+            # so the transcript keeps alternating cleanly.
             messages.append({"role": "user", "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": b.id,
+                    "content": f"Not executed: tool-call limit ({MAX_TOOL_CALLS_PER_TURN}) reached for this turn.",
+                }
+                for b in response.content if b.type == "tool_use"
+            ] + [
                 {"type": "text", "text": f"Tool call limit ({MAX_TOOL_CALLS_PER_TURN}) reached. Please summarize what you've found so far and provide a response to the user."}
             ]})
             # One more call to get the final summary
@@ -1171,7 +1210,10 @@ def agent_loop(system_prompt: str, messages: list) -> str:
                     tools=combined_tools,
                     messages=messages,
                 )
-                return "".join(b.text for b in final_resp.content if hasattr(b, "text"))
+                final_text = "".join(b.text for b in final_resp.content if hasattr(b, "text"))
+                if final_text:
+                    messages.append({"role": "assistant", "content": final_text})
+                return final_text
             except Exception:
                 return "I've reached the tool-call limit. Here's what I found so far — please ask me to continue if you need more."
 
@@ -1216,6 +1258,12 @@ def agent_loop(system_prompt: str, messages: list) -> str:
                     "tool_use_id": block.id,
                     "content": result,
                 })
+        # The assistant's tool_use blocks MUST be in the transcript before the
+        # tool results. OpenAI-format upstreams (everything behind zen_proxy)
+        # translate tool_result into a `role: "tool"` message, which is only
+        # valid as a response to a preceding message carrying `tool_calls`.
+        # Without this append the upstream rejects the request outright.
+        messages.append({"role": "assistant", "content": response.content})
         messages.append({"role": "user", "content": tool_results})
 
 
@@ -1289,6 +1337,12 @@ def _agent_loop_streamed(
     # If the model requested tools, return sentinel so caller falls back
     if has_tool_use or stop_reason == "tool_use":
         return "__TOOLS__"
+
+    # Record the reply here too — the caller returns this text directly, so
+    # without this append the streaming path silently reintroduces the
+    # no-conversation-memory bug that the non-streaming path just fixed.
+    if full_text:
+        messages.append({"role": "assistant", "content": full_text})
 
     return full_text
 
@@ -2389,19 +2443,11 @@ def main() -> int:
             # Re-check compaction with the actual system prompt size
             messages = maybe_compact(messages, system_prompt)
             result = agent_loop(system_prompt, messages)
-            # Streaming already printed the response with the ▌ TOMAS label.
-            # For non-streaming fallback, result is the text — print it.
-            if result and not result.startswith("I'm sorry"):
-                # Check if streaming already output the text (it prints inline)
-                # We detect this by checking if the result was already shown.
-                # The streaming path prints text as it arrives and returns it.
-                # To avoid double-printing, we only print if the result
-                # wasn't streamed. We use a simple heuristic: streaming
-                # sets a flag. For safety, if result contains text not
-                # already shown, print it.
-                pass  # streaming handles output; non-streaming also handles it
-            elif result:
-                # Error messages from the agent loop
+            # agent_loop owns both printing and transcript recording: the
+            # streaming path prints tokens as they arrive, the non-streaming
+            # path prints on return. Only error strings (which are returned
+            # without being printed or recorded) need handling here.
+            if result and result.startswith("I'm sorry"):
                 print(f'  {MAGENTA}{BOLD}▌ TOMAS{RESET}')
                 print(f'  {result}')
             # ── Token usage info ──

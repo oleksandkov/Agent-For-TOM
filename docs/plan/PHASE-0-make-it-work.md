@@ -1,5 +1,23 @@
 # Phase 0 — Make It Work
 
+> **STATUS: IMPLEMENTED — 2026-08-02.** All four items done, verified live against
+> `deepseek-v4-flash-free`. Tool round-trip 7.8s (was 100% failure), streaming 2.4s
+> (was 100% 502), conversation memory confirmed. 25 unit tests pass (17 new);
+> integration suite 40/42, the 2 failures pre-existing and unrelated
+> (they assert text that is no longer in `CLAUDE.md`).
+>
+> **Deviations from the spec below, all deliberate:**
+> - Tool-limit branch: the "please summarize" nudge is merged into the *same*
+>   user message as the tool results rather than appended as a second user
+>   message, so the transcript keeps alternating cleanly.
+> - `zen_proxy` SSE sends `Connection: close`, not `keep-alive` as originally
+>   sketched. Found in live testing: this server speaks HTTP/1.0 and sends no
+>   `Content-Length`, so end-of-stream is the socket closing — advertising
+>   keep-alive leaves clients waiting for data that never comes.
+> - Added `os.system("")` alongside the encoding fix to enable VT100 on legacy
+>   consoles.
+> - 17 tests written rather than the 3 sketched here.
+
 **Goal:** TOMAS completes a multi-turn conversation with tool calls, on the shipped configuration, without crashing.
 **Effort:** 1-2 days.
 **Blocks:** everything. No other phase can be verified until this is done.

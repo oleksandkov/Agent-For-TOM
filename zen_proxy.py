@@ -398,6 +398,82 @@ class ZenProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
+    def _send_sse_event(self, event: str, data: dict) -> None:
+        """Write one Server-Sent Event frame."""
+        self.wfile.write(f"event: {event}\n".encode())
+        self.wfile.write(f"data: {json.dumps(data)}\n\n".encode())
+        self.wfile.flush()
+
+    def _send_anthropic_sse(self, ant_resp: dict) -> None:
+        """Replay a completed Anthropic response as an SSE stream.
+
+        The upstream call has already finished, so this is not true token
+        streaming — but it emits exactly the frame sequence the Anthropic SDK's
+        .stream() expects, so streaming clients work instead of failing with a
+        502. True incremental streaming belongs in the provider adapter.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        # Deliberately NOT keep-alive: this server speaks HTTP/1.0 and sends no
+        # Content-Length, so end-of-stream is signalled by closing the socket.
+        # Advertising keep-alive would leave clients waiting for more data.
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        blocks = ant_resp.get("content", []) or []
+        usage = ant_resp.get("usage", {}) or {}
+
+        # message_start carries the message shell with an empty content list.
+        self._send_sse_event("message_start", {
+            "type": "message_start",
+            "message": {**{k: v for k, v in ant_resp.items() if k != "content"},
+                        "content": []},
+        })
+
+        for i, block in enumerate(blocks):
+            btype = block.get("type")
+            if btype == "text":
+                start_block = {"type": "text", "text": ""}
+            else:
+                # tool_use: input is streamed separately as input_json_delta
+                start_block = {**block, "input": {}}
+            self._send_sse_event("content_block_start", {
+                "type": "content_block_start",
+                "index": i,
+                "content_block": start_block,
+            })
+
+            if btype == "text":
+                self._send_sse_event("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": i,
+                    "delta": {"type": "text_delta", "text": block.get("text", "")},
+                })
+            elif btype == "tool_use":
+                self._send_sse_event("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": i,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(block.get("input", {})),
+                    },
+                })
+
+            self._send_sse_event("content_block_stop", {
+                "type": "content_block_stop", "index": i,
+            })
+
+        self._send_sse_event("message_delta", {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": ant_resp.get("stop_reason"),
+                "stop_sequence": ant_resp.get("stop_sequence"),
+            },
+            "usage": {"output_tokens": usage.get("output_tokens", 0)},
+        })
+        self._send_sse_event("message_stop", {"type": "message_stop"})
+
     def _ensure_session(self):
         now = time.time()
         if now - self.__class__._session_ts > 1800:  # 30 min
@@ -459,7 +535,12 @@ class ZenProxyHandler(BaseHTTPRequestHandler):
         # Convert Anthropic → OpenAI
         oai_body = anthropic_to_openai(ant_body)
         oai_body["model"] = model
-        oai_body["stream"] = stream
+        # Always fetch a COMPLETE response upstream. _upstream_request reads the
+        # whole body and json.loads() it below; an SSE body is not valid JSON,
+        # so forwarding stream=true made every streamed request fail with
+        # "Invalid upstream response". If the client wants streaming we
+        # synthesise the SSE frames from the finished response instead.
+        oai_body["stream"] = False
         input_tokens = len(json.dumps(oai_body["messages"])) // 4
 
         # Forward to Zen API (with retry on transient errors)
@@ -518,7 +599,10 @@ class ZenProxyHandler(BaseHTTPRequestHandler):
 
         # Convert OpenAI → Anthropic
         ant_resp = openai_to_anthropic(zen_json, model, input_tokens)
-        self._send_json(200, ant_resp)
+        if stream:
+            self._send_anthropic_sse(ant_resp)
+        else:
+            self._send_json(200, ant_resp)
 
     def _handle_openai(self, raw_body: bytes):
         """Handle OpenAI-format POST /v1/chat/completions (passthrough)."""
