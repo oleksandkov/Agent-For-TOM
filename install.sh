@@ -94,15 +94,17 @@ if [ "$HAS_LOCAL_SOURCE" = true ]; then
           --exclude='.agent' --exclude='*.pyc' \
           "$SCRIPT_DIR/" "$SRC_DIR/" 2>/dev/null || \
     cp -r "$SCRIPT_DIR/" "$SRC_DIR/" 2>/dev/null || {
-        # Fallback: manually copy files
+        # Fallback: manually copy. -r matters — core/, adapters/ and learning/
+        # are packages the agent imports at startup, and a plain cp skips them
+        # silently, leaving an install that dies with ModuleNotFoundError.
         for f in "$SCRIPT_DIR"/*; do
             case "$(basename "$f")" in
                 .venv|__pycache__|.git|.agent) ;;
-                *) cp "$f" "$SRC_DIR/" 2>/dev/null || true ;;
+                *) cp -r "$f" "$SRC_DIR/" 2>/dev/null || true ;;
             esac
         done
     }
-    ok "Copied $(find "$SRC_DIR" -maxdepth 1 -type f | wc -l) files"
+    ok "Copied $(find "$SRC_DIR" -maxdepth 1 -type f | wc -l) files, $(find "$SRC_DIR" -maxdepth 1 -mindepth 1 -type d | wc -l) directories"
 else
     header "Downloading from GitHub..."
     echo -e "  ${DIM}URL: $REPO_URL${RESET}"
@@ -164,6 +166,30 @@ if [ -f "$REQ_FILE" ]; then
     "$PIP" install --quiet -r "$REQ_FILE" && ok "Dependencies installed" || warn "Some dependencies may have failed"
 else
     warn "No requirements.txt found"
+fi
+
+# ── Verify the install can actually start ──
+# An installer that reports success and then dies on first run with
+# ModuleNotFoundError has not installed anything. Fail here, where the error
+# can still be explained.
+header "Verifying installation..."
+MISSING=""
+for pkg in core adapters learning; do
+    [ -d "$SRC_DIR/$pkg" ] || MISSING="$MISSING $pkg"
+done
+if [ -n "$MISSING" ]; then
+    echo -e "  ${RED}[FAIL]${RESET} Missing package directories:$MISSING"
+    echo -e "  ${DIM}The source copy is incomplete — TOMAS cannot start.${RESET}"
+    echo -e "  ${DIM}If you installed from GitHub, these may be untracked in the repo.${RESET}"
+    exit 1
+fi
+if IMPORT_OUT=$("$PYTHON" -c "import sys; sys.path.insert(0, '$SRC_DIR'); import agent; print('ok')" 2>&1) \
+   && [ "${IMPORT_OUT##*$'\n'}" = "ok" ]; then
+    ok "TOMAS imports cleanly"
+else
+    echo -e "  ${RED}[FAIL]${RESET} TOMAS cannot be imported after install:"
+    echo "$IMPORT_OUT" | tail -6 | sed 's/^/         /'
+    exit 1
 fi
 
 # ── Create launcher script ──

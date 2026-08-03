@@ -37,8 +37,43 @@ from core.events import (
     TurnFinished,
 )
 from core.permissions import Decision
+from text_display import (
+    display_width, shorten, strip_ansi, term_width, wrap,
+)
 
 from .ansi import BOLD, DIM, GREEN, MAGENTA, RED, RESET, YELLOW
+
+# The argument worth showing for each built-in tool. A raw JSON dump is both
+# unreadable and — before this phase — escaped: Cyrillic arguments rendered as
+# `пр...`, and the 120-char cut landed mid-escape.
+_HEADLINE_ARG = {
+    "read_file": "file_path",
+    "write_file": "file_path",
+    "edit_file": "file_path",
+    "list_files": "path",
+    "run_command": "command",
+    "search_code": "pattern",
+    "save_memory": "key",
+    "fetch_url": "url",
+    "fetch_url_with_browser": "url",
+    "search_web": "query",
+    "read_mcp_resource": "uri",
+}
+
+
+def summarise_args(name: str, args: dict) -> str:
+    """One readable line for a tool call, in the caller's own script."""
+    if not args:
+        return ""
+    key = _HEADLINE_ARG.get(name)
+    if key and key in args:
+        head = str(args[key])
+        extra = len(args) - 1
+        suffix = f" (+{extra})" if extra > 0 else ""
+        return shorten(head.replace("\n", " "), max(20, term_width() - 40)) + suffix
+    # Unknown tool (usually MCP): show the arguments, unescaped.
+    rendered = json.dumps(args, default=str, ensure_ascii=False)
+    return shorten(rendered, max(20, term_width() - 40))
 
 
 class TerminalAdapter:
@@ -47,6 +82,7 @@ class TerminalAdapter:
     def __init__(self, interactive: bool = True):
         self.interactive = interactive
         self._streaming_header_shown = False
+        self._non_interactive_notice_shown = False
 
     # ── Driving ────────────────────────────────────────────────────
 
@@ -85,25 +121,36 @@ class TerminalAdapter:
         elif isinstance(event, AssistantMessage):
             self._end_stream_line()
             print(f'  {MAGENTA}{BOLD}▌ TOMAS{RESET}')
-            print(f'  {event.text}')
+            print(wrap(event.text))
 
         elif isinstance(event, TurnFinished):
             self._end_stream_line()
 
         elif isinstance(event, ToolStarted):
             self._end_stream_line()
-            args_str = json.dumps(event.args, default=str)[:120]
             origin = f'{DIM}[{event.origin}]{RESET}' if event.origin else ''
-            print(f'    {YELLOW}⚡{RESET} {BOLD}{event.name}{RESET} '
-                  f'{origin}({DIM}{args_str}...{RESET})')
+            summary = summarise_args(event.name, event.args)
+            width = term_width()
+            # Right-align the origin when there is room, so the eye can scan
+            # the tool column without the provenance getting in the way.
+            head = f'    {YELLOW}⚡{RESET} {BOLD}{event.name}{RESET}'
+            body = f'  {DIM}{summary}{RESET}' if summary else ''
+            plain = display_width(f'    ⚡ {event.name}' + (f'  {summary}' if summary else ''))
+            gap = width - plain - display_width(strip_ansi(origin))
+            if origin and gap >= 2:
+                print(f'{head}{body}{" " * gap}{origin}')
+            else:
+                print(f'{head}{body} {origin}'.rstrip())
 
         elif isinstance(event, ToolFinished):
             result = event.result
             if isinstance(result, str) and result.strip():
                 lines = result.strip().splitlines()
-                shown = lines[0][:160] if lines else ""
-                if len(lines) > 1 or len(result) > 160:
-                    shown += f' {DIM}…{RESET}'
+                first = lines[0] if lines else ""
+                room = term_width() - 8
+                shown = shorten(first, room)
+                if len(lines) > 1 and not shown.endswith("…"):
+                    shown += ' …'
                 mark = f'{GREEN}↳{RESET}' if event.ok else f'{RED}↳{RESET}'
                 print(f'    {mark} {DIM}{shown}{RESET}')
 
@@ -142,15 +189,21 @@ class TerminalAdapter:
     # ── Answering the core's questions ─────────────────────────────
 
     def ask(self, event) -> Decision:
+        if not self.interactive:
+            # Say it once, not once per call. Six silent denials in a row is
+            # what made a turn look broken rather than unattended.
+            if not self._non_interactive_notice_shown:
+                self._non_interactive_notice_shown = True
+                print(f'  {DIM}non-interactive — medium/high-risk tools are '
+                      f'unavailable this run{RESET}')
+            return "deny"
+
         risk_colors = {"low": GREEN, "medium": YELLOW, "high": RED}
         risk_color = risk_colors.get(event.risk, RED)
         print(f'\n  {risk_color}{BOLD}⚠ Permission ({event.risk.upper()} risk){RESET}')
         print(f'  {DIM}Tool:{RESET} {BOLD}{event.name}{RESET}')
         for k, v in (event.args or {}).items():
-            display = str(v)[:200]
-            if len(str(v)) > 200:
-                display += "..."
-            print(f'  {DIM}{k}:{RESET} {display}')
+            print(f'  {DIM}{k}:{RESET} {shorten(str(v), term_width() - 6)}')
         try:
             resp = input(
                 f'  {YELLOW}Allow?{RESET} [y/N/always for this exact call]: '

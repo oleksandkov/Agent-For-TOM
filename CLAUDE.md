@@ -15,6 +15,7 @@ TOMAS (Terminal Operated Modular Agent System) — a self-hosted AI coding agent
 - Run a single unit test: `python -m unittest tests.test_agent_units.<TestClass>.<test_method>`
 - Simulation harness (one entry point, replaced five root scripts):
   - `python -m tests.simulate checks [--offline]` — capability checks, writes `simulation_results.json`
+  - `python -m tests.simulate cyrillic` — Ukrainian/Russian support sweep
   - `python -m tests.simulate sessions [--turns N] [--session <name>]` — live goal-driven sessions
   - It resolves every entry point up front; a missing name is a hard FAIL (exit 2), never a WARN
 

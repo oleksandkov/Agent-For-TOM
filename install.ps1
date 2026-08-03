@@ -195,16 +195,33 @@ $hasLocalSource = $localSource -and (Test-Path (Join-Path $localSource "agent.py
 if ($hasLocalSource) {
     Write-Host ""
     Write-Host "  [3/9] Copying local source..." -ForegroundColor Cyan
-    # Copy all project files except excluded patterns
-    $exclude = @('.venv', '__pycache__', '.git', '.agent', '*.pyc', '.gitignore')
+    # Copy project files AND package directories. This used to be -File only,
+    # which silently left out core/, adapters/ and learning/ — the install
+    # completed "successfully" and then died on first run with
+    # ModuleNotFoundError: No module named 'learning'.
+    $exclude = @('.venv', '__pycache__', '.git', '.agent', '.claude', '.kilo',
+                 '.github', '.pytest_cache', '.mypy_cache', 'node_modules')
+    $excludeFilePatterns = @('*.pyc', '.gitignore')
+
     Get-ChildItem -Path $localSource -File | Where-Object {
-        $excludeFile = $false
-        foreach ($pat in $exclude) {
-            if ($_.Name -like $pat -or $_.FullName -like "*\$pat\*") { $excludeFile = $true; break }
+        $skip = $false
+        foreach ($pat in ($exclude + $excludeFilePatterns)) {
+            if ($_.Name -like $pat) { $skip = $true; break }
         }
-        -not $excludeFile
+        -not $skip
     } | Copy-Item -Destination $SrcDir -Force
-    Write-Host "  [OK] Copied $( (Get-ChildItem $SrcDir -File).Count ) files to $SrcDir" -ForegroundColor Green
+
+    $dirCount = 0
+    foreach ($dir in (Get-ChildItem -Path $localSource -Directory)) {
+        if ($exclude -contains $dir.Name) { continue }
+        $dest = Join-Path $SrcDir $dir.Name
+        if (Test-Path $dest) { Remove-Item -Path $dest -Recurse -Force }
+        Copy-Item -Path $dir.FullName -Destination $dest -Recurse -Force
+        Get-ChildItem -Path $dest -Recurse -Directory -Filter '__pycache__' `
+            -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        $dirCount++
+    }
+    Write-Host "  [OK] Copied $( (Get-ChildItem $SrcDir -File).Count ) files and $dirCount directories to $SrcDir" -ForegroundColor Green
 }
 else {
     Write-Host ""
@@ -345,6 +362,37 @@ if (Test-Path $reqFile) {
 } else {
     Write-Host "  [WARN] No requirements.txt found" -ForegroundColor Yellow
 }
+
+# в”Ђв”Ђ Verify the install can actually start в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+# An installer that reports success and then dies on first run with
+# ModuleNotFoundError has not installed anything. Import the entry point here,
+# where the failure can still be explained and acted on.
+Write-Host ""
+Write-Host "  [5b/9] Verifying installation..." -ForegroundColor Cyan
+$requiredPackages = @('core', 'adapters', 'learning')
+$missingPackages = @()
+foreach ($pkg in $requiredPackages) {
+    if (-not (Test-Path (Join-Path $SrcDir $pkg))) { $missingPackages += $pkg }
+}
+if ($missingPackages.Count -gt 0) {
+    Write-Host "  [FAIL] Missing package directories: $($missingPackages -join ', ')" -ForegroundColor Red
+    Write-Host "         The source copy is incomplete — TOMAS cannot start." -ForegroundColor Yellow
+    Write-Host "         If you installed from GitHub, these directories may be" -ForegroundColor Yellow
+    Write-Host "         missing from the repository (untracked). Commit them, or" -ForegroundColor Yellow
+    Write-Host "         re-run this installer from a complete local checkout." -ForegroundColor Yellow
+    exit 1
+}
+
+$importCheck = & $script:PythonExe -c "import sys; sys.path.insert(0, r'$SrcDir'); import agent; print('ok')" 2>&1
+if ($LASTEXITCODE -ne 0 -or "$importCheck" -notmatch 'ok') {
+    Write-Host "  [FAIL] TOMAS cannot be imported after install:" -ForegroundColor Red
+    foreach ($line in ("$importCheck" -split "`n" | Select-Object -Last 6)) {
+        if ($line.Trim()) { Write-Host "         $($line.Trim())" -ForegroundColor DarkGray }
+    }
+    Write-Host "         Fix the error above and re-run the installer." -ForegroundColor Yellow
+    exit 1
+}
+Write-Host "  [OK] TOMAS imports cleanly ($($requiredPackages.Count) packages present)" -ForegroundColor Green
 
 # в”Ђв”Ђ Create launcher scripts в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 Write-Host ""

@@ -41,26 +41,51 @@ class _PDF(FPDF):
         # Register a Unicode font (DejaVuSans) for proper character support
         self._unicode_font = self._try_add_unicode_font()
 
-    @staticmethod
-    def _try_add_unicode_font() -> str:
-        """Try to find and register DejaVuSans.ttf. Returns font name or empty."""
-        candidates = [
-            Path(r"C:\Windows\Fonts\DejaVuSans.ttf"),
-            Path(r"C:\Windows\Fonts\DejaVuSans-Bold.ttf"),
-            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-            Path("/usr/share/fonts/dejavu/DejaVuSans.ttf"),
-            Path("/System/Library/Fonts/DejaVuSans.ttf"),
-        ]
-        for p in candidates:
-            if p.exists():
-                return "DejaVuSans"
-            bold = p.parent / "DejaVuSans-Bold.ttf"
-            if bold.exists():
-                return "DejaVuSans"
+    # (regular, bold, italic) candidates, best first. DejaVu is the portable
+    # choice; Arial ships with Windows and covers Cyrillic; Calibri is a
+    # further fallback. The previous version looked only for DejaVu — absent
+    # on a stock Windows box — and, more importantly, never called add_font,
+    # so even a hit would have failed at set_font.
+    _FONT_FAMILIES = [
+        ("DejaVuSans", "DejaVuSans.ttf", "DejaVuSans-Bold.ttf", "DejaVuSans-Oblique.ttf"),
+        ("Arial", "arial.ttf", "arialbd.ttf", "ariali.ttf"),
+        ("Calibri", "calibri.ttf", "calibrib.ttf", "calibrii.ttf"),
+        ("Verdana", "verdana.ttf", "verdanab.ttf", "verdanai.ttf"),
+    ]
+
+    _FONT_DIRS = [
+        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts",
+        Path.home() / "AppData/Local/Microsoft/Windows/Fonts",
+        Path("/usr/share/fonts/truetype/dejavu"),
+        Path("/usr/share/fonts/dejavu"),
+        Path("/usr/share/fonts"),
+        Path("/Library/Fonts"),
+        Path("/System/Library/Fonts"),
+    ]
+
+    def _try_add_unicode_font(self) -> str:
+        """Register a Unicode TTF so Cyrillic renders. Returns the family
+        name, or "" to fall back to latin-1 core Helvetica."""
+        for family, regular, bold, italic in self._FONT_FAMILIES:
+            for d in self._FONT_DIRS:
+                reg = d / regular
+                if not reg.exists():
+                    continue
+                try:
+                    self.add_font(family, "", str(reg))
+                    for style, fname in (("B", bold), ("I", italic)):
+                        f = d / fname
+                        # Re-use the regular face when the styled file is
+                        # missing: a missing bold must not lose Cyrillic.
+                        self.add_font(family, style, str(f if f.exists() else reg))
+                    return family
+                except Exception:
+                    continue
         return ""
 
     def _use_font(self, style: str = "", size: int = 10):
-        """Set font: use DejaVu if available, fall back to Helvetica."""
+        """Set font: the registered Unicode family if we have one, else the
+        latin-1 core font."""
         if self._unicode_font:
             self.set_font(self._unicode_font, style, size)
         else:
@@ -95,6 +120,26 @@ def _sanitize_text(text: str) -> str:
     for old, new in replacements.items():
         text = text.replace(old, new)
     return text
+
+
+def _latin1_safe(text: str) -> str:
+    """Last resort when no Unicode font could be registered.
+
+    fpdf2's core fonts are latin-1 only and *raise* on anything outside it,
+    so a Cyrillic report used to fail outright. Transliterating is worse than
+    the real font and far better than an exception.
+    """
+    table = str.maketrans({
+        "а": "a", "б": "b", "в": "v", "г": "h", "ґ": "g", "д": "d", "е": "e",
+        "є": "ie", "ж": "zh", "з": "z", "и": "y", "і": "i", "ї": "i",
+        "й": "i", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p",
+        "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "kh",
+        "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch", "ь": "", "ю": "iu",
+        "я": "ia", "ы": "y", "э": "e", "ё": "e", "ъ": "",
+    })
+    out = text.lower().translate(table) if any(
+        "Ѐ" <= c <= "ӿ" for c in text) else text
+    return out.encode("latin-1", "replace").decode("latin-1")
 
 
 def _fetch_news_text() -> str:
@@ -134,14 +179,20 @@ def generate_ai_news_pdf(output_path: str | Path = OUTPUT_PDF) -> str:
     pdf.set_auto_page_break(auto=True, margin=20)
     pdf.add_page()
 
+    if not pdf._unicode_font:
+        # No Unicode TTF on this machine: degrade to transliteration rather
+        # than raising FPDFUnicodeEncodingException on the first Cyrillic
+        # character.
+        lines = [_latin1_safe(line) for line in lines]
+
     # ── Title ──
-    pdf.set_font("Helvetica", "B", 18)
+    pdf._use_font("B", 18)
     pdf.set_text_color(30, 30, 30)
     pdf.cell(0, 14, "Latest AI News", align="C")
     pdf.ln(12)
 
     # ── Date ──
-    pdf.set_font("Helvetica", "", 9)
+    pdf._use_font("", 9)
     pdf.set_text_color(120, 120, 120)
     pdf.cell(0, 8, f"Generated: {datetime.now():%d %B %Y at %H:%M}", align="C")
     pdf.ln(14)
@@ -165,17 +216,19 @@ def generate_ai_news_pdf(output_path: str | Path = OUTPUT_PDF) -> str:
         if stripped.endswith(":") or (
             len(stripped) < 60 and stripped.isupper()
         ):
-            pdf.set_font("Helvetica", "B", 12)
+            pdf._use_font("B", 12)
             pdf.multi_cell(0, 7, stripped)
             pdf.ln(2)
         elif stripped.startswith("- ") or stripped.startswith("* "):
-            # Bullet point
-            pdf.set_font("Helvetica", "", 10)
+            # Bullet point — use explicit width and reset x afterwards,
+            # because multi_cell (fpdf2 >= 2.8) leaves x at the right margin.
+            pdf._use_font("", 10)
             x = pdf.get_x()
             pdf.set_x(x + 8)
-            pdf.multi_cell(0, 6, stripped)
+            pdf.multi_cell(pdf.w - pdf.r_margin - pdf.get_x(), 6, stripped)
+            pdf.set_x(pdf.l_margin)
         else:
-            pdf.set_font("Helvetica", "", 10)
+            pdf._use_font("", 10)
             pdf.multi_cell(0, 6, stripped)
             pdf.ln(1)
 

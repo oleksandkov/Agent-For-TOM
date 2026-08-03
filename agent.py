@@ -1303,7 +1303,50 @@ Rules:
 - Keep responses concise. Focus on code, not lengthy explanations.
 - Use absolute or project-relative paths.
 - If a task is done, stop calling tools and summarize.
-- Memory files listed in the memory index can be read with read_file when you need their detail."""
+- Memory files listed in the memory index can be read with read_file when you need their detail.
+- A denied tool call will stay denied. Do not re-issue it with different wording.
+- Reply in the language the user wrote in."""
+
+
+def _classify_mcp_failures(failed: dict) -> tuple[list, list]:
+    """Split MCP failures into 'needs credentials' and 'actually broken'.
+
+    A 401 on an optional server is a permanent, expected state — it should
+    not be styled like a crash.
+    """
+    needs_auth, broken = [], []
+    for name, err in (failed or {}).items():
+        text = str(err).lower()
+        if any(m in text for m in ("401", "403", "unauthor", "forbidden",
+                                   "authenticat", "api key", "token")):
+            needs_auth.append(name)
+        else:
+            broken.append(name)
+    return needs_auth, broken
+
+
+def _environment_section() -> str:
+    """Tell the model which shell it actually has.
+
+    Without this it reached for `rm`, `ls` and `test -f` on cmd.exe — POSIX
+    commands that simply do not exist there — and burned tool calls finding
+    out. One line removes the whole class of mistake.
+    """
+    if sys.platform == "win32":
+        return (
+            "\n\n# Environment\n"
+            "- OS: Windows. `run_command` runs through **cmd.exe**, not bash.\n"
+            "- Use `dir`, `type`, `del`, `copy`, `move`, `findstr` — not "
+            "`ls`, `cat`, `rm`, `cp`, `mv`, `grep`, `test -f`.\n"
+            "- Prefer the built-in tools over shell equivalents: `list_files` "
+            "over `dir`, `read_file` over `type`, `search_code` over `findstr`.\n"
+            f"- Python interpreter: `{sys.executable}`"
+        )
+    return (
+        "\n\n# Environment\n"
+        f"- OS: {sys.platform}. `run_command` runs through a POSIX shell.\n"
+        f"- Python interpreter: `{sys.executable}`"
+    )
 
 def _truncate_section(text: str, max_chars: int, label: str = "") -> str:
     """Truncate a section to max_chars, adding a notice if cut."""
@@ -1334,7 +1377,7 @@ def build_system_prompt(user_message: str = "") -> str:
     query falls back to the most recently confirmed facts, so callers that
     have no message yet still get something sensible.
     """
-    prompt = BASE_PROMPT
+    prompt = BASE_PROMPT + _environment_section()
     # project-level instructions from AGENTS.md / agent.md + .tomas/instructions/
     instructions_section = build_instructions_section(PROJECT_DIR)
     if instructions_section:
@@ -1831,7 +1874,9 @@ def _run_text_protocol(state, adapter, reply: str, messages: list) -> str:
         for call in calls:
             name, params = call["name"], call["input"]
             if not request_permission(name, params):
-                results.append(f"[{name}] Error: user denied this tool call.")
+                results.append(
+                    f"[{name}] Error: the user denied this tool call. Retrying "
+                    f"the same call will be denied again — do not re-issue it.")
                 continue
             t0 = time.perf_counter()
             try:
@@ -2619,10 +2664,30 @@ def read_input_with_suggestions(prompt: str) -> str:
         )
 
     def _refresh():
-        """Clear the input line and re-draw prompt + buffer."""
+        """Clear the input line and re-draw prompt + buffer.
+
+        Measured in display columns, not `len()`: `\\r\\033[K` only clears the
+        line the cursor is on, so a buffer wide enough to wrap leaves debris
+        behind. Long input scrolls horizontally instead, keeping the tail —
+        the part being typed — visible.
+        """
+        from text_display import display_width, term_width
+        prompt = _build_prompt()
+        body = _repr()
+        room = term_width() - display_width(prompt) - 1
+        if room > 10 and display_width(body) > room:
+            kept, used = [], 0
+            for ch_ in reversed(body):
+                from text_display import char_width
+                w = char_width(ch_)
+                if used + w > room - 1:
+                    break
+                kept.append(ch_)
+                used += w
+            body = '…' + ''.join(reversed(kept))
         sys.stdout.write('\r\033[K')
-        sys.stdout.write(_build_prompt())
-        sys.stdout.write(_repr())
+        sys.stdout.write(prompt)
+        sys.stdout.write(body)
         sys.stdout.flush()
 
     def _show():
@@ -2673,10 +2738,13 @@ def read_input_with_suggestions(prompt: str) -> str:
 
     try:
         while True:
-            ch = msvcrt.getch()
+            # getwch returns a decoded str, so a Ukrainian, Russian,
+            # accented-Latin or CJK keystroke arrives as one character
+            # instead of a high byte that the old ASCII test discarded.
+            ch = msvcrt.getwch()
 
             # ── Enter ──────────────────────────────────────────────────────
-            if ch == b'\r':
+            if ch == '\r':
                 chosen = selected  # save before _hide() clears it
                 _hide()
                 sys.stdout.write('\n')
@@ -2696,33 +2764,54 @@ def read_input_with_suggestions(prompt: str) -> str:
                 return result
 
             # ── Ctrl+C ────────────────────────────────────────────────────
-            if ch == b'\x03':
+            if ch == '\x03':
                 _hide()
                 sys.stdout.write('\n')
                 sys.stdout.flush()
                 raise KeyboardInterrupt
 
             # ── Arrow / function keys ─────────────────────────────────────
-            if ch == b'\xe0':
-                ext = msvcrt.getch()
+            if ch in ('\xe0', '\x00'):
+                # One prefix branch for both extended-key families: getwch
+                # reports '\xe0' for arrows and '\x00' for function keys, and
+                # the second call gives the key itself.
+                ext = msvcrt.getwch()
+
+                # F5–F8 — quick mode switch
+                if ext in ('\x3f', '\x40', '\x41', '\x42'):
+                    if ext == '\x3f':      # F5 — toggle auto/default
+                        _set_mode("default" if AUTO_APPROVE_LOW else "auto")
+                    elif ext == '\x40':    # F6 — default mode
+                        _set_mode("default")
+                    elif ext == '\x41':    # F7 — strict mode
+                        _set_mode("strict")
+                    else:                  # F8 — YOLO mode
+                        _set_mode("yolo")
+                    _refresh()
+                    if _is_slash():
+                        _show()
+                    else:
+                        _hide()
+                    continue
+
                 if showing and _is_slash():
                     matches = _get_matches()
                     if not matches:
                         continue
-                    if ext == b'H':  # ↑ Up arrow — navigate suggestions
+                    if ext == 'H':  # ↑ Up arrow — navigate suggestions
                         selected = 0 if selected is None else max(0, selected - 1)
                         _show()
-                    elif ext == b'P':  # ↓ Down arrow — navigate suggestions
+                    elif ext == 'P':  # ↓ Down arrow — navigate suggestions
                         selected = 0 if selected is None else min(len(matches) - 1, selected + 1)
                         _show()
-                elif ext == b'H':  # ↑ Up arrow — history recall
+                elif ext == 'H':  # ↑ Up arrow — history recall
                     if _input_history:
                         _hide()
                         if _history_index > 0:
                             _history_index -= 1
                         buffer = list(_input_history[_history_index])
                         _refresh()
-                elif ext == b'P':  # ↓ Down arrow — history forward
+                elif ext == 'P':  # ↓ Down arrow — history forward
                     _hide()
                     if _history_index < len(_input_history) - 1:
                         _history_index += 1
@@ -2734,26 +2823,8 @@ def read_input_with_suggestions(prompt: str) -> str:
                 # ← / → are silently consumed
                 continue
 
-            # ── F5/F6/F7/F8 — quick mode switch ─────────────────────────
-            if ch == b'\x00':
-                ext2 = msvcrt.getch()
-                if ext2 == b'\x3f':    # F5 — toggle auto/default
-                    _set_mode("default" if AUTO_APPROVE_LOW else "auto")
-                elif ext2 == b'\x40':  # F6 — default mode
-                    _set_mode("default")
-                elif ext2 == b'\x41':  # F7 — strict mode
-                    _set_mode("strict")
-                elif ext2 == b'\x42':  # F8 — YOLO mode
-                    _set_mode("yolo")
-                _refresh()
-                if _is_slash():
-                    _show()
-                else:
-                    _hide()
-                continue
-
             # ── Tab — auto-complete slash commands OR cycle risk mode ──────
-            if ch == b'\t':
+            if ch == '\t':
                 if _is_slash():
                     cf = _cmd_filter()
                     if cf:
@@ -2786,7 +2857,7 @@ def read_input_with_suggestions(prompt: str) -> str:
                 continue
 
             # ── Backspace ─────────────────────────────────────────────────
-            if ch in (b'\x08', b'\x7f'):
+            if ch in ('\x08', '\x7f'):
                 if buffer:
                     buffer.pop()
                     selected = None
@@ -2798,7 +2869,7 @@ def read_input_with_suggestions(prompt: str) -> str:
                 continue
 
             # ── Escape — clear whole input ────────────────────────────────
-            if ch == b'\x1b':
+            if ch == '\x1b':
                 if buffer:
                     buffer.clear()
                     selected = None
@@ -2806,9 +2877,14 @@ def read_input_with_suggestions(prompt: str) -> str:
                     _refresh()
                 continue
 
-            # ── Printable ASCII ───────────────────────────────────────────
-            if len(ch) == 1 and 32 <= ch[0] < 127:
-                buffer.append(chr(ch[0]))
+            # ── Printable — any script ────────────────────────────────────
+            # `ch.isprintable()` is true for 'a', 'П', 'ї', 'é', '日' and an
+            # emoji, and false for control characters. The old test was
+            # `32 <= ch[0] < 127` against a *byte*, which silently discarded
+            # every Cyrillic keystroke — you could not type Ukrainian or
+            # Russian into the prompt at all.
+            if ch.isprintable():
+                buffer.append(ch)
                 selected = None
                 _refresh()
                 if _is_slash():
@@ -2817,7 +2893,7 @@ def read_input_with_suggestions(prompt: str) -> str:
                     _hide()
                 continue
 
-            # ── Everything else (non-printable, utf-8 multi-byte, etc.) ──
+            # ── Everything else (remaining control characters) ────────────
             continue
 
     except KeyboardInterrupt:
@@ -2841,7 +2917,11 @@ def _format_block_content(content, max_len: int = 200) -> str:
                     texts.append(block.get("text", ""))
                 elif t == "tool_use":
                     name = block.get("name", "?")
-                    inp = json.dumps(block.get("input", {}))[:80]
+                    # ensure_ascii=False: history used to replay Cyrillic
+                    # arguments as \uXXXX escapes, cut mid-escape at 80.
+                    from text_display import shorten
+                    inp = shorten(
+                        json.dumps(block.get("input", {}), ensure_ascii=False), 80)
                     texts.append(f"[tool_use: {name}({inp})]")
                 elif t == "tool_result":
                     rc = str(block.get("content", ""))[:120]
@@ -2944,25 +3024,29 @@ def main() -> int:
         failed = attempted - connected_servers
         total_tools = len(mcp_manager.tools)
 
+        # One status line. Six red error lines before the user has typed
+        # anything were mostly "this optional server has no credentials",
+        # which is a fact, not a failure — and not one they can act on here.
+        needs_auth, broken = _classify_mcp_failures(mcp_manager.failed_servers)
         if connected_servers:
-            tag = ""
-            if disabled:
-                tag += f", {DIM}{len(disabled)} disabled{RESET}"
-            if failed:
-                tag += f", {RED}{len(failed)} failed{RESET}"
-            print(f'  {GREEN}✓{RESET}  {BOLD}MCP:{RESET} {len(connected_servers)} connected ({total_tools} tools){tag}')
+            line = (f'  {GREEN}✓{RESET}  {BOLD}MCP:{RESET} '
+                    f'{len(connected_servers)} connected {DIM}·{RESET} {total_tools} tools')
         else:
-            parts = []
-            if disabled:
-                parts.append(f"{len(disabled)} disabled")
-            if failed:
-                parts.append(f"{len(failed)} failed")
-            status = ", ".join(parts) if parts else f'{DIM}no servers configured{RESET}'
-            print(f'  {DIM}MCP:{RESET} {status}')
-        # Show per-server failure reasons
-        if mcp_manager.failed_servers:
-            for srv_name, err_msg in mcp_manager.failed_servers.items():
-                print(f'  {RED}  ✗{RESET} {srv_name}: {DIM}{err_msg[:120]}{RESET}')
+            line = f'  {DIM}MCP:{RESET} none connected'
+        extras = []
+        if disabled:
+            extras.append(f'{len(disabled)} disabled')
+        if needs_auth:
+            extras.append(f'{len(needs_auth)} need credentials')
+        if broken:
+            extras.append(f'{len(broken)} unavailable')
+        if extras:
+            line += f' {DIM}·{RESET} {DIM}' + f'{DIM} · {RESET}{DIM}'.join(extras) + RESET
+        print(line)
+        if needs_auth or broken:
+            names = sorted(needs_auth) + sorted(broken)
+            shown = ', '.join(names[:4]) + ('…' if len(names) > 4 else '')
+            print(f'     {DIM}{shown} — /mcp for details{RESET}')
 
         # Resolve names once. Which tools are *sent* is decided per turn by
         # select_tools(), against what the user is actually asking for.

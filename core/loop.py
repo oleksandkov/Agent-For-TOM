@@ -243,6 +243,7 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
         yield TurnStarted(user_message)
 
     calls_used = 0
+    denials = 0          # per-turn, so the message can escalate
     budget = state.tool_budget
     signatures: list[str] = []
 
@@ -331,7 +332,20 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
 
             t0 = time.perf_counter()
             if not approved:
-                result = "Error: user denied this tool call."
+                # "user denied this tool call" reads like a transient failure,
+                # so the model rewrote the same command cosmetically and tried
+                # again — six times in one observed turn, until the loop
+                # detector stopped it. Say that a retry cannot succeed.
+                denials += 1
+                result = (
+                    "Error: the user denied this tool call. Retrying the same "
+                    "call — or a cosmetic variation of it — will be denied "
+                    "again. Do not re-issue it. Either continue without this "
+                    "tool, or explain what you wanted to do and why."
+                )
+                if denials >= 2:
+                    result += (" Further tool calls this turn are unlikely to "
+                               "be approved; summarise what you have instead.")
                 ok = False
             else:
                 try:
