@@ -475,6 +475,129 @@ def check_skill_format(r: Results) -> None:
             skills_manager.SKILL_DIRS = saved
 
 
+def check_cyrillic(r: Results) -> None:
+    """Ukrainian and Russian across the whole stack (Phase 7, Part A)."""
+    s = "Cyrillic"
+    UA = "Привіт! Це тест українською мовою."
+    RU = "Привет! Это тест на русском языке."
+    UA_ONLY = "їєґіІЇЄҐ"
+    from learning import text as ltext
+    import text_display as td
+
+    probe = PROJECT_DIR / "_sim_cyr.txt"
+    try:
+        agent.handle_write_file({"file_path": str(probe), "content": f"{UA}\n{RU}\n"})
+        out = agent.handle_read_file({"file_path": str(probe)})
+        r.check(s, "file round-trip", UA in out and RU in out)
+        found = agent.handle_search_code({"pattern": "українською", "path": str(probe)})
+        r.check(s, "search_code finds Cyrillic", "українською" in found)
+    finally:
+        probe.unlink(missing_ok=True)
+
+    named = PROJECT_DIR / "_тест_файл.txt"
+    try:
+        agent.handle_write_file({"file_path": str(named), "content": "вміст"})
+        r.check(s, "Cyrillic filename",
+                "вміст" in agent.handle_read_file({"file_path": str(named)}))
+    finally:
+        named.unlink(missing_ok=True)
+
+    out = agent.handle_run_command({"command": 'python -c "print(\'Привіт світ\')"'})
+    r.check(s, "shell returns Cyrillic", "Привіт світ" in out, repr(out[:60]))
+
+    r.check(s, "tokeniser reads Ukrainian",
+            bool(ltext.extract_keywords("Прочитай файл конфігурації")),
+            str(ltext.extract_keywords("Прочитай файл конфігурації")))
+    r.check(s, "tokeniser reads Russian",
+            bool(ltext.extract_keywords("Прочитай файл конфигурации")))
+    r.check(s, "English tokenisation unchanged",
+            ltext.extract_keywords("Read the configuration file and fix the error",
+                                   aliases=False)
+            == ["read", "configuration", "file", "fix", "error"])
+    r.check(s, "similarity works on Cyrillic",
+            ltext.similarity("файл конфігурації", "конфігурації файл") > 0)
+    r.check(s, "Cyrillic stop words present",
+            all(w in ltext.STOP_WORDS for w in ("що", "це", "как", "это")))
+
+    mk = lambda n, d: {"name": n, "description": d,
+                       "input_schema": {"type": "object", "properties": {}}}
+    pool = agent.TOOLS + [mk("sql_query", "run a sql query on a postgres database"),
+                          mk("take_screenshot", "screenshot the browser page")]
+    budget = len(agent.TOOLS) + 1
+    builtin = {t["name"] for t in agent.TOOLS}
+    pick = lambda c: [t["name"] for t in agent.select_tools(pool, c, budget)[0]
+                      if t["name"] not in builtin]
+    r.check(s, "Ukrainian request selects the right tool",
+            pick("зроби скріншот браузера") == ["take_screenshot"],
+            str(pick("зроби скріншот браузера")))
+    r.check(s, "Russian request selects the right tool",
+            pick("сделай скриншот браузера") == ["take_screenshot"])
+    r.check(s, "selection is not just list order",
+            pick("зроби скріншот браузера") != pick(""))
+
+    r.check(s, "Cyrillic measures single-width",
+            td.display_width(UA_ONLY) == len(UA_ONLY))
+    r.check(s, "CJK measures double-width", td.display_width("日本") == 4)
+    r.check(s, "shorten stays within the column budget",
+            td.display_width(td.shorten(UA * 4, 20)) <= 20)
+
+    from adapters.terminal import summarise_args
+    rendered = summarise_args("write_file", {"file_path": "привіт.txt"})
+    r.check(s, "tool args render real characters",
+            "привіт.txt" in rendered and "\\u04" not in rendered, rendered)
+
+    if sys.platform == "win32":
+        import io as _io
+        import msvcrt
+        original = getattr(msvcrt, "getwch", None)
+        seq = iter(list("Привіт") + ["\r"])
+        msvcrt.getwch = lambda: next(seq)
+        saved = sys.stdout
+        sys.stdout = _io.StringIO()
+        try:
+            typed = agent.read_input_with_suggestions("> ")
+        except Exception as e:
+            typed = f"<{e}>"
+        finally:
+            sys.stdout = saved
+            if original:
+                msvcrt.getwch = original
+        r.check(s, "the prompt accepts Cyrillic keystrokes", typed == "Привіт", typed)
+
+    try:
+        import pdf_report_skill
+        src = PROJECT_DIR / "latest_ai_news_report.txt"
+        backup = src.read_text(encoding="utf-8") if src.exists() else None
+        out_pdf = PROJECT_DIR / "_sim_cyr.pdf"
+        try:
+            src.write_text(f"Звіт українською\n\n- {UA}\n- {RU}\n", encoding="utf-8")
+            pdf_report_skill.generate_ai_news_pdf(str(out_pdf))
+            r.check(s, "PDF with Cyrillic", out_pdf.exists() and out_pdf.stat().st_size > 0,
+                    f"{out_pdf.stat().st_size if out_pdf.exists() else 0} bytes")
+        except Exception as e:
+            r.check(s, "PDF with Cyrillic", False, f"{type(e).__name__}: {e}")
+        finally:
+            out_pdf.unlink(missing_ok=True)
+            if backup is not None:
+                src.write_text(backup, encoding="utf-8")
+            else:
+                src.unlink(missing_ok=True)
+    except Exception as e:
+        r.check(s, "pdf_report_skill importable", False, str(e))
+
+
+def run_cyrillic(args: argparse.Namespace) -> int:
+    r = Results()
+    check_cyrillic(r)
+    sm = r.data["summary"]
+    print(f"\n{'=' * 62}\n Cyrillic: {sm['passed']}/{sm['total']} passed, "
+          f"{sm['failed']} failed\n{'=' * 62}")
+    out = Path(args.out) if args.out else PROJECT_DIR / "cyrillic_results.json"
+    out.write_text(json.dumps(r.data, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"wrote {out}")
+    return 1 if r.failed else 0
+
+
 def run_checks(args: argparse.Namespace) -> int:
     r = Results()
     check_tool_layer(r)
@@ -569,6 +692,9 @@ def main(argv: list[str] | None = None) -> int:
                           help="skip network-dependent checks")
     p_checks.add_argument("--out", help="where to write the results JSON")
 
+    p_cyr = sub.add_parser("cyrillic", help="Ukrainian/Russian support sweep")
+    p_cyr.add_argument("--out", help="where to write the results JSON")
+
     p_sessions = sub.add_parser("sessions", help="live goal-driven sessions")
     p_sessions.add_argument("--turns", type=int, default=0,
                             help="cap turns per session (0 = all)")
@@ -584,7 +710,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     print(f"{GREEN}[ok]{RESET} {len(REQUIRED_ENTRY_POINTS)} entry points resolved")
 
-    return run_checks(args) if args.mode == "checks" else run_sessions(args)
+    if args.mode == "checks":
+        return run_checks(args)
+    if args.mode == "cyrillic":
+        return run_cyrillic(args)
+    return run_sessions(args)
 
 
 if __name__ == "__main__":
