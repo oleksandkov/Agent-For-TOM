@@ -25,13 +25,10 @@ DEFAULT_WIDTH = 100
 # stripped before measuring or every coloured string measures too wide.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
-<<<<<<< HEAD
-=======
 # Kept here rather than imported from adapters.ansi: this module is the one
 # every renderer already depends on, and it must not depend on any of them.
 RESET = "\x1b[0m"
 
->>>>>>> 2d11f2fa9708ae26b06718a847edca04f2e94090
 
 def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text or "")
@@ -71,8 +68,6 @@ def term_width(default: int = DEFAULT_WIDTH) -> int:
     return max(MIN_WIDTH, min(cols, MAX_WIDTH))
 
 
-<<<<<<< HEAD
-=======
 def term_columns(default: int = DEFAULT_WIDTH) -> int:
     """The terminal's real column count, unclamped.
 
@@ -95,15 +90,12 @@ def term_lines(default: int = 24) -> int:
         return default
 
 
->>>>>>> 2d11f2fa9708ae26b06718a847edca04f2e94090
 def shorten(text: str, width: int, ellipsis: str = "…") -> str:
     """Truncate to `width` columns, always on a character boundary.
 
     The old `json.dumps(...)[:120]` cut inside a `\\uXXXX` escape and emitted
     fragments like `3f\\u0440\\u0438`. Slicing by column, on whole
     characters, cannot produce that.
-<<<<<<< HEAD
-=======
 
     Colour is carried, not counted. `display_width` strips ANSI before
     measuring, so the early-exit below is right — but the truncation loop used
@@ -113,7 +105,6 @@ def shorten(text: str, width: int, ellipsis: str = "…") -> str:
     are now stepped over at zero width and re-emitted intact, and a reset is
     appended when one was seen, so a truncated row cannot bleed its colour into
     the rest of the line.
->>>>>>> 2d11f2fa9708ae26b06718a847edca04f2e94090
     """
     text = text or ""
     if width <= 0:
@@ -121,16 +112,6 @@ def shorten(text: str, width: int, ellipsis: str = "…") -> str:
     if display_width(text) <= width:
         return text
     budget = max(0, width - display_width(ellipsis))
-<<<<<<< HEAD
-    out, used = [], 0
-    for ch in text:
-        w = char_width(ch)
-        if used + w > budget:
-            break
-        out.append(ch)
-        used += w
-    return "".join(out) + ellipsis
-=======
     out: list[str] = []
     used = 0
     saw_escape = False
@@ -149,7 +130,6 @@ def shorten(text: str, width: int, ellipsis: str = "…") -> str:
         used += w
         i += 1
     return "".join(out) + ellipsis + (RESET if saw_escape else "")
->>>>>>> 2d11f2fa9708ae26b06718a847edca04f2e94090
 
 
 def rule(char: str = "─", width: int | None = None, indent: int = 2) -> str:
@@ -193,8 +173,6 @@ def wrap(text: str, indent: str = "  ", width: int | None = None,
     return "\n".join(out)
 
 
-<<<<<<< HEAD
-=======
 class StreamWrap:
     """Wraps model output to the terminal *as it streams*.
 
@@ -274,7 +252,6 @@ class StreamWrap:
         return tail
 
 
->>>>>>> 2d11f2fa9708ae26b06718a847edca04f2e94090
 def pad(text: str, width: int, align: str = "left") -> str:
     """Pad to `width` display columns (not len), for aligned columns."""
     gap = max(0, width - display_width(text))
