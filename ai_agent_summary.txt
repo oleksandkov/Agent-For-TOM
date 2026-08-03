@@ -1,0 +1,34 @@
+AI Agent Architecture Overview
+==============================
+
+An AI agent is a system that uses a large language model (LLM) as its
+reasoning core to plan and execute tasks. Key architectural components:
+
+1. Agent Loop (REPL)
+   - Iterative cycle: observe context, decide next action, invoke a tool,
+     incorporate the result, and repeat until the task completes.
+
+2. Tools
+   - Built-in tools (read, write, edit, list, run, search, fetch) and MCP
+     (Model Context Protocol) tools merged at startup.
+   - Each tool carries a risk tier (low/medium/high) driving the permission
+     system (auto, default, strict, yolo modes).
+
+3. Permission System
+   - Auto-approves low-risk actions; prompts for higher-risk ones.
+   - Supports persistent overrides (e.g., "always" downgrades a tool).
+
+4. Context Management
+   - System prompt assembled each turn from base prompt, project files
+     (AGENT.md, CLAUDE.md), global instructions, and memory index.
+   - Session auto-save with compaction to manage token limits.
+
+5. Multi-Provider Support
+   - Pluggable backends (Anthropic, OpenRouter, local proxies) via a
+     providers.json configuration and .env settings.
+
+6. Memory & Skills
+   - Persistent memory files for cross-session knowledge.
+   - Installable skills that extend agent capabilities on demand.
+
+Typical flow: user request -> agent loop -> tool calls -> final response.

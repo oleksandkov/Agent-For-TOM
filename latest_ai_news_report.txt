@@ -1,0 +1,28 @@
+# AI News Report
+
+## Model Releases
+
+- OpenAI releases GPT-5.5 with enhanced multi-agent orchestration and native tool-use improvements.
+- Anthropic ships Claude Opus 4.5, featuring a longer context window and stronger coding benchmarks.
+- Google DeepMind rolls out Gemini 3 Pro with native image generation and real-time video understanding.
+
+## Agents & Automation
+
+- Microsoft's Playwright MCP becomes the de-facto browser automation standard for AI agents.
+- A new wave of "agentic" coding tools integrates MCP servers directly into IDEs.
+- Browser-use agents gain accessibility-tree snapshots, eliminating the need for screenshot-based steering.
+
+## Open Source
+
+- Meta releases Llama 4.5 under a permissive license, targeting on-prem enterprise deployments.
+- The MCP protocol reaches widespread adoption with hundreds of community servers.
+
+## Industry
+
+- AI infrastructure spending continues to grow as hyperscalers expand GPU fleets.
+- Enterprises prioritize guardrails: permissions systems, sandboxing, and audit trails.
+- Multi-provider setups (OpenRouter, Anthropic, Zen proxies) become the standard for cost optimization.
+
+## Summary
+
+The AI landscape in 2026 is defined by agentic workflows, standardized MCP tooling, and a shift toward production-ready governance.

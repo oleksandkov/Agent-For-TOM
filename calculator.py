@@ -2,6 +2,8 @@
 
 import sys
 
+from calculator_plugins import mean, median, variance
+
 
 def add(a: float, b: float) -> float:
     return a + b
@@ -21,11 +23,16 @@ def divide(a: float, b: float) -> float:
     return a / b
 
 
+def power(base: float, exponent: float) -> float:
+    return base ** exponent
+
+
 OPERATIONS = {
     "+": add,
     "-": subtract,
     "*": multiply,
     "/": divide,
+    "^": power,
 }
 
 
