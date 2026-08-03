@@ -697,15 +697,34 @@ def start_proxy(port: int = DEFAULT_PORT, daemon: bool = False) -> HTTPServer:
             server.shutdown()
 
 
-def check_status(port: int = DEFAULT_PORT) -> bool:
-    """Check if the proxy is running. Returns True if reachable."""
-    try:
-        req = Request(f"http://127.0.0.1:{port}/health")
-        with urlopen(req, timeout=2) as resp:
-            data = json.loads(resp.read())
-            return data.get("status") == "ok"
-    except Exception:
-        return False
+def check_status(port: int = DEFAULT_PORT, use_cache: bool = True) -> bool:
+    """Check if the proxy is running. Returns True if reachable.
+
+    Since Phase 4 the proxy is opt-in, so on a normal install nothing is
+    listening — and this function was the single most expensive thing in the
+    menus because of it. A connect to the closed port is silently dropped
+    rather than refused, so the `timeout=2` was paid *in full*, every time,
+    on three different pages (measured: 2,099 ms).
+
+    Asking a cheap question first — is anything listening at all? — bounds the
+    negative answer to ~200 ms, and the short TTL means revisiting a page is
+    free. A running proxy still answers on the real HTTP path as before.
+    """
+    from net_probe import cached, port_open
+
+    def measure() -> bool:
+        if not port_open("127.0.0.1", port):
+            return False
+        try:
+            req = Request(f"http://127.0.0.1:{port}/health")
+            with urlopen(req, timeout=2) as resp:
+                return json.loads(resp.read()).get("status") == "ok"
+        except Exception:
+            return False
+
+    if not use_cache:
+        return measure()
+    return cached(f"zen_status:{port}", ttl=5.0, produce=measure)
 
 
 # ── CLI entry point ──────────────────────────────────────────────────

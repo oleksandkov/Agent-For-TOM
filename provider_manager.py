@@ -302,7 +302,21 @@ def _headers_for(provider: Provider) -> dict:
     return headers
 
 
+def _reachable(url: str) -> bool:
+    """Cheap gate before any HTTP call to a *local* endpoint.
+
+    A local provider that is not installed (the common case for Ollama) used
+    to cost the full `_PROBE_TIMEOUT` per attempt, and `list_models` makes
+    three attempts — 12.3 s before the provider menu could draw a single row.
+    Remote hosts are not gated; their reachability is the HTTP layer's job.
+    """
+    from net_probe import url_port_open
+    return url_port_open(url)
+
+
 def _get_json(url: str, headers: dict, timeout: int = _PROBE_TIMEOUT) -> Any:
+    if not _reachable(url):
+        raise OSError("nothing listening")
     req = urllib.request.Request(url, method="GET")
     for k, v in headers.items():
         req.add_header(k, v)
@@ -312,6 +326,8 @@ def _get_json(url: str, headers: dict, timeout: int = _PROBE_TIMEOUT) -> Any:
 
 def _post_json(url: str, headers: dict, body: dict,
                timeout: int = _PROBE_TIMEOUT) -> Any:
+    if not _reachable(url):
+        raise OSError("nothing listening")
     req = urllib.request.Request(
         url, data=json.dumps(body).encode("utf-8"), method="POST")
     for k, v in headers.items():

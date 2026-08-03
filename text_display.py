@@ -64,6 +64,28 @@ def term_width(default: int = DEFAULT_WIDTH) -> int:
     return max(MIN_WIDTH, min(cols, MAX_WIDTH))
 
 
+def term_columns(default: int = DEFAULT_WIDTH) -> int:
+    """The terminal's real column count, unclamped.
+
+    `term_width` is a *reading* width — capped at 120 so prose does not sprawl.
+    Cursor arithmetic needs the real number instead: a menu redraw that moves
+    the cursor up by N rows has to know when the terminal will soft-wrap a
+    line into two rows, and that happens at the true edge, not at 120.
+    """
+    try:
+        return max(20, shutil.get_terminal_size((default, 24)).columns)
+    except Exception:
+        return default
+
+
+def term_lines(default: int = 24) -> int:
+    """The terminal's real row count. Used to size a menu viewport."""
+    try:
+        return max(6, shutil.get_terminal_size((80, default)).lines)
+    except Exception:
+        return default
+
+
 def shorten(text: str, width: int, ellipsis: str = "…") -> str:
     """Truncate to `width` columns, always on a character boundary.
 
@@ -126,6 +148,85 @@ def wrap(text: str, indent: str = "  ", width: int | None = None,
         if line:
             out.append((indent if first else following) + " ".join(line))
     return "\n".join(out)
+
+
+class StreamWrap:
+    """Wraps model output to the terminal *as it streams*.
+
+    The non-streaming path has always run its reply through `wrap`. The
+    streaming path wrote deltas straight to stdout, so the same reply was
+    laid out two different ways depending on whether the provider supported
+    streaming: wrapped and indented when it did not, running off the right
+    edge when it did.
+
+    Wrapping a stream means never looking ahead, so the rule is: hold the word
+    currently being typed, and commit it only once its width is known. A code
+    fence switches the wrapper off, because reflowing code destroys it.
+    """
+
+    def __init__(self, indent: str = "  ", width: int | None = None):
+        self.indent = indent
+        self.limit = max(20, (width or term_width()) - display_width(indent))
+        self._word: list[str] = []
+        self._col = 0
+        self._in_fence = False
+        self._line_start = True
+        self._recent: list[str] = []   # chars of the current line, for fence detection
+
+    def feed(self, chunk: str) -> str:
+        """Consume a delta, return the text that should be written now."""
+        out: list[str] = []
+        for ch in chunk or "":
+            if ch == "\n":
+                out.append(self._commit_word())
+                # A fence toggles on the line that contains it.
+                if "".join(self._recent).strip().startswith("```"):
+                    self._in_fence = not self._in_fence
+                out.append("\n" + self.indent)
+                self._col = 0
+                self._line_start = True
+                self._recent = []
+                continue
+
+            self._recent.append(ch)
+            if self._in_fence:
+                out.append(ch)
+                self._col += char_width(ch)
+                continue
+
+            if ch == " ":
+                out.append(self._commit_word())
+                # A space that would sit past the edge becomes the wrap point.
+                if self._col + 1 > self.limit:
+                    out.append("\n" + self.indent)
+                    self._col = 0
+                elif not self._line_start:
+                    out.append(" ")
+                    self._col += 1
+                continue
+
+            self._word.append(ch)
+        return "".join(out)
+
+    def _commit_word(self) -> str:
+        if not self._word:
+            return ""
+        word = "".join(self._word)
+        self._word = []
+        w = display_width(word)
+        prefix = ""
+        if self._col and self._col + w > self.limit:
+            prefix = "\n" + self.indent
+            self._col = 0
+        self._col += w
+        self._line_start = False
+        return prefix + word
+
+    def flush(self) -> str:
+        """Emit whatever is still held. Call once the stream ends."""
+        tail = self._commit_word()
+        self._recent = []
+        return tail
 
 
 def pad(text: str, width: int, align: str = "left") -> str:

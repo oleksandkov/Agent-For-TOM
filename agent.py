@@ -52,13 +52,15 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# Try to import Playwright
-try:
-    from playwright.async_api import async_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
-    async_playwright = None
+# Playwright for browser-based fetching (JavaScript rendering).
+# Whether it is installed is answered from the import system's metadata
+# instead of by importing it: the package costs ~105 ms to load, and the CLI
+# menus only ever need the boolean. The tools that drive a browser import it
+# themselves, at the point they are about to use it.
+import importlib.util
+
+PLAYWRIGHT_AVAILABLE = importlib.util.find_spec("playwright") is not None
+async_playwright = None  # bound on demand by the browser tools
 
 # Load variables from .env into os.environ if present.
 try:
@@ -68,14 +70,12 @@ except ImportError:
     # python-dotenv not installed — rely on real env vars instead.
     pass
 
-# Playwright for browser-based fetching (JavaScript rendering)
-try:
-    from playwright.async_api import async_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
-
-import anthropic
+# NOTE: `anthropic` is deliberately *not* imported here. It is the single
+# most expensive import in the project — 1.13 s of the CLI's 1.66 s cold
+# start — and the menus never touch it: they import TOOLS, RISK_LEVELS and
+# build_system_prompt from this module and go straight to drawing. It is
+# imported where it is used, in `_get_client` (and already lazily in
+# `core/loop.py`), so only a session that actually talks to a model pays it.
 
 # MCP and skills support
 from mcp_manager import MCPManager
@@ -225,6 +225,7 @@ def _get_client():
         client = None
 
     if client is None:
+        import anthropic  # deferred: see the note at the top of this module
         headers = json.loads(extra_hdr) if extra_hdr else None
         client = anthropic.Anthropic(
             api_key=key or None,
@@ -259,7 +260,7 @@ def _ensure_zen_proxy():
                 start_proxy(6446, daemon=True)
                 import time
                 time.sleep(0.5)
-                if check_status(6446):
+                if check_status(6446, use_cache=False):  # verifies our own start
                     print(f'  {GREEN}✓{RESET}  Zen proxy is running')
                 else:
                     print(f'  {YELLOW}⚠{RESET}  Zen proxy may not have started')
@@ -1084,6 +1085,7 @@ def handle_fetch_url_with_browser(params: dict) -> str:
             return f"Error: blocked URL pattern: {pattern}"
 
     async def _fetch():
+        from playwright.async_api import async_playwright  # deferred, see top
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             try:
