@@ -429,8 +429,16 @@ def arrow_menu(title: str, items: list, header_lines: list = None,
 
     def draw_header():
         if header_lines:
+            # A header entry can itself be several lines -- TOMAS_ART is one
+            # string containing embedded newlines. shorten() measures a
+            # newline as zero width and keeps consuming budget past it, so
+            # passing the whole block through in one call truncated the
+            # entire ASCII banner down to one line's worth of columns and cut
+            # it off mid-render with a trailing ellipsis. Each physical line
+            # needs its own budget.
             for line in header_lines:
-                print(shorten(line, line_budget))
+                for sub in line.split(chr(10)):
+                    print(shorten(sub, line_budget))
         else:
             print(f'{BOLD}{shorten(title, line_budget)}{RESET}')
             print('─' * min(50, line_budget))

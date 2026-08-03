@@ -474,5 +474,35 @@ class TestMenuKeyOverlay(unittest.TestCase):
         self.assertEqual(idx, 1)
 
 
+
+class TestMultiLineHeader(unittest.TestCase):
+    """A header entry can be several physical lines in one string --
+    TOMAS_ART is the ASCII banner, built that way. shorten() measures a
+    newline as zero-width and keeps consuming its column budget past it,
+    so passing an unsplit multi-line block through one shorten() call
+    truncated the whole banner down to a single line's worth of columns
+    and cut it off mid-render with a trailing ellipsis -- draw_header now
+    shortens each physical line on its own budget instead.
+    """
+
+    def test_a_multiline_header_is_not_truncated_as_one_line(self):
+        # Ten lines of 60 columns is 600 visible columns total -- comfortably
+        # past any real terminal width, which is what a shorten() call that
+        # does not know about the embedded newlines would truncate against.
+        banner = chr(10).join(['#' * 60 for _ in range(10)])
+        _, screen = drive_menu(['item'], ['ENTER'],
+                               header_lines=[banner], max_visible=5)
+        for row in banner.split(chr(10)):
+            self.assertIn(row, screen.text)
+        self.assertNotIn(chr(8230), screen.text.split('item')[0])
+
+    def test_each_physical_line_is_still_truncated_to_the_terminal(self):
+        wide = '#' * 500
+        banner = chr(10).join([wide, wide])
+        _, screen = drive_menu(['item'], ['ENTER'],
+                               header_lines=[banner], max_visible=5)
+        for row in screen.rows:
+            self.assertLessEqual(display_width(row), term_columns())
+
 if __name__ == '__main__':
     unittest.main()
