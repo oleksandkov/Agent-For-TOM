@@ -63,7 +63,7 @@ def test_builtin_tools():
 
     # read_file
     out = agent.handle_read_file({"file_path": "CLAUDE.md"})
-    check("read_file returns content", "Project guidelines" in out, out[:80])
+    check("read_file returns content", "# CLAUDE.md" in out, out[:80])
 
     # read_file missing
     out = agent.handle_read_file({"file_path": "nonexistent_xyz.py"})
@@ -117,7 +117,7 @@ def test_builtin_tools():
 
     # execute_tool dispatch
     out = agent.execute_tool("read_file", {"file_path": "CLAUDE.md"})
-    check("execute_tool dispatches", "Project guidelines" in out, out[:80])
+    check("execute_tool dispatches", "# CLAUDE.md" in out, out[:80])
     out = agent.execute_tool("unknown_tool_xyz", {})
     check("execute_tool unknown → error", "unknown tool" in out.lower() or "error" in out.lower(), out[:80])
 

@@ -1,6 +1,6 @@
 # TOMAS Implementation Plan
 
-Six phases, in dependency order. Each file is self-contained: problem statement, evidence from the codebase, why it matters, step-by-step implementation with code, tests, and acceptance criteria.
+Seven phases, in dependency order. Each file is self-contained: problem statement, evidence from the codebase, why it matters, step-by-step implementation with code, tests, and acceptance criteria.
 
 | Phase | File | Goal | Effort |
 |---|---|---|---|
@@ -10,6 +10,7 @@ Six phases, in dependency order. Each file is self-contained: problem statement,
 | 3 | [PHASE-3-real-learning.md](PHASE-3-real-learning.md) | Replace keyword counting with genuine learning | 2-3 weeks |
 | 4 | [PHASE-4-providers-and-extensions.md](PHASE-4-providers-and-extensions.md) | Any provider, smarter MCP, uniform skills | 1-2 weeks |
 | 5 | [PHASE-5-desktop-app.md](PHASE-5-desktop-app.md) | Desktop app as a thin adapter, not a rewrite | 3-4 weeks |
+| 6 | [PHASE-6-hardening-from-simulation.md](PHASE-6-hardening-from-simulation.md) | Fix what 16 real sessions actually broke on | ~1.5 weeks |
 
 ## Rules that apply to every phase
 
@@ -24,3 +25,13 @@ Six phases, in dependency order. Each file is self-contained: problem statement,
 Start with Phase 0. Nothing else can be verified until a tool round-trip completes end to end.
 
 Background and rationale for the whole plan: `../../IMPROVEMENT_PLAN.md`. Test evidence: `../../QA_REPORT.md`.
+
+Phase 6 is different in kind: Phases 0–5 were derived from reading the code, Phase 6 from
+running it. Its evidence is `../../TOMAS_SIMULATION_REPORT.md`,
+`../../TOMAS_SIMULATION_REPORT_2.md`, `../../TOMAS_SIMULATION_REPORT_3.md`,
+`../../simulation_results.json`, and the 16 session JSONs in `~/.tomas/sessions/`.
+It can be started any time after Phase 3; three of its items (P6-7, P6-8, P6-11) unblock
+work in Phases 3 and 4.
+
+The three simulation reports are agent-generated and two of them contain claims the session
+files contradict — Phase 6 opens by listing which. Read the phase file, not the reports.

@@ -28,6 +28,8 @@ import re
 import sys
 import time
 import json
+import shutil
+import tempfile
 import subprocess
 import urllib.request
 import urllib.error
@@ -146,8 +148,47 @@ AUTO_APPROVE_LOW = os.environ.get("AGENT_AUTO_APPROVE", "1") == "1"
 YOLO_MODE = False  # when True, all tools are auto-approved without any prompt
 
 # ── Session token tracking ──
+# Per-session, not per-process. These used to accumulate for the life of the
+# interpreter, so two sessions run back to back reported byte-identical usage
+# and a session that did no work still claimed 1.6M input tokens.
 _session_tokens = {"input": 0, "output": 0, "calls": 0}
 _last_turn_usage = {"input": 0, "output": 0}
+
+# ── Session telemetry (P6-8) ──
+# Per-turn wall clock and per-tool-call outcome, so a saved session can say
+# which call was slow and which one failed.
+_turn_timings: list[float] = []
+_tool_log: list[dict] = []
+_session_started_at: float = time.time()
+# Turns that produced no assistant reply (e.g. retries exhausted on a 429).
+_failed_turns: list[dict] = []
+
+
+def reset_session_state() -> None:
+    """Start a fresh session's accounting. Called when a session begins or
+    when /clear discards the conversation."""
+    global _session_started_at
+    _session_tokens.update({"input": 0, "output": 0, "calls": 0})
+    _last_turn_usage.update({"input": 0, "output": 0})
+    _turn_timings.clear()
+    _tool_log.clear()
+    _failed_turns.clear()
+    _session_started_at = time.time()
+
+
+def session_telemetry() -> dict:
+    """Telemetry block for the session file."""
+    total = round(sum(_turn_timings), 2)
+    n = len(_turn_timings)
+    return {
+        "turn_metrics": {
+            "total_duration_sec": total,
+            "avg_turn_sec": round(total / n, 2) if n else 0.0,
+            "turn_timings": [round(t, 2) for t in _turn_timings],
+        },
+        "tool_log": list(_tool_log),
+        "failed_turns": list(_failed_turns),
+    }
 
 # ── Session continuation ──
 # Set by agent_cli.py before calling main() to continue a previous session.
@@ -249,6 +290,60 @@ COMBINED_TOOLS: list[dict] = []
 TOOL_TOKENS: int = 0  # estimated token count for tool definitions
 MCP_TOOL_NAME_MAP: dict[str, str] = {}  # renamed_name -> original_name for conflicting MCP tools
 
+
+def resolve_mcp_tool_conflicts(mcp_tools: list[dict], builtin_names: Optional[set] = None) -> tuple[list[dict], dict[str, str], int]:
+    """
+    Resolve MCP/built-in tool name collisions by prefixing conflicting MCP
+    tools with 'mcp_' (e.g. read_file -> mcp_read_file).
+
+    Returns (resolved_mcp_tools, name_map, renames) where:
+      - resolved_mcp_tools: MCP tools with collisions renamed (originals untouched)
+      - name_map:          {renamed_name: original_name} for renamed tools
+      - renames:           number of tools that were renamed
+    """
+    if builtin_names is None:
+        builtin_names = {t["name"] for t in TOOLS}
+    resolved: list[dict] = []
+    name_map: dict[str, str] = {}
+    renames = 0
+    for t in mcp_tools:
+        original = t["name"]
+        if original in builtin_names:
+            new_name = f"mcp_{original}"
+            renamed = dict(t)
+            renamed["name"] = new_name
+            renamed["description"] = f"[MCP: {original}] {renamed.get('description', '')}"
+            resolved.append(renamed)
+            name_map[new_name] = original
+            renames += 1
+        else:
+            resolved.append(t)
+    return resolved, name_map, renames
+
+
+def apply_tool_cap(mcp_tools: list[dict], max_allowed: int = 128) -> tuple[list[dict], int]:
+    """
+    Merge built-in TOOLS with MCP tools and truncate to max_allowed tools.
+    Built-in tools are always kept; excess MCP tools are silently dropped.
+
+    Returns (combined_tools, dropped) where dropped is the number of MCP
+    tools that were removed to satisfy the cap.
+    """
+    n_builtin = len(TOOLS)
+    keep = max(0, max_allowed - n_builtin)
+    dropped = max(0, len(mcp_tools) - keep)
+    if dropped:
+        return TOOLS + mcp_tools[:keep], dropped
+    return TOOLS + mcp_tools, 0
+
+
+def is_free_tier_model(model_name: Optional[str] = None) -> bool:
+    """True when the active endpoint restricts tool payloads (~32 tools max)."""
+    if model_name is None:
+        model_name = (_get_model() or "").lower()
+    base = os.environ.get("ANTHROPIC_BASE_URL", "").lower()
+    return "free" in model_name or "openrouter" in base or "127.0.0.1" in base
+
 # ── ANSI color constants for the chat UI ──
 RESET = '\033[0m'
 BOLD = '\033[1m'
@@ -294,13 +389,14 @@ TOOLS: list[dict] = [
     },
     {
         "name": "edit_file",
-        "description": "Replace a unique string in a file. old_string must appear exactly once.",
+        "description": "Replace a string in a file. old_string must appear exactly once, unless replace_all is true.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "Absolute or project-relative path"},
                 "old_string": {"type": "string", "description": "Exact text to find"},
                 "new_string": {"type": "string", "description": "Replacement text"},
+                "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring a unique match. Use this for mechanical substitutions rather than issuing one call per site."},
             },
             "required": ["file_path", "old_string", "new_string"],
         },
@@ -318,7 +414,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "run_command",
-        "description": "Execute a shell command and return stdout/stderr.",
+        "description": "Execute a shell command. Returns '[exit N — ok|FAILED]' followed by stdout and any stderr, so you never need to append '2>&1' or infer success from the text.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -330,13 +426,14 @@ TOOLS: list[dict] = [
     },
     {
         "name": "search_code",
-        "description": "Search for a regex pattern across files in a directory.",
+        "description": "Search for a regex pattern across files. Returns the true match count; page through large result sets with offset.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "Regex pattern"},
-                "path": {"type": "string", "description": "Directory to search. Defaults to project root."},
-                "file_glob": {"type": "string", "description": "File pattern filter, e.g. '*.py'"},
+                "path": {"type": "string", "description": "Directory or single file to search. Defaults to project root."},
+                "file_glob": {"type": "string", "description": "File pattern filter, e.g. '*.py'. Ignored when path is a file."},
+                "offset": {"type": "integer", "description": "Skip this many matches. Default 0."},
             },
             "required": ["pattern"],
         },
@@ -413,8 +510,41 @@ RISK_LEVELS: dict[str, str] = {
     "search_web": "low",
 }
 
+# Commands that only read. `run_command` is the most-used tool in the corpus
+# (72 of 209 calls) and every one of them blocked on a prompt, because
+# `git status` and `rm -rf` shared a single tier.
+READONLY_CMD = re.compile(
+    r'^\s*(git\s+(status|log|diff|show|branch)\b'
+    r'|(?:[\w.\\/:-]*[\\/])?python(?:\.exe)?\s+-m\s+(?:unittest|pytest)\b'
+    r'|pytest\b|dir\b|ls\b|type\b|cat\b|echo\b|where\b|which\b|findstr\b'
+    r'|pip\s+(list|show|freeze)\b)',
+    re.I,
+)
+
+# Any of these turns a command into something a single-token classifier cannot
+# reason about. The corpus contains `del x && type y` — a delete wearing a
+# read's clothes — and `dir /b n* & echo --- & type n`, where cmd.exe treats a
+# lone `&` as a separator. Chaining is not classified; it is high.
+_CMD_SEPARATORS = ("&&", "||", ";", "|", ">", "<", "&", "`", "$(")
+
+
+def risk_for(name: str, params: Optional[dict] = None) -> str:
+    """Risk tier for a specific call, not just a tool name."""
+    if name == "run_command":
+        cmd = (params or {}).get("command", "")
+        if any(sep in cmd for sep in _CMD_SEPARATORS):
+            return "high"
+        if re.search(r'\b(del|rm|rmdir|erase|move|ren|format|curl|wget)\b', cmd, re.I):
+            return "high"
+        return "low" if READONLY_CMD.match(cmd) else "high"
+    return RISK_LEVELS.get(name, "high")
+
 # Patterns that are always blocked from run_command
 BLOCKED_PATTERNS = ["rm -rf /", "mkfs", "> /dev/sd", "dd if=/dev/zero", ":(){:|:&};:"]
+
+# Ceiling on a single read_file result. The line limit alone is not a size
+# limit — one 2000-line read put 45 KB into the context in a single result.
+MAX_READ_FILE_CHARS = 20000
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -426,13 +556,32 @@ def _resolve(path: str) -> Path:
         p = PROJECT_DIR / p
     return p.resolve()
 
-def _safe(p: Path) -> bool:
-    """Ensure the path stays inside the project directory."""
-    try:
-        p.relative_to(PROJECT_DIR)
+# All user state lives under ~/.tomas (sessions, notes, memory, learned
+# skills). Locking the agent out of it does not make anything safer — it just
+# pushes the same read through `run_command`, which is a higher risk tier.
+TOMAS_HOME = (Path.home() / ".tomas").resolve()
+
+
+def _within(p: Path, root: Path) -> bool:
+    return p == root or root in p.parents
+
+
+def _safe(p: Path, write: bool = False) -> bool:
+    """Project dir is read-write. ~/.tomas is read-only: it is written through
+    the typed APIs (save_memory, self_notes, session_manager) that own each
+    file's schema, never by hand."""
+    if _within(p, PROJECT_DIR):
         return True
-    except ValueError:
-        return False
+    return not write and _within(p, TOMAS_HOME)
+
+
+def _outside_project_error(path: Path, write: bool = False) -> str:
+    """Say which rule was hit, so the model corrects instead of retrying."""
+    if write and _within(path, TOMAS_HOME):
+        return (f"Error: {path} is under ~/.tomas, which is read-only. "
+                f"Use save_memory or the self_notes API to write there.")
+    return (f"Error: path outside project: {path}. "
+            f"Readable roots: {PROJECT_DIR} (read-write), {TOMAS_HOME} (read-only).")
 
 # ---------------------------------------------------------------------------
 # Tool handlers
@@ -441,7 +590,7 @@ def _safe(p: Path) -> bool:
 def handle_read_file(params: dict) -> str:
     path = _resolve(params["file_path"])
     if not _safe(path):
-        return f"Error: path outside project: {path}"
+        return _outside_project_error(path)
     if not path.exists():
         return f"Error: file not found: {path}"
     offset = max(0, int(params.get("offset", 1)) - 1)
@@ -449,31 +598,50 @@ def handle_read_file(params: dict) -> str:
     with path.open("r", encoding="utf-8", errors="replace") as f:
         lines = f.readlines()
     selected = lines[offset:offset + limit]
-    numbered = [f"{i + offset + 1:6}\t{line}" for i, line in enumerate(selected)]
-    return "".join(numbered) if numbered else "(empty file)"
+    if not selected:
+        return "(empty file)"
+    # A line limit alone is not a size limit: a 2000-line read of a wide file
+    # put 45 KB into the context in one tool result. Cap by characters too,
+    # and say where to resume so the truncation is recoverable.
+    out: list[str] = []
+    used = 0
+    for i, line in enumerate(selected):
+        entry = f"{i + offset + 1:6}\t{line}"
+        if used + len(entry) > MAX_READ_FILE_CHARS:
+            next_line = i + offset + 1
+            out.append(f"\n... [truncated at line {next_line} of {len(lines)} — "
+                       f"re-read with offset={next_line} to continue] ...\n")
+            break
+        out.append(entry)
+        used += len(entry)
+    return "".join(out)
 
 def handle_write_file(params: dict) -> str:
     path = _resolve(params["file_path"])
-    if not _safe(path):
-        return f"Error: path outside project: {path}"
+    if not _safe(path, write=True):
+        return _outside_project_error(path, write=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(params["content"], encoding="utf-8")
     return f"Successfully wrote {len(params['content'])} chars to {path}"
 
 def handle_edit_file(params: dict) -> str:
     path = _resolve(params["file_path"])
-    if not _safe(path):
-        return f"Error: path outside project: {path}"
+    if not _safe(path, write=True):
+        return _outside_project_error(path, write=True)
     if not path.exists():
         return f"Error: file not found: {path}"
     content = path.read_text(encoding="utf-8")
     old = params["old_string"]
+    replace_all = bool(params.get("replace_all", False))
     count = content.count(old)
     if count == 0:
         return f"Error: old_string not found in {path}"
-    if count > 1:
-        return f"Error: old_string matches {count} locations; be more specific."
-    new_content = content.replace(old, params["new_string"], 1)
+    if count > 1 and not replace_all:
+        # Ambiguity still fails loudly; replace_all is how you say "all of them"
+        # instead of synthesising N disambiguating contexts by hand.
+        return (f"Error: old_string matches {count} locations; be more specific, "
+                f"or pass replace_all=true to replace all {count}.")
+    new_content = content.replace(old, params["new_string"], -1 if replace_all else 1)
 
     # ── Generate a unified diff preview ──
     import difflib
@@ -505,12 +673,13 @@ def handle_edit_file(params: dict) -> str:
     # Return a summary with the diff
     n_add = sum(1 for l in diff_text.splitlines() if l.startswith('+') and not l.startswith('+++'))
     n_del = sum(1 for l in diff_text.splitlines() if l.startswith('-') and not l.startswith('---'))
-    return f"Successfully edited {path} (+{n_add} -{n_del} lines)\n\n{colored_diff}"
+    note = f", {count} replacements" if replace_all and count > 1 else ""
+    return f"Successfully edited {path} (+{n_add} -{n_del} lines{note})\n\n{colored_diff}"
 
 def handle_list_files(params: dict) -> str:
     path = _resolve(params.get("path", "."))
     if not _safe(path):
-        return f"Error: path outside project: {path}"
+        return _outside_project_error(path)
     if not path.exists():
         return f"Error: directory not found: {path}"
     entries = []
@@ -521,39 +690,103 @@ def handle_list_files(params: dict) -> str:
         entries.append(f"{'[dir] ' if child.is_dir() else '      '}{child.name}")
     return "\n".join(entries) if entries else "(empty)"
 
+# Matches a `python -c "..."` payload at the end of a command line. cmd.exe
+# cannot carry newlines or nested quotes through such a payload, so it is
+# round-tripped via a temporary script file instead.
+_PYTHON_INLINE_RE = re.compile(
+    r'python(?:\.exe)?\s+(?:-u\s+)?-c\s+"(.*)"\s*$', re.S | re.I
+)
+# `python -c` without -u: cmd.exe swallows stdout of short-lived processes.
+_PYTHON_DASH_C_RE = re.compile(r'\bpython(\.exe)?\s+-c\b', re.I)
+
+
+def _normalise_windows_command(cmd: str) -> tuple[str, Optional[str]]:
+    """Work around two cmd.exe defects around inline python payloads.
+
+    Returns (command, temp_dir_to_clean). The temp directory is created
+    outside the project so scratch files never land in the source tree and
+    never collide with `unittest discover`.
+    """
+    if sys.platform != "win32":
+        return cmd, None
+    # 1. Force unbuffered output.
+    cmd = _PYTHON_DASH_C_RE.sub(lambda m: f"python{m.group(1) or ''} -u -c", cmd)
+    # 2. Multi-line or nested-quote payloads cannot survive cmd.exe tokenising.
+    m = _PYTHON_INLINE_RE.search(cmd)
+    if m and ("\n" in m.group(1) or "'" in m.group(1)):
+        temp_dir = tempfile.mkdtemp(prefix="tomas_exec_")
+        script = Path(temp_dir) / "_exec.py"
+        script.write_text(m.group(1), encoding="utf-8")
+        cmd = cmd[:m.start()] + f'"{sys.executable}" -u "{script}"'
+        return cmd, temp_dir
+    return cmd, None
+
+
 def handle_run_command(params: dict) -> str:
     cmd = params["command"]
     for bad in BLOCKED_PATTERNS:
         if bad in cmd:
             return f"Error: blocked dangerous pattern: {bad}"
     timeout = int(params.get("timeout", 120))
+
+    cmd, temp_dir = _normalise_windows_command(cmd)
+    # Child processes must emit UTF-8 rather than the console codepage,
+    # otherwise non-ASCII output is mangled beyond recovery on the way back.
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
     try:
         result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True,
-            timeout=timeout, cwd=str(PROJECT_DIR),
+            cmd, shell=True, capture_output=True,
+            encoding="utf-8", errors="replace",
+            timeout=timeout, cwd=str(PROJECT_DIR), env=env,
         )
     except subprocess.TimeoutExpired:
         return f"Error: command timed out after {timeout}s"
-    output = ""
-    if result.stdout:
-        output += result.stdout
-    if result.stderr:
-        output += f"\nSTDERR:\n{result.stderr}"
-    if not output.strip():
-        output = f"Command completed with exit code {result.returncode}"
-    if len(output) > 30000:
-        output = output[:15000] + "\n\n... [truncated] ...\n\n" + output[-15000:]
-    return output
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    parts = []
+    if (result.stdout or "").strip():
+        parts.append(result.stdout.rstrip())
+    if (result.stderr or "").strip():
+        parts.append(f"[stderr]\n{result.stderr.rstrip()}")
+    body = "\n".join(parts) or "(no output)"
+    if len(body) > 30000:
+        body = body[:15000] + "\n\n... [truncated] ...\n\n" + body[-15000:]
+    # The exit code is always reported. A command that fails while still
+    # writing to stdout used to be indistinguishable from one that succeeded.
+    status = "ok" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
+    return f"[exit {result.returncode} — {status}]\n{body}"
+
+SEARCH_PAGE_SIZE = 50
+
 
 def handle_search_code(params: dict) -> str:
     pattern = params["pattern"]
     path = _resolve(params.get("path", "."))
     if not _safe(path):
-        return f"Error: path outside project: {path}"
+        return _outside_project_error(path)
     file_glob = params.get("file_glob", "")
+    offset = max(0, int(params.get("offset", 0)))
+
+    # A file is a legitimate search target. rglob() on one yields nothing, so
+    # the old code answered "no matches" for a path that was never searched —
+    # a confident false negative the model had no reason to doubt.
+    if path.is_file():
+        candidates = [path]
+    elif path.is_dir():
+        candidates = path.rglob(file_glob) if file_glob else path.rglob("*")
+    else:
+        return f"Error: path does not exist: {path}"
+
+    try:
+        regex = re.compile(pattern)
+    except re.error as e:
+        return f"Error: invalid regex {pattern!r}: {e}"
+
     matches: list[str] = []
-    glob_iter = path.rglob(file_glob) if file_glob else path.rglob("*")
-    for file in glob_iter:
+    total = 0
+    for file in candidates:
         if not file.is_file():
             continue
         try:
@@ -561,12 +794,23 @@ def handle_search_code(params: dict) -> str:
         except Exception:
             continue
         for i, line in enumerate(text.splitlines(), 1):
-            if re.search(pattern, line):
-                matches.append(f"{file}:{i}: {line}")
-                if len(matches) >= 50:
-                    matches.append("... (50 matches, truncated)")
-                    return "\n".join(matches)
-    return "\n".join(matches) if matches else f"No matches for pattern: {pattern}"
+            if regex.search(line):
+                total += 1
+                if offset < total <= offset + SEARCH_PAGE_SIZE:
+                    matches.append(f"{file}:{i}: {line}")
+
+    if total == 0:
+        return f"No matches for pattern: {pattern}"
+    header = f"{total} match{'' if total == 1 else 'es'}"
+    shown = len(matches)
+    if total > offset + shown:
+        # Report the true total so the model can decide whether to page,
+        # instead of guessing what "truncated" hid.
+        header += (f" — showing {offset + 1}-{offset + shown}; "
+                   f"re-run with offset={offset + shown} for more")
+    elif offset:
+        header += f" — showing {offset + 1}-{offset + shown}"
+    return header + "\n" + "\n".join(matches)
 
 def handle_save_memory(params: dict) -> str:
     save_memory(params["key"], params["description"], params["content"])
@@ -835,7 +1079,7 @@ def check_permission(name: str, params: dict) -> bool:
         return True  # YOLO mode approves everything
     if APPROVALS.is_approved(name, params):
         return True
-    risk = RISK_LEVELS.get(name, "high")
+    risk = risk_for(name, params)
     if risk == "low" and AUTO_APPROVE_LOW:
         return True
 
@@ -920,12 +1164,10 @@ def build_system_prompt(user_message: str = "") -> str:
                        f"{learned}")
     except Exception:
         pass
-    # installed skills
-    skills_section = build_skills_section()
+    # installed skills — budgeted by whole entries, not by slicing the joined
+    # string at a character offset (which used to cut mid-skill-name).
+    skills_section = build_skills_section(max_chars=MAX_SKILLS_CHARS)
     if skills_section:
-        skills_section = _truncate_section(
-            skills_section, MAX_SKILLS_CHARS, "skills"
-        )
         prompt += f"\n\n{skills_section}"
     # NOTE: the self-improvement tips/session-context block used to be injected
     # here. It was template text addressed to a human developer ("Consider
@@ -1226,11 +1468,36 @@ def _tool_origin(name: str) -> str:
     return "built-in"
 
 
-def _record_tool_call(name: str, args: dict, preview: str) -> None:
+_EXIT_CODE_RE = re.compile(r'^\[exit (-?\d+) ')
+
+
+def _record_tool_call(name: str, args: dict, preview: str,
+                      duration_ms: int = 0, ok: bool = True) -> None:
     try:
         self_improve.record_tool_call(name, args, preview)
     except Exception:
         pass
+    entry = {
+        "turn": len(_turn_timings) + 1,
+        "tool": name,
+        "duration_sec": round(duration_ms / 1000, 3),
+        "ok": ok,
+    }
+    # run_command now leads with its exit code, so the log can record the real
+    # process status rather than "the tool returned a string".
+    m = _EXIT_CODE_RE.match(preview or "")
+    if m:
+        entry["exit"] = int(m.group(1))
+    elif not ok or (preview or "").startswith("Error:"):
+        entry["exit"] = 1
+        entry["error"] = (preview or "")[:200]
+    else:
+        entry["exit"] = 0
+    if entry["exit"] != 0 and "error" not in entry:
+        entry["error"] = (preview or "")[:200]
+    # Arguments and results are already in `messages`; duplicating them here
+    # is how a 6-turn session file reached 190 KB.
+    _tool_log.append(entry)
 
 
 def build_state(system_prompt: str, messages: list, responder) -> AgentState:
@@ -1243,7 +1510,7 @@ def build_state(system_prompt: str, messages: list, responder) -> AgentState:
         tools=COMBINED_TOOLS,
         max_tokens=MAX_TOKENS,
         execute_tool=execute_tool,
-        risk_of=lambda n: RISK_LEVELS.get(n, "high"),
+        risk_of=risk_for,
         origin_of=_tool_origin,
         responder=responder,
         approvals=APPROVALS,
@@ -1267,16 +1534,34 @@ def agent_loop(system_prompt: str, messages: list) -> str:
     adapter = TerminalAdapter(interactive=interactive)
     state = build_state(system_prompt, messages, adapter)
 
-    # messages already carries the user's turn, so no user_message here.
-    reply = adapter.run(state)
-
-    # Propagate what the turn learned back into module state.
-    _streaming_disabled = not state.streaming_enabled
-    _last_turn_usage["input"] = state.usage.get("input", 0)
-    _last_turn_usage["output"] = state.usage.get("output", 0)
-    _session_tokens["input"] += state.usage.get("total_input", 0)
-    _session_tokens["output"] += state.usage.get("total_output", 0)
-    _session_tokens["calls"] += state.usage.get("calls", 0)
+    turn_index = len(_turn_timings) + 1
+    t0 = time.perf_counter()
+    error: Optional[BaseException] = None
+    reply = ""
+    try:
+        # messages already carries the user's turn, so no user_message here.
+        reply = adapter.run(state)
+    except BaseException as e:
+        error = e
+        raise
+    finally:
+        _turn_timings.append(time.perf_counter() - t0)
+        # Propagate what the turn learned back into module state.
+        _streaming_disabled = not state.streaming_enabled
+        _last_turn_usage["input"] = state.usage.get("input", 0)
+        _last_turn_usage["output"] = state.usage.get("output", 0)
+        _session_tokens["input"] += state.usage.get("total_input", 0)
+        _session_tokens["output"] += state.usage.get("total_output", 0)
+        _session_tokens["calls"] += state.usage.get("calls", 0)
+        # A turn that produced nothing is recorded as such. Silence here is
+        # what let a session with eight prompts and zero replies be saved,
+        # and then be reported as eight turns of completed work.
+        if error is not None or not (reply or "").strip():
+            _failed_turns.append({
+                "turn": turn_index,
+                "reason": type(error).__name__ if error else "empty_reply",
+                "error": str(error)[:300] if error else "",
+            })
     return reply
 
 
@@ -1387,6 +1672,8 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
 
     if cmd == "clear":
         messages.clear()
+        # A cleared conversation is a new session; its accounting starts over.
+        reset_session_state()
         return f'  {GREEN}✓{RESET} Conversation cleared ({_get_model()}).'
 
     if cmd == "status":
@@ -1596,6 +1883,7 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
                 return f'  {RED}✗{RESET} Session not found: {sid}'
             # Replace current messages with the loaded ones
             messages.clear()
+            reset_session_state()
             messages.extend(loaded)
             # Show the full conversation history so the user has context
             lines = [
@@ -1685,59 +1973,20 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
             return _render_reflection_log()
 
         if sub in ("analyze", "scan"):
-            self_improve.analyze_patterns(force=True)
-            self_improve.generate_skills_for_all_ready_patterns()
-            self_improve.generate_tips()
             self_improve.update_session_analysis()
-            return f'  {GREEN}✓{RESET} Forced full analysis — patterns, skills, tips updated.'
+            return f'  {GREEN}✓{RESET} Session analysis updated.'
 
-        if sub in ("skills",):
-            skills = self_improve.get_auto_generated_skills()
-            if not skills:
-                return f'  {DIM}No auto-generated skills yet.{RESET}'
-            lines = [f'  {BOLD}Auto-Generated Skills{RESET}']
-            lines.append(f'  {DIM}{"─" * 46}{RESET}')
-            for s in skills:
-                lines.append(f'    {DIM}📄{RESET} {s.get("name", "?")}')
-            return '\n'.join(lines)
-
-        if sub in ("tips",):
-            tips = self_improve.get_tips()
-            if not tips:
-                return f'  {DIM}No tips generated yet.{RESET}'
-            active = self_improve.get_active_tips()
-            lines = [
-                f'  {BOLD}Self-Improvement Tips{RESET}',
-                f'  {DIM}{"─" * 46}{RESET}',
-                f'  {DIM}Total: {len(tips)}  Active: {len(active)}{RESET}',
-                '',
-            ]
-            for i, t in enumerate(tips):
-                status = f'{GREEN}✓{RESET}' if t.get("applied") else f'{YELLOW}○{RESET}'
-                lines.append(f'  {status} {t.get("message", "")}')
-            return '\n'.join(lines)
-
-        if sub in ("patterns",):
-            patterns = self_improve.get_patterns()
-            if not patterns:
-                return f'  {DIM}No patterns detected yet.{RESET}'
-            lines = [
-                f'  {BOLD}Detected Patterns{RESET}',
-                f'  {DIM}{"─" * 46}{RESET}',
-            ]
-            for p in sorted(patterns, key=lambda x: -x.get("count", 0)):
-                ptype = p.get("type", "?")
-                pcount = p.get("count", 0)
-                if ptype == "frequent_tool":
-                    lines.append(f'    {DIM}🔧{RESET} {p.get("tool")} ({pcount}×)')
-                elif ptype == "topic":
-                    lines.append(f'    {DIM}📌{RESET} topic: {p.get("keyword")} ({pcount}×)')
-                elif ptype == "tool_sequence":
-                    lines.append(f'    {DIM}🔗{RESET} {p.get("sequence")} ({pcount}×)')
-                elif ptype == "repetition":
-                    kws = ", ".join(p.get("keywords", [])[:3])
-                    lines.append(f'    {DIM}🔁{RESET} repeated: {kws} ({pcount}×)')
-            return '\n'.join(lines)
+        # The keyword-counting generator behind `skills`, `tips`, and
+        # `patterns` was deleted in Phase 6. Point at what replaced it rather
+        # than leaving three subcommands that silently show nothing.
+        if sub in ("skills", "tips", "patterns"):
+            return (
+                f'  {DIM}The pattern/tip generator was removed — it counted keywords and\n'
+                f'  filled in templates, and nothing consumed its output.{RESET}\n'
+                f'  {CYAN}/self-improve facts{RESET}      — what the agent has actually learned\n'
+                f'  {CYAN}/self-improve reflect{RESET}    — the reflection log\n'
+                f'  {CYAN}/skills{RESET}                  — installed skills'
+            )
 
         # Default: show status
         return self_improve.get_self_improve_status()
@@ -2237,6 +2486,9 @@ def _print_conversation_history(messages: list) -> None:
 def main() -> int:
     global mcp_manager, _current_context_window, CONTEXT_WINDOW, CONTINUE_SESSION_ID
 
+    # ── This session's accounting starts here, not at import time ──
+    reset_session_state()
+
     # ── Auto-start Zen proxy if needed ──
     _ensure_zen_proxy()
 
@@ -2306,40 +2558,18 @@ def main() -> int:
         global TOOL_TOKENS, MCP_TOOL_NAME_MAP
         if mcp_manager.tools:
             # Check for name conflicts with built-in tools and rename MCP tools accordingly
-            builtin_names = {t["name"] for t in TOOLS}
-            mcp_tools = []
-            MCP_TOOL_NAME_MAP = {}
-            renames = 0
-            for t in mcp_manager.tools:
-                original = t["name"]
-                if original in builtin_names:
-                    new_name = f"mcp_{original}"
-                    renamed = dict(t)
-                    renamed["name"] = new_name
-                    # Update description to note the rename
-                    renamed["description"] = f"[MCP: {original}] {renamed.get('description', '')}"
-                    mcp_tools.append(renamed)
-                    MCP_TOOL_NAME_MAP[new_name] = original
-                    renames += 1
-                else:
-                    mcp_tools.append(t)
-            combined = TOOLS + mcp_tools
+            mcp_tools, MCP_TOOL_NAME_MAP, renames = resolve_mcp_tool_conflicts(mcp_manager.tools)
             if renames:
                 print(f'  {YELLOW}⚠{RESET}  Renamed {renames} MCP tool(s) to avoid built-in name conflicts')
             model_name = (_get_model() or "").lower()
             # Free tier endpoints & OpenRouter models have strict payload limits (max ~32 tools)
-            is_free_tier = "free" in model_name or "openrouter" in os.environ.get("ANTHROPIC_BASE_URL", "").lower() or "127.0.0.1" in os.environ.get("ANTHROPIC_BASE_URL", "")
+            is_free_tier = is_free_tier_model(model_name)
             max_allowed = 32 if is_free_tier else 128
 
-            if len(combined) > max_allowed:
-                n_builtin = len(TOOLS)
-                keep = max(0, max_allowed - n_builtin)
-                dropped = len(mcp_tools) - keep
+            COMBINED_TOOLS, dropped = apply_tool_cap(mcp_tools, max_allowed=max_allowed)
+            if dropped:
                 limit_reason = f"{_get_model()} payload limit" if is_free_tier else "API 128-tool limit"
-                print(f'  {YELLOW}⚠{RESET}  Truncated MCP tools: keeping {keep} of {len(mcp_tools)} ({dropped} dropped, {limit_reason})')
-                COMBINED_TOOLS = TOOLS + mcp_tools[:keep]
-            else:
-                COMBINED_TOOLS = combined
+                print(f'  {YELLOW}⚠{RESET}  Truncated MCP tools: keeping {len(mcp_tools) - dropped} of {len(mcp_tools)} ({dropped} dropped, {limit_reason})')
         else:
             COMBINED_TOOLS = TOOLS
             MCP_TOOL_NAME_MAP = {}
@@ -2354,6 +2584,16 @@ def main() -> int:
     # ── Initialize self-improving system ──
     self_improve.init()
     init_learning()
+    # One-shot: annotate sessions saved before completeness was recorded, so
+    # an abandoned run is distinguishable from a finished one.
+    try:
+        from session_manager import backfill_completeness
+        marked = backfill_completeness()
+        if marked:
+            print(f'  {YELLOW}⚠{RESET}  Marked {len(marked)} incomplete session(s) '
+                  f'{DIM}(saved with turns that produced no reply){RESET}')
+    except Exception:
+        pass
     print(f'  {GREEN}✦{RESET}  Self-improving system active — learning from interactions')
 
     print(f'  {DIM}─── Type {RESET}{BOLD}quit{RESET}{DIM} or {RESET}{BOLD}exit{RESET}{DIM} to leave · {RESET}{BOLD}/help{RESET}{DIM} for commands · Ctrl+C also works ───{RESET}')

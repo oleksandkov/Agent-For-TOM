@@ -128,12 +128,66 @@ def _summarize_messages(messages: list) -> str:
 #  CRUD operations
 # ═══════════════════════════════════════════════════════════════════════
 
+def audit_transcript(messages: list) -> dict:
+    """Report whether a transcript actually completed.
+
+    A user turn with no assistant reply after it means the turn produced
+    nothing — the model errored, retries were exhausted, or the harness moved
+    on. Saving that as an ordinary session is how eight prompts and zero
+    replies came to be reported as eight turns of finished work.
+    """
+    roles = [m.get("role") for m in messages]
+    orphaned = [
+        i for i, r in enumerate(roles)
+        if r == "user" and (i + 1 >= len(roles) or roles[i + 1] == "user")
+    ]
+    return {
+        "complete": not orphaned,
+        "orphaned_user_turns": orphaned,
+        "user_messages": roles.count("user"),
+        "assistant_messages": roles.count("assistant"),
+    }
+
+
+def backfill_completeness() -> list[str]:
+    """Mark pre-Phase-6 sessions that were saved without a `complete` flag.
+
+    Sessions written before this flag existed carry no signal at all, so a
+    reader cannot distinguish an abandoned run from a finished one. Files
+    that audit clean are left untouched; only genuinely incomplete ones are
+    annotated. Safe to call repeatedly.
+    """
+    marked: list[str] = []
+    for path in sorted(get_session_dir().glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if "complete" in data:
+            continue
+        audit = audit_transcript(data.get("messages", []))
+        if audit["complete"]:
+            continue
+        data["complete"] = False
+        data["incomplete_reason"] = {
+            "orphaned_user_turns": audit["orphaned_user_turns"],
+            "user_messages": audit["user_messages"],
+            "assistant_messages": audit["assistant_messages"],
+            "failed_turns": [],
+            "note": "backfilled: saved before completeness was recorded",
+        }
+        path.write_text(_serialize_session_data(data), encoding="utf-8")
+        marked.append(path.stem)
+    return marked
+
+
 def save_session(
     messages: list,
     summary: str = "",
     model: str = "",
     token_usage: dict | None = None,
     session_id: str | None = None,
+    telemetry: dict | None = None,
 ) -> str:
     """Save the current conversation as a session.
 
@@ -145,6 +199,8 @@ def save_session(
         session_id: Optional existing session ID to overwrite.
             If provided, updates the existing session file
             instead of creating a new one.
+        telemetry: Optional dict with turn_metrics / tool_log / failed_turns.
+            Defaults to the live session's telemetry from `agent`.
 
     Returns:
         The session ID string.
@@ -174,6 +230,19 @@ def save_session(
         except (ImportError, Exception):
             token_usage = {"input": 0, "output": 0, "calls": 0}
 
+    if telemetry is None:
+        try:
+            from agent import session_telemetry
+            telemetry = session_telemetry()
+        except (ImportError, Exception):
+            telemetry = {}
+
+    audit = audit_transcript(messages)
+    # A turn the agent recorded as failed also makes the session incomplete,
+    # even when a later turn produced a reply.
+    failed_turns = list(telemetry.get("failed_turns") or [])
+    complete = audit["complete"] and not failed_turns
+
     session_data = {
         "id": session_id,
         "timestamp": time.time(),
@@ -184,10 +253,20 @@ def save_session(
         "project_dir": project_dir,
         "model": model,
         "message_count": len(messages),
+        "complete": complete,
         "token_usage": token_usage,
         "summary": summary,
+        "turn_metrics": telemetry.get("turn_metrics", {}),
+        "tool_log": telemetry.get("tool_log", []),
         "messages": messages,
     }
+    if not complete:
+        session_data["incomplete_reason"] = {
+            "orphaned_user_turns": audit["orphaned_user_turns"],
+            "user_messages": audit["user_messages"],
+            "assistant_messages": audit["assistant_messages"],
+            "failed_turns": failed_turns,
+        }
 
     path = _session_path(session_id)
     path.write_text(

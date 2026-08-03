@@ -368,12 +368,22 @@ class MCPManager:
         self.servers: dict[str, MCPServer] = {}
         self._all_tools: list[dict] = []
         self.failed_servers: dict[str, str] = {}  # name -> error message
+        # exposed tool name -> (server name, original tool name). Two servers
+        # can expose the same tool (chrome-devtools and playwright both have
+        # take_screenshot); routing by first match sent half those calls to
+        # the wrong server, and emitting both under one name put duplicate
+        # names in the API payload.
+        self._owner: dict[str, tuple[str, str]] = {}
 
     def discover_and_connect(self, config: dict[str, dict] = None) -> list[dict]:
         """
         Read MCP config (from global config or provided dict),
         connect to every server, and return the combined tool list.
         Skips servers marked as disabled.
+
+        A tool name claimed by two servers is namespaced for the second
+        claimant only (mcp_<server>_<tool>), so the common case — one server
+        owning a name — keeps that name unchanged.
         """
         if config is None:
             config = read_mcp_servers()
@@ -383,33 +393,42 @@ class MCPManager:
             server = MCPServer(name, cfg)
             if server.connect():
                 self.servers[name] = server
-                # Convert tools to Anthropic-compatible format
                 for t in server.tools:
-                    self._all_tools.append(self._to_anthropic_tool(t))
+                    original = t.get("name", "?")
+                    if original in self._owner:
+                        exposed = f"mcp_{name}_{original}"
+                        # Pathological case: even the namespaced name collides.
+                        suffix = 2
+                        while exposed in self._owner:
+                            exposed = f"mcp_{name}_{original}_{suffix}"
+                            suffix += 1
+                    else:
+                        exposed = original
+                    tool = self._to_anthropic_tool(t)
+                    tool["name"] = exposed
+                    self._all_tools.append(tool)
+                    self._owner[exposed] = (name, original)
             else:
                 self.failed_servers[name] = server._last_error or "unknown error"
         return self._all_tools
 
     @property
     def tools(self) -> list[dict]:
-        """All MCP tools across all connected servers."""
+        """All MCP tools across all connected servers. Names are unique."""
         return self._all_tools
 
     def call_tool(self, tool_name: str, arguments: dict) -> str:
-        """Route a tool call to the right server based on which owns it."""
-        for server in self.servers.values():
-            for t in server.tools:
-                if t["name"] == tool_name:
-                    return server.call_tool(tool_name, arguments)
-        return f"Error: MCP tool '{tool_name}' not found on any connected server."
+        """Route a tool call to the server that owns the exposed name."""
+        owner = self._owner.get(tool_name)
+        if owner is None:
+            return f"Error: MCP tool '{tool_name}' not found on any connected server."
+        server_name, original = owner
+        return self.servers[server_name].call_tool(original, arguments)
 
     def get_server_for_tool(self, tool_name: str) -> str | None:
         """Return the server name that owns the given tool, or None."""
-        for server in self.servers.values():
-            for t in server.tools:
-                if t["name"] == tool_name:
-                    return server.name
-        return None
+        owner = self._owner.get(tool_name)
+        return owner[0] if owner else None
 
     @staticmethod
     def _to_anthropic_tool(tool: dict) -> dict:
@@ -431,6 +450,7 @@ class MCPManager:
             server.disconnect()
         self.servers.clear()
         self._all_tools.clear()
+        self._owner.clear()
 
 
 # ═══════════════════════════════════════════════════════════════════════

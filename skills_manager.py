@@ -12,10 +12,14 @@ from typing import Optional
 
 # ── skill directories (searched in order) ────────────────────────────
 
-# Skills the agent wrote for itself. The learned/ path is where reflection
-# writes (Phase 3); the self-improve/ path is the older template generator,
-# kept until that code is deleted.
+# Skills the agent wrote for itself. Reflection (Phase 3) writes here.
 LEARNED_SKILLS_DIR = Path.home() / ".tomas" / "learned" / "global" / "skills"
+
+# The self-improve/ template generator wrote here. It is no longer on the
+# discovery path: it produced entries like "sequence-read_file-read_file"
+# ("when starting with read_file, consider following up with read_file") that
+# crowded real skills out of the prompt budget. Kept as a constant so the
+# migration in self_improve.py can find and remove the directory.
 LEGACY_LEARNED_SKILLS_DIR = Path.home() / ".tomas" / "self-improve" / "skills"
 
 SKILL_DIRS = [
@@ -23,7 +27,6 @@ SKILL_DIRS = [
     Path.home() / ".agents" / "skills",
     Path.home() / "AppData" / "Roaming" / "Code" / "User" / "prompts",
     LEARNED_SKILLS_DIR,
-    LEGACY_LEARNED_SKILLS_DIR,
 ]
 
 
@@ -100,35 +103,57 @@ def discover_skills() -> list[dict]:
                     "file": skill_file,
                     "description": desc,
                     "content": body,
-                    "learned": skills_dir in (LEARNED_SKILLS_DIR,
-                                              LEGACY_LEARNED_SKILLS_DIR),
+                    "learned": skills_dir == LEARNED_SKILLS_DIR,
                 }
             )
 
     return skills
 
 
-def build_skills_section() -> str:
+def build_skills_section(max_chars: Optional[int] = None) -> str:
     """
     Build a markdown section listing all installed skills and their
     descriptions, for injection into the system prompt.
+
+    When `max_chars` is given the list is budgeted by whole entries: a skill
+    is either listed or it is not. Slicing the joined string at a character
+    offset instead (the old behaviour) cut mid-entry and left the model
+    reading half a skill name.
     """
     skills = discover_skills()
     if not skills:
         return ""
 
-    lines = [
+    header = [
         "# Installed Agent Skills",
         "",
         "The following skills are available on this system. "
         "Use them to guide your behavior when relevant.",
         "",
     ]
-    for s in skills:
+
+    def render(s: dict) -> str:
         origin = " *(learned from your past sessions)*" if s.get("learned") else ""
-        lines.append(f"- **{s['name']}**: {s['description']}{origin}")
-    lines.append("")
-    return "\n".join(lines)
+        return f"- **{s['name']}**: {s['description']}{origin}"
+
+    entries = [render(s) for s in skills]
+    if max_chars is None:
+        return "\n".join(header + entries + [""])
+
+    budget = max_chars - len("\n".join(header + [""])) - 1
+    kept: list[str] = []
+    used = 0
+    for i, entry in enumerate(entries):
+        remaining = len(entries) - i
+        # Reserve room for the "N more not shown" line while any remain.
+        note = f"- *(+{remaining} more skills not shown)*"
+        reserve = len(note) + 1 if remaining > 1 else 0
+        if used + len(entry) + 1 + reserve > budget:
+            kept.append(f"- *(+{remaining} more skills not shown)*")
+            break
+        kept.append(entry)
+        used += len(entry) + 1
+    return "\n".join(header + kept + [""])
 
 
 def cmd_skill_list() -> str:

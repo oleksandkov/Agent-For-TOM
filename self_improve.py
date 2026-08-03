@@ -1,17 +1,19 @@
 """
-Self-Improving System — learns from user interactions, detects patterns,
-auto-generates skills, and creates self-improvement tips.
+Interaction log and session-purpose analysis.
 
-Inspired by the Hermes AI self-improvement approach: the agent monitors
-conversations, identifies repetitive patterns, generates reusable skills,
-and produces tips to improve its own behaviour over time.
+This module used to detect "patterns" by counting keywords and then fill in
+Markdown templates from them ("when starting with read_file, consider
+following up with read_file"). That generator was deleted in Phase 6: nothing
+consumed its output after Phase 3 removed the prompt injection point, and its
+28 template files were crowding real skills out of the context budget.
+
+What remains is the raw signal and a cheap session summary. Actual learning
+is `learning/` — reflection over transcripts by a model, not by a counter.
 
 Data is stored under ~/.tomas/self-improve/:
   - interactions.jsonl   — every user message + tool call, timestamped
-  - patterns.json         — detected repetitive patterns with metadata
-  - tips.json             — generated self-improvement tips
-  - skills/              — auto-generated SKILL.md files
-  - session.json          — current session purpose analysis
+                           (read by learning/)
+  - session.json         — current session purpose analysis
 """
 
 from __future__ import annotations
@@ -35,13 +37,7 @@ SESSION_FILE = SELF_IMPROVE_DIR / "session.json"
 SKILLS_DIR = SELF_IMPROVE_DIR / "skills"
 TIPS_DIR = SELF_IMPROVE_DIR / "tips"
 
-# How many repetitions of a similar pattern before we auto-generate a skill
-PATTERN_TO_SKILL_THRESHOLD = 3
-
-# How many interactions before we re-analyze patterns
-ANALYZE_INTERVAL = 5
-
-# How many recent interactions pattern analysis considers — bounds per-call
+# How many recent interactions session analysis considers — bounds per-call
 # cost independent of how long interactions.jsonl has grown.
 ANALYSIS_WINDOW = 500
 
@@ -49,9 +45,6 @@ ANALYSIS_WINDOW = 500
 # tailable in O(window) instead of O(total history).
 ROTATE_AT_BYTES = 5 * 1024 * 1024
 ROTATE_KEEP = 3
-
-# How many patterns before we generate a tip
-PATTERN_TO_TIP_THRESHOLD = 5
 
 # Common stop words for keyword extraction
 STOP_WORDS = {
@@ -75,10 +68,13 @@ STOP_WORDS = {
 # ═══════════════════════════════════════════════════════════════════════
 
 def _ensure_dirs() -> None:
-    """Create all self-improvement directories."""
+    """Create the directories this module still writes to.
+
+    SKILLS_DIR and TIPS_DIR are deliberately not recreated — the generator
+    that filled them is gone, and recreating them would undo the migration on
+    the next startup.
+    """
     SELF_IMPROVE_DIR.mkdir(parents=True, exist_ok=True)
-    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-    TIPS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _load_json(path: Path, default: Any = None) -> Any:
@@ -171,20 +167,6 @@ def _compute_fingerprint(text: str) -> str:
     return hashlib.md5(" ".join(words).encode()).hexdigest()
 
 
-def _similarity_score(a: str, b: str) -> float:
-    """
-    Return a 0.0-1.0 score of how similar two strings are,
-    based on keyword Jaccard similarity.
-    """
-    ka = set(_extract_keywords(a, max_keywords=15))
-    kb = set(_extract_keywords(b, max_keywords=15))
-    if not ka or not kb:
-        return 0.0
-    intersection = ka & kb
-    union = ka | kb
-    return len(intersection) / len(union)
-
-
 # ═══════════════════════════════════════════════════════════════════════
 #  Interaction Tracking
 # ═══════════════════════════════════════════════════════════════════════
@@ -243,542 +225,6 @@ def get_recent_interactions(n: int = ANALYSIS_WINDOW) -> list[dict]:
 def get_all_interactions() -> list[dict]:
     """Return all logged interactions."""
     return _read_jsonl(INTERACTIONS_FILE)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  Pattern Detection
-# ═══════════════════════════════════════════════════════════════════════
-
-def analyze_patterns(force: bool = False) -> dict:
-    """
-    Analyze logged interactions to detect repetitive patterns.
-    Returns a dict of detected patterns.
-
-    Pattern types detected:
-    - tool_patterns: tools used most frequently
-    - keyword_clusters: topics that appear often
-    - task_patterns: sequences of tools used together
-    - repetition_patterns: very similar messages
-    """
-    interactions = get_recent_interactions(ANALYSIS_WINDOW)
-    if len(interactions) < 3:
-        return {"patterns": [], "analyzed_at": time.time()}
-
-    # ── Load existing patterns ──
-    existing = _load_json(PATTERNS_FILE, {"patterns": [], "analyzed_at": 0})
-    existing_patterns = existing.get("patterns", [])
-
-    # ── Tool frequency ──
-    tool_counts: dict[str, int] = {}
-    for entry in interactions:
-        if entry.get("type") == "tool_call":
-            tool_counts[entry["tool_name"]] = tool_counts.get(entry["tool_name"], 0) + 1
-
-    # ── Keyword clusters (topics) ──
-    keyword_freq: dict[str, int] = {}
-    for entry in interactions:
-        if entry.get("type") == "user_message":
-            for kw in entry.get("keywords", []):
-                keyword_freq[kw] = keyword_freq.get(kw, 0) + 1
-
-    # ── Task patterns (tool sequences) ──
-    tool_sequence: list[str] = [
-        e["tool_name"] for e in interactions
-        if e.get("type") == "tool_call"
-    ]
-    task_patterns: dict[str, int] = {}
-    for i in range(len(tool_sequence) - 1):
-        pair = f"{tool_sequence[i]} → {tool_sequence[i+1]}"
-        task_patterns[pair] = task_patterns.get(pair, 0) + 1
-
-    # ── Repetition detection ──
-    # Comparing every message pair is O(n²); bucket by top keyword first so
-    # only messages that could plausibly overlap get compared at all.
-    recent_msgs = [
-        e for e in interactions
-        if e.get("type") == "user_message"
-    ]
-    buckets: dict[str, list[int]] = {}
-    for i, e in enumerate(recent_msgs):
-        for kw in e.get("keywords", [])[:3]:
-            buckets.setdefault(kw, []).append(i)
-
-    repetition_groups: list[list[int]] = []
-    seen_pairs: set[tuple[int, int]] = set()
-    for indices in buckets.values():
-        for bi in range(len(indices)):
-            for bj in range(bi + 1, len(indices)):
-                i, j = indices[bi], indices[bj]
-                pair = (i, j)
-                if pair in seen_pairs:
-                    continue
-                seen_pairs.add(pair)
-                score = _similarity_score(
-                    recent_msgs[i].get("content", ""),
-                    recent_msgs[j].get("content", ""),
-                )
-                if score > 0.6:  # similar enough
-                    repetition_groups.append([i, j])
-
-    # ── Build pattern entries ──
-    new_patterns = []
-
-    # Top tools used
-    for tool, count in sorted(tool_counts.items(), key=lambda x: -x[1]):
-        if count >= 2:
-            existing_match = next(
-                (p for p in existing_patterns
-                 if p.get("type") == "frequent_tool" and p.get("tool") == tool),
-                None,
-            )
-            if existing_match:
-                existing_match["count"] = count
-                existing_match["updated_at"] = time.time()
-            else:
-                new_patterns.append({
-                    "type": "frequent_tool",
-                    "tool": tool,
-                    "count": count,
-                    "detected_at": time.time(),
-                    "updated_at": time.time(),
-                })
-
-    # Repeated keyword clusters (topics)
-    top_keywords = sorted(keyword_freq.items(), key=lambda x: -x[1])[:10]
-    for kw, count in top_keywords:
-        if count >= 2:
-            existing_match = next(
-                (p for p in existing_patterns
-                 if p.get("type") == "topic" and p.get("keyword") == kw),
-                None,
-            )
-            if existing_match:
-                existing_match["count"] = count
-                existing_match["updated_at"] = time.time()
-            else:
-                new_patterns.append({
-                    "type": "topic",
-                    "keyword": kw,
-                    "count": count,
-                    "detected_at": time.time(),
-                    "updated_at": time.time(),
-                })
-
-    # Tool sequence patterns
-    for seq, count in sorted(task_patterns.items(), key=lambda x: -x[1]):
-        if count >= 2:
-            existing_match = next(
-                (p for p in existing_patterns
-                 if p.get("type") == "tool_sequence" and p.get("sequence") == seq),
-                None,
-            )
-            if existing_match:
-                existing_match["count"] = count
-                existing_match["updated_at"] = time.time()
-            else:
-                new_patterns.append({
-                    "type": "tool_sequence",
-                    "sequence": seq,
-                    "count": count,
-                    "detected_at": time.time(),
-                    "updated_at": time.time(),
-                })
-
-    # Repetition patterns
-    if len(repetition_groups) >= 2:
-        rep_keywords = _extract_keywords(
-            recent_msgs[repetition_groups[0][0]].get("content", "")
-        )
-        pattern_id = "_".join(rep_keywords[:3])
-        existing_match = next(
-            (p for p in existing_patterns
-             if p.get("type") == "repetition" and p.get("id") == pattern_id),
-            None,
-        )
-        if existing_match:
-            existing_match["count"] = len(repetition_groups)
-            existing_match["updated_at"] = time.time()
-        else:
-            new_patterns.append({
-                "type": "repetition",
-                "id": pattern_id,
-                "keywords": rep_keywords[:5],
-                "count": len(repetition_groups),
-                "detected_at": time.time(),
-                "updated_at": time.time(),
-            })
-
-    # Merge new patterns with existing
-    merged = existing_patterns + new_patterns
-    # Deduplicate by (type, identifier)
-    seen: set[str] = set()
-    deduped = []
-    for p in merged:
-        key = _pattern_key(p)
-        if key not in seen:
-            seen.add(key)
-            deduped.append(p)
-
-    result = {
-        "patterns": deduped,
-        "analyzed_at": time.time(),
-        "total_interactions": len(interactions),
-        "tool_counts": tool_counts,
-    }
-    _save_json(PATTERNS_FILE, result)
-    return result
-
-
-def _pattern_key(p: dict) -> str:
-    """Generate a unique key for a pattern dict."""
-    t = p.get("type", "")
-    if t == "frequent_tool":
-        return f"tool:{p.get('tool')}"
-    elif t == "topic":
-        return f"topic:{p.get('keyword')}"
-    elif t == "tool_sequence":
-        return f"seq:{p.get('sequence')}"
-    elif t == "repetition":
-        return f"rep:{p.get('id')}"
-    return f"other:{hashlib.md5(json.dumps(p, sort_keys=True).encode()).hexdigest()}"
-
-
-def get_patterns() -> list[dict]:
-    """Get all detected patterns."""
-    data = _load_json(PATTERNS_FILE, {"patterns": []})
-    return data.get("patterns", [])
-
-
-def get_ready_to_generate_skill() -> list[dict]:
-    """
-    Return patterns that have crossed the threshold for skill generation.
-    """
-    patterns = get_patterns()
-    ready = []
-    for p in patterns:
-        count = p.get("count", 0)
-        if count >= PATTERN_TO_SKILL_THRESHOLD:
-            # Check if we already generated a skill for this pattern
-            skill_name = _pattern_to_skill_name(p)
-            skill_path = SKILLS_DIR / f"{skill_name}.md"
-            if not skill_path.exists():
-                ready.append(p)
-    return ready
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  Skill Generation
-# ═══════════════════════════════════════════════════════════════════════
-
-def _pattern_to_skill_name(pattern: dict) -> str:
-    """Convert a pattern to a skill filename (kebab-case)."""
-    ptype = pattern.get("type", "unknown")
-    if ptype == "frequent_tool":
-        return f"frequent-{pattern.get('tool', 'tool')}"
-    elif ptype == "topic":
-        return f"topic-{pattern.get('keyword', 'keyword')}"
-    elif ptype == "tool_sequence":
-        seq = pattern.get("sequence", "tool-pair")
-        return f"sequence-{seq.replace(' → ', '-')}"
-    elif ptype == "repetition":
-        kws = pattern.get("keywords", ["pattern"])
-        return f"pattern-{'-'.join(kws[:3])}"
-    return f"pattern-{int(time.time())}"
-
-
-def generate_skill_for_pattern(pattern: dict) -> Optional[str]:
-    """
-    Generate a SKILL.md file for a detected pattern.
-    Returns the path to the created file, or None if skipped.
-    """
-    skill_name = _pattern_to_skill_name(pattern)
-    skill_file = SKILLS_DIR / f"{skill_name}.md"
-
-    if skill_file.exists():
-        return None
-
-    ptype = pattern.get("type")
-    count = pattern.get("count", 0)
-
-    if ptype == "frequent_tool":
-        tool = pattern.get("tool", "unknown")
-        content = f"""---
-type: auto-generated-skill
-name: {tool}-usage
-description: Guidelines for using the {tool} tool effectively
-generated: {time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-pattern: frequent_tool
-count: {count}
----
-
-# Using `{tool}` Effectively
-
-*This skill was auto-generated because `{tool}` has been used {count} times in this session.*
-
-## Best Practices
-
-- Always verify the path before calling `{tool}`.
-- Use `{tool}` with clear, specific parameters.
-- Check the result of `{tool}` before proceeding to the next step.
-"""
-
-    elif ptype == "topic":
-        kw = pattern.get("keyword", "topic")
-        content = f"""---
-type: auto-generated-skill
-name: topic-{kw}
-description: User frequently asks about {kw}
-generated: {time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-pattern: topic
-count: {count}
----
-
-# Topic: {kw}
-
-*This skill was auto-generated because the topic "{kw}" appeared {count} times.*
-
-## Guidelines
-
-- When the user asks about "{kw}", be thorough and specific.
-- Provide concrete examples related to {kw}.
-- Reference previous solutions involving {kw} when relevant.
-"""
-
-    elif ptype == "tool_sequence":
-        seq = pattern.get("sequence", "tool-a → tool-b")
-        content = f"""---
-type: auto-generated-skill
-name: sequence-{seq[:30]}
-description: Common tool sequence detected: {seq}
-generated: {time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-pattern: tool_sequence
-count: {count}
----
-
-# Tool Sequence: {seq}
-
-*This skill was auto-generated because the sequence "{seq}" was used {count} times.*
-
-## Guidelines
-
-- When starting with `{seq.split(' → ')[0]}`, consider following up with `{seq.split(' → ')[1]}`.
-- This sequence is efficient for the following scenarios:
-  - (List scenarios based on context)
-"""
-
-    elif ptype == "repetition":
-        kws = pattern.get("keywords", ["task"])
-        content = f"""---
-type: auto-generated-skill
-name: pattern-{'-'.join(kws[:2])}
-description: Repeated task pattern: {', '.join(kws[:4])}
-generated: {time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-pattern: repetition
-count: {count}
----
-
-# Task Pattern: {', '.join(kws[:4])}
-
-*This skill was auto-generated because this type of task was repeated {count} times.*
-
-## Approach
-
-1. Understand the specific requirements for this task type.
-2. Follow the established pattern from previous iterations.
-3. Optimise the process based on past feedback.
-
-## Common Pitfalls
-
-- (Detected from user corrections) — will be filled as more data is collected.
-"""
-
-    else:
-        return None
-
-    _ensure_dirs()
-    skill_file.write_text(content, encoding="utf-8")
-
-    # Also register in the skills directory so the agent can find it
-    # We create a symlink or copy to the user's skills directory
-    _register_skill(skill_name, skill_file)
-
-    return str(skill_file)
-
-
-def _register_skill(skill_name: str, skill_file: Path) -> None:
-    """
-    Bookkeeping only. The skill file itself already lives under SKILLS_DIR
-    (== skills_manager.LEARNED_SKILLS_DIR), which skills_manager.SKILL_DIRS
-    scans directly — that's what makes it reach build_skills_section() and
-    the system prompt. This registry is a separate list (skill-registry.json)
-    used only to report counts on the `/si` status screen.
-    """
-    registry = SELF_IMPROVE_DIR / "skill-registry.json"
-    registry_data = _load_json(registry, {"skills": []})
-    # Avoid duplicates
-    for s in registry_data["skills"]:
-        if s.get("name") == skill_name:
-            s["path"] = str(skill_file)
-            _save_json(registry, registry_data)
-            return
-    registry_data["skills"].append({
-        "name": skill_name,
-        "path": str(skill_file),
-        "generated": time.time(),
-    })
-    _save_json(registry, registry_data)
-
-
-def get_auto_generated_skills() -> list[dict]:
-    """Return list of auto-generated skills."""
-    registry = _load_json(SELF_IMPROVE_DIR / "skill-registry.json", {"skills": []})
-    return registry.get("skills", [])
-
-
-def generate_skills_for_all_ready_patterns() -> list[str]:
-    """
-    Generate skills for all patterns that have crossed the threshold.
-    Returns list of created skill file paths.
-    """
-    ready = get_ready_to_generate_skill()
-    created = []
-    for pattern in ready:
-        path = generate_skill_for_pattern(pattern)
-        if path:
-            created.append(path)
-    return created
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  Tip Generation
-# ═══════════════════════════════════════════════════════════════════════
-
-def generate_tips() -> list[dict]:
-    """
-    Analyze patterns and generate self-improvement tips.
-    Returns list of tip dicts.
-    """
-    patterns = get_patterns()
-    interactions = get_recent_interactions(ANALYSIS_WINDOW)
-    tips = _load_json(TIPS_FILE, {"tips": [], "generated_at": 0})
-
-    new_tips: list[dict] = []
-
-    # ── Tool usage tips ──
-    tool_counts: dict[str, int] = {}
-    for p in patterns:
-        if p.get("type") == "frequent_tool":
-            tool_counts[p["tool"]] = p.get("count", 0)
-
-    if tool_counts:
-        most_used = max(tool_counts, key=tool_counts.get)
-        new_tips.append({
-            "type": "tool_usage",
-            "category": "efficiency",
-            "message": f"You frequently use `{most_used}` ({tool_counts[most_used]}×). "
-                       f"Consider creating shortcuts or aliases for this tool.",
-            "generated_at": time.time(),
-            "applied": False,
-        })
-
-    # ── Topic tips ──
-    topic_patterns = [p for p in patterns if p.get("type") == "topic"]
-    if len(topic_patterns) >= 3:
-        topics = [p["keyword"] for p in topic_patterns[:5]]
-        new_tips.append({
-            "type": "topic_cluster",
-            "category": "focus",
-            "message": f"The user often asks about: {', '.join(topics)}. "
-                       f"Keep relevant context ready for these topics.",
-            "generated_at": time.time(),
-            "applied": False,
-        })
-
-    # ── Repetition tips ──
-    rep_patterns = [p for p in patterns if p.get("type") == "repetition"]
-    if rep_patterns:
-        total_reps = sum(p.get("count", 0) for p in rep_patterns)
-        if total_reps >= 3:
-            new_tips.append({
-                "type": "repetition_warning",
-                "category": "learning",
-                "message": f"Detected {total_reps} similar request groups. "
-                           f"Consider creating a reusable skill for this task type.",
-                "generated_at": time.time(),
-                "applied": False,
-            })
-
-    # ── Tool sequence optimisation tip ──
-    seq_patterns = [p for p in patterns if p.get("type") == "tool_sequence"]
-    if seq_patterns:
-        top_seq = max(seq_patterns, key=lambda p: p.get("count", 0))
-        new_tips.append({
-            "type": "sequence_optimisation",
-            "category": "efficiency",
-            "message": f"Common workflow: {top_seq.get('sequence')} ({top_seq.get('count')}×). "
-                       f"Consider batching these operations.",
-            "generated_at": time.time(),
-            "applied": False,
-        })
-
-    # ── Session duration tip ──
-    if interactions:
-        first_ts = interactions[0].get("timestamp", time.time())
-        session_duration = time.time() - first_ts
-        if session_duration > 1800:  # 30 minutes
-            new_tips.append({
-                "type": "session_duration",
-                "category": "productivity",
-                "message": f"Session running for {session_duration / 60:.0f} minutes. "
-                           f"Consider compacting conversation or taking a summary break.",
-                "generated_at": time.time(),
-                "applied": False,
-            })
-
-    # Merge with existing tips
-    all_tips = tips.get("tips", []) + new_tips
-    # Deduplicate by message
-    seen_messages: set[str] = set()
-    deduped = []
-    for t in all_tips:
-        if t["message"] not in seen_messages:
-            seen_messages.add(t["message"])
-            deduped.append(t)
-
-    # Keep only last 20 tips
-    deduped = deduped[-20:]
-
-    result = {
-        "tips": deduped,
-        "generated_at": time.time(),
-        "patterns_analyzed": len(patterns),
-        "interactions_analyzed": len(interactions),
-    }
-    _save_json(TIPS_FILE, result)
-    return deduped
-
-
-def get_tips() -> list[dict]:
-    """Get all generated tips."""
-    data = _load_json(TIPS_FILE, {"tips": []})
-    return data.get("tips", [])
-
-
-def get_active_tips() -> list[dict]:
-    """Get tips that haven't been applied yet."""
-    return [t for t in get_tips() if not t.get("applied")]
-
-
-def mark_tip_applied(tip_index: int) -> bool:
-    """Mark a tip as applied."""
-    data = _load_json(TIPS_FILE, {"tips": []})
-    tips = data.get("tips", [])
-    if 0 <= tip_index < len(tips):
-        tips[tip_index]["applied"] = True
-        data["tips"] = tips
-        _save_json(TIPS_FILE, data)
-        return True
-    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -985,14 +431,19 @@ def update_session_analysis() -> dict:
 def init() -> None:
     """Initialise the self-improvement system."""
     _ensure_dirs()
+    # One-shot: clear the deleted generator's output off this user's disk.
+    try:
+        migrate_remove_generated()
+    except Exception:
+        pass
     # Create initial session analysis
     if not SESSION_FILE.exists():
         update_session_analysis()
 
 
 def record_user_message(content: str, msg_type: str = "text") -> None:
-    """Log a user message. Analysis is triggered separately, after the turn
-    completes (see maybe_analyze_after_turn) — not on this hot path."""
+    """Log a user message. The log is the input to learning/; nothing is
+    derived from it on this hot path."""
     log_user_message(content, msg_type)
 
 
@@ -1002,55 +453,30 @@ def record_tool_call(tool_name: str, args: dict, result_preview: str = "") -> No
 
 
 def maybe_analyze_after_turn() -> None:
-    """Call once per user turn, after the reply has been delivered, so
-    analysis never adds to response latency."""
-    _maybe_analyze(get_recent_interactions(ANALYSIS_WINDOW))
+    """Call once per user turn, after the reply has been delivered.
 
+    The pattern/skill/tip generator that used to run here was deleted in
+    Phase 6. It counted keywords and filled in templates — "when starting
+    with read_file, consider following up with read_file" — writing 28 such
+    files to disk and crowding real skills out of the prompt budget. Nothing
+    consumed its output after Phase 3 removed the injection point.
 
-def _maybe_analyze(interactions: list[dict]) -> None:
-    """Periodically run pattern analysis and skill generation.
-
-    Counts user turns explicitly rather than raw interaction count: the log
-    also contains tool_call entries, so a turn with several tool calls could
-    jump the raw count past a multiple of ANALYZE_INTERVAL and silently skip
-    analysis for that stretch.
+    Session purpose analysis is cheap and still read by /self-improve, so it
+    stays. Genuine learning lives in learning/ (reflection over transcripts).
     """
-    user_turns = sum(1 for i in interactions if i.get("type") == "user_message")
-    if user_turns == 0 or user_turns % ANALYZE_INTERVAL != 0:
-        return
-
-    # Analyze patterns
-    analyze_patterns()
-
-    # Generate skills for patterns that crossed threshold
-    created = generate_skills_for_all_ready_patterns()
-    if created:
-        print(f'  {GREEN}✦{RESET} Auto-generated {len(created)} skill(s):')
-        for path in created:
-            print(f'    {DIM}📄{RESET} {Path(path).name}')
-
-    # Generate tips
-    generate_tips()
-
-    # Update session analysis
     update_session_analysis()
 
 
 def get_self_improve_status() -> str:
     """Return a human-readable status of the self-improvement system."""
     interactions = get_all_interactions()
-    patterns = get_patterns()
-    tips = get_tips()
-    skills = get_auto_generated_skills()
     session = get_session_analysis()
 
     lines = [
         f'  {BOLD}Self-Improvement System{RESET}',
         f'  {DIM}{"─" * 46}{RESET}',
         f'  {CYAN}◈{RESET}  Interactions: {len(interactions)}',
-        f'  {CYAN}◈{RESET}  Patterns:     {len(patterns)}',
-        f'  {CYAN}◈{RESET}  Tips:         {len(tips)} ({len(get_active_tips())} active)',
-        f'  {CYAN}◈{RESET}  Auto-skills:  {len(skills)}',
+        f'  {DIM}   Learning lives in learning/ — see /self-improve facts{RESET}',
         '',
         f'  {BOLD}Session Analysis{RESET}',
         f'  {DIM}Purpose:{RESET}   {session.get("purpose", "unknown")}',
@@ -1059,42 +485,42 @@ def get_self_improve_status() -> str:
         f'  {DIM}Keywords:{RESET}  {", ".join(session.get("keywords", [])[:6])}',
     ]
 
-    if patterns:
-        lines.append('')
-        lines.append(f'  {BOLD}Top Patterns{RESET}')
-        for p in sorted(patterns, key=lambda x: -x.get("count", 0))[:5]:
-            ptype = p.get("type", "?")
-            pcount = p.get("count", 0)
-            if ptype == "frequent_tool":
-                lines.append(f'    {DIM}🔧{RESET} {p.get("tool")} ({pcount}×)')
-            elif ptype == "topic":
-                lines.append(f'    {DIM}📌{RESET} topic: {p.get("keyword")} ({pcount}×)')
-            elif ptype == "tool_sequence":
-                lines.append(f'    {DIM}🔗{RESET} {p.get("sequence")} ({pcount}×)')
-            elif ptype == "repetition":
-                kws = ", ".join(p.get("keywords", [])[:3])
-                lines.append(f'    {DIM}🔁{RESET} repeated: {kws} ({pcount}×)')
-
-    if tips:
-        lines.append('')
-        lines.append(f'  {BOLD}Active Tips{RESET}')
-        active = get_active_tips()
-        if active:
-            for i, t in enumerate(active[:5]):
-                lines.append(f'    {DIM}💡{RESET} {t.get("message", "")}')
-        else:
-            lines.append(f'    {DIM}No active tips.{RESET}')
-
-    if skills:
-        lines.append('')
-        lines.append(f'  {BOLD}Generated Skills{RESET}')
-        for s in skills:
-            lines.append(f'    {DIM}📄{RESET} {s.get("name", "?")}')
-
     return '\n'.join(lines)
 
 
-# Patch for ANSI codes (used by _maybe_analyze output)
+# ═══════════════════════════════════════════════════════════════════════
+#  Migration — remove the deleted generator's output
+# ═══════════════════════════════════════════════════════════════════════
+
+def migrate_remove_generated() -> list[str]:
+    """Delete the pattern generator's leftovers from the user's disk.
+
+    The generator is gone from the code, but its 28 skill files and its
+    tips.json are still in ~/.tomas on every machine that ran an older
+    build. `interactions.jsonl` is kept — learning/ reads it.
+
+    Returns a list of what was removed. Safe to call repeatedly.
+    """
+    import shutil
+    removed: list[str] = []
+    if SKILLS_DIR.is_dir():
+        n = len(list(SKILLS_DIR.glob("*.md")))
+        shutil.rmtree(SKILLS_DIR, ignore_errors=True)
+        removed.append(f"{SKILLS_DIR} ({n} generated skills)")
+    for path in (TIPS_FILE, PATTERNS_FILE, SELF_IMPROVE_DIR / "skill-registry.json"):
+        if path.exists():
+            try:
+                path.unlink()
+                removed.append(str(path))
+            except OSError:
+                pass
+    if TIPS_DIR.is_dir():
+        shutil.rmtree(TIPS_DIR, ignore_errors=True)
+        removed.append(str(TIPS_DIR))
+    return removed
+
+
+# Patch for ANSI codes
 try:
     from agent import GREEN, DIM, RESET, CYAN, YELLOW, BOLD, RED
 except ImportError:
