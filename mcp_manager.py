@@ -100,44 +100,58 @@ def get_server_env(name: str) -> dict[str, str]:
     return cfg.get("env", {})
 
 
-def test_mcp_connections() -> dict[str, dict]:
+def test_mcp_connections(max_workers: int = 8) -> dict[str, dict]:
     """
-    Test connections to all configured MCP servers.
+    Test connections to all configured MCP servers, in parallel.
     Returns {name: {"connected": bool, "error": str, "disabled": bool, "tool_count": int}}
     Does NOT print anything to stderr.
+
+    This ran serially, which made the MCP page cost the *sum* of every
+    server's handshake — 23.3 s with 17 configured, all of it before the menu
+    drew its first row. Connecting is almost entirely waiting on a subprocess
+    or a socket, so the same fan-out `discover_and_connect` already uses
+    brings that down to roughly the slowest single server.
     """
     import io
     from contextlib import redirect_stderr
 
     servers_config = read_mcp_servers()
     results: dict[str, dict] = {}
+    pending: list[tuple[str, dict]] = []
 
-    # Redirect stderr to capture (and discard) connection errors
-    stderr_capture = io.StringIO()
-    with redirect_stderr(stderr_capture):
-        for name, cfg in servers_config.items():
-            disabled = cfg.get("disabled", False)
-            if disabled:
-                results[name] = {"connected": False, "error": None, "disabled": True, "tool_count": 0}
-                continue
-            try:
-                server = MCPServer(name, cfg)
-                ok = server.connect()
-                results[name] = {
-                    "connected": ok,
-                    "error": None if ok else server._last_error,
-                    "disabled": False,
-                    "tool_count": len(server.tools) if ok else 0,
-                }
-                if ok:
-                    server.disconnect()
-            except Exception as exc:
-                results[name] = {
-                    "connected": False,
-                    "error": str(exc),
-                    "disabled": False,
-                    "tool_count": 0,
-                }
+    for name, cfg in servers_config.items():
+        if cfg.get("disabled", False):
+            results[name] = {"connected": False, "error": None,
+                             "disabled": True, "tool_count": 0}
+        else:
+            pending.append((name, cfg))
+
+    def probe(item: tuple[str, dict]) -> tuple[str, dict]:
+        name, cfg = item
+        try:
+            server = MCPServer(name, cfg)
+            ok = server.connect()
+            row = {
+                "connected": ok,
+                "error": None if ok else server._last_error,
+                "disabled": False,
+                "tool_count": len(server.tools) if ok else 0,
+            }
+            if ok:
+                server.disconnect()
+        except Exception as exc:
+            row = {"connected": False, "error": str(exc),
+                   "disabled": False, "tool_count": 0}
+        return name, row
+
+    if pending:
+        # stderr is redirected around the whole fan-out: the worker threads
+        # write their connection noise through the same process-wide stream.
+        with redirect_stderr(io.StringIO()):
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(pending))) as pool:
+                for name, row in pool.map(probe, pending):
+                    results[name] = row
+
     return results
 
 # ═══════════════════════════════════════════════════════════════════════

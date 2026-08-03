@@ -29,6 +29,7 @@ import os
 import sys
 import subprocess
 import shutil
+import threading
 from pathlib import Path
 
 # ── Windows console setup (must run before anything can print) ──
@@ -155,32 +156,37 @@ def update_dotenv(key: str, value: str):
 #  KEYBOARD INPUT
 # ═══════════════════════════════════════════════════════════
 
+_SPECIAL_KEYS = {
+    'H': 'UP', 'P': 'DOWN',
+    'K': 'LEFT', 'M': 'RIGHT',
+    'G': 'HOME', 'O': 'END',
+    'I': 'PGUP', 'Q': 'PGDN',
+    'S': 'DELETE',
+}
+
+
 def get_key():
-    """Read a single keypress. Returns key name or character."""
-    key = msvcrt.getch()
-    if key == b'\xe0':  # Arrow / function keys
-        key = msvcrt.getch()
-        mapping = {
-            b'H': 'UP', b'P': 'DOWN',
-            b'K': 'LEFT', b'M': 'RIGHT',
-            b'G': 'HOME', b'O': 'END',
-            b'I': 'PGUP', b'Q': 'PGDN',
-        }
-        return mapping.get(key, f'FUNC({key[0]})')
-    elif key == b'\r':
+    """Read a single keypress. Returns a key name, or the character typed.
+
+    Reads through `getwch` rather than `getch`: `getch` hands back one *byte*,
+    so a Cyrillic keystroke arrived as an undecodable fragment and was
+    discarded as '?'. The REPL was fixed for this in Phase 7; the menus were
+    not, which is why the type-to-filter binding needs it here.
+    """
+    ch = msvcrt.getwch()
+    if ch in ('\x00', '\xe0'):          # arrow / function key: a second read follows
+        return _SPECIAL_KEYS.get(msvcrt.getwch(), 'FUNC')
+    if ch == '\r':
         return 'ENTER'
-    elif key == b'\x1b':
+    if ch == '\x1b':
         return 'ESC'
-    elif key == b'\x03':
+    if ch == '\x03':
         return 'CTRL_C'
-    elif key == b'\x00':  # Some function keys
-        msvcrt.getch()  # consume second byte
-        return 'FUNC'
-    else:
-        try:
-            return key.decode('utf-8')
-        except UnicodeDecodeError:
-            return '?'
+    if ch in ('\x08', '\x7f'):
+        return 'BACKSPACE'
+    if ch == '\t':
+        return 'TAB'
+    return ch
 
 
 # ═══════════════════════════════════════════════════════════
@@ -206,8 +212,20 @@ BOLD_OFF = '\033[22m'
 
 
 def clear_screen():
-    """Clear the terminal screen."""
-    os.system('cls' if os.name == 'nt' else 'clear')
+    """Clear the terminal screen.
+
+    This used to be `os.system('cls')`, which spawns a whole cmd.exe for the
+    sake of blanking a screen — ~13 ms and a visible flash, paid on every
+    menu open. The TUI already requires ANSI (it is built out of colour and
+    cursor escapes, and enables VT processing at import), so the escape
+    sequence is both faster and flicker-free. `\033[3J` also clears the
+    scrollback, which `cls` does and a bare `\033[2J` does not.
+    """
+    try:
+        sys.stdout.write('\033[H\033[2J\033[3J')
+        sys.stdout.flush()
+    except Exception:
+        os.system('cls' if os.name == 'nt' else 'clear')
 
 
 # ═══════════════════════════════════════════════════════════
@@ -217,92 +235,294 @@ def clear_screen():
 CURSOR_UP_N = '\033[{}A'  # move cursor up N lines
 ERASE_DOWN = '\033[J'     # erase from cursor to end of screen
 
+from text_display import display_width, shorten, strip_ansi, term_columns, term_lines
+
+
+def menu_row_count(item: str, columns: int) -> int:
+    """How many terminal rows `item` occupies once drawn.
+
+    The redraw bug this fixes came from assuming the answer is always 1. It
+    is not: the session browser builds two-row entries (`label + '\\n' +
+    summary`), and any label longer than the window soft-wraps. Both are
+    counted here.
+    """
+    if not item:
+        return 1
+    rows = 0
+    for segment in item.split('\n'):
+        w = display_width(segment)
+        rows += max(1, -(-w // columns)) if columns > 0 else 1
+    return rows
+
+
+def _is_selectable(item: str) -> bool:
+    """Blank spacer rows are drawn but must not be landed on."""
+    return bool(strip_ansi(item or '').strip())
+
+
+def _matches(item: str, needle: str) -> bool:
+    return needle in strip_ansi(item or '').lower()
+
+
+# One footer, so every menu advertises the same keys — and mentions `?`,
+# which is where the rest of them are written down.
+DEFAULT_FOOTER = '↑↓ navigate · Enter select · Esc back · ? keys'
+
+MENU_KEYS = [
+    ("↑ ↓",       "move (blank spacer rows are skipped)"),
+    ("PgUp PgDn", "move a screenful"),
+    ("Home End",  "first / last row"),
+    ("1-9",       "jump to the Nth selectable row"),
+    ("/",         "filter the list · Esc clears the filter"),
+    ("Enter",     "select"),
+    ("Esc ← q",   "back"),
+    ("?",         "this help"),
+]
+
+
+def _show_menu_keys() -> None:
+    """The key overlay. Painted over the menu; the caller repaints after."""
+    clear_screen()
+    budget = max(1, term_columns() - 1)
+    print(f'  {BOLD}Menu keys{RESET}')
+    print(f'  {DIM}{"─" * min(50, budget - 2)}{RESET}')
+    width = max(len(k) for k, _ in MENU_KEYS)
+    for key, desc in MENU_KEYS:
+        print(shorten(f'    {CYAN}{key}{RESET}{" " * (width - len(key) + 2)}{DIM}{desc}{RESET}', budget))
+    print()
+    sys.stdout.write(f'  {DIM}Press any key to go back{RESET}')
+    sys.stdout.flush()
+    get_key()
+
 
 def arrow_menu(title: str, items: list, header_lines: list = None,
                footer: str = None, max_visible: int = 14) -> int:
-    """
-    Show an arrow-key navigable menu with windowed viewport scrolling.
-    Returns the index of the selected item, or -1 if cancelled.
-    Eliminates duplicate menu text artifacts when lists exceed terminal height.
+    """Arrow-key menu with a row-accurate viewport.
+
+    Returns the index of the selected item in `items`, or -1 if cancelled.
+
+    The previous implementation tracked its viewport in *items* and redrew by
+    moving the cursor up `len(visible) + 1` rows. Any item that occupied more
+    than one row — a multi-line session entry, or a label wider than the
+    window — made that number too small, so each redraw started lower than
+    the last one had ended and the list visibly duplicated itself down the
+    screen, leaving stale `▶` cursors behind (that is the reported bug).
+
+    Two changes make it correct rather than nearly correct:
+
+      * every drawn row is truncated to one column short of the terminal, so
+        nothing soft-wraps and the row count is knowable; and
+      * `draw_all` returns the number of rows it actually emitted, and the
+        redraw rewinds by exactly that, then `ERASE_DOWN` clears whatever was
+        below. What gets erased is what was drawn, by construction.
+
+    Keys: ↑↓ move (skipping blank spacers), PgUp/PgDn, Home/End, digits jump,
+    `/` filters, Enter selects, Esc/←/q cancels.
     """
     n = len(items)
     if n == 0:
         return -1
 
-    # Dynamically clamp max_visible to terminal height - header padding
-    try:
-        term_lines = shutil.get_terminal_size().lines
-        max_visible = max(5, min(max_visible, term_lines - 7))
-    except Exception:
-        pass
+    columns = term_columns()
+    line_budget = max(1, columns - 1)   # never touch the last column
+    rows_available = max(4, term_lines() - len(header_lines or (1, 2)) - 3)
+    if max_visible:
+        rows_available = min(rows_available, max(4, max_visible))
 
-    selected = 0
-    scroll_top = 0
+    query = ''
+    filtering = False
+    last_rows = 0
 
-    def get_visible_range(sel: int, top: int) -> tuple[int, int, int]:
-        """Compute (start_idx, end_idx, new_scroll_top) for current selection."""
-        if n <= max_visible:
-            return 0, n, 0
-        if sel < top:
-            top = sel
-        elif sel >= top + max_visible:
-            top = sel - max_visible + 1
-        return top, min(top + max_visible, n), top
+    def visible_indices() -> list[int]:
+        """Item indices eligible to be drawn, honouring the active filter."""
+        if query:
+            return [i for i in range(n) if _is_selectable(items[i])
+                    and _matches(items[i], query)]
+        return list(range(n))
 
-    def draw_all():
-        """Draw (or redraw) the visible window of items + footer."""
-        nonlocal scroll_top
-        start_idx, end_idx, scroll_top = get_visible_range(selected, scroll_top)
-        for i in range(start_idx, end_idx):
-            prefix = f'{GREEN}▶{RESET} ' if i == selected else '  '
-            label = f'{BOLD}{items[i]}{RESET}' if i == selected else items[i]
-            sys.stdout.write(f'{CLEAR_LINE}{prefix}{label}\n')
+    def landable(shown: list[int]) -> list[int]:
+        """Of the drawn rows, the ones the cursor may rest on."""
+        stops = [i for i in shown if _is_selectable(items[i])]
+        return stops or shown
 
-        # Add scroll counter to footer if list is long
-        scroll_indicator = f'  [{selected + 1}/{n}]' if n > max_visible else ''
-        base_footer = footer if footer else '↑↓ navigate · Enter select · Esc cancel'
-        sys.stdout.write(CLEAR_LINE + DIM + base_footer + scroll_indicator + RESET + '\n')
+    shown = visible_indices()
+    stops = landable(shown)
+    selected = stops[0] if stops else 0
+
+    def window(shown: list[int]) -> list[int]:
+        """The slice of `shown` that fits in the row budget, around `selected`."""
+        if not shown:
+            return []
+        try:
+            pos = shown.index(selected)
+        except ValueError:
+            pos = 0
+        start = pos
+        used = menu_row_count(items[shown[pos]], line_budget)
+        end = pos + 1
+        # Grow forwards first, then backwards, so the selection stays put
+        # instead of jumping to the top of the viewport on every keypress.
+        while end < len(shown):
+            cost = menu_row_count(items[shown[end]], line_budget)
+            if used + cost > rows_available:
+                break
+            used += cost
+            end += 1
+        while start > 0:
+            cost = menu_row_count(items[shown[start - 1]], line_budget)
+            if used + cost > rows_available:
+                break
+            used += cost
+            start -= 1
+        return shown[start:end]
+
+    def draw_all() -> int:
+        """Draw the viewport and footer. Returns rows emitted."""
+        rows = 0
+        view = window(shown)
+        for i in view:
+            chosen = (i == selected)
+            for k, segment in enumerate((items[i] or '').split('\n')):
+                if k == 0:
+                    prefix = f'{GREEN}▶{RESET} ' if chosen else '  '
+                    body = f'{BOLD}{segment}{RESET}' if chosen else segment
+                else:
+                    prefix, body = '  ', segment
+                line = shorten(prefix + body, line_budget)
+                sys.stdout.write(CLEAR_LINE + line + RESET + '\n')
+                rows += 1
+
+        if filtering:
+            base = f'/{query}{DIM}  ({len(stops)} match){RESET}'
+        else:
+            base = footer if footer else DEFAULT_FOOTER
+            if len(view) < len(shown):
+                here = (stops.index(selected) + 1) if selected in stops else 0
+                base += f'  [{here}/{len(stops)}]'
+        sys.stdout.write(CLEAR_LINE + DIM + shorten(base, line_budget) + RESET + '\n')
+        return rows + 1
+
+    def redraw():
+        nonlocal last_rows
+        if last_rows:
+            sys.stdout.write(CURSOR_UP_N.format(last_rows) + ERASE_DOWN)
+        last_rows = draw_all()
         sys.stdout.flush()
 
+    def move(step: int):
+        """Advance the cursor by `step` landable rows, wrapping at the ends."""
+        nonlocal selected
+        if not stops:
+            return
+        try:
+            pos = stops.index(selected)
+        except ValueError:
+            pos = 0
+        selected = stops[(pos + step) % len(stops)]
+
+    def refilter():
+        nonlocal shown, stops, selected
+        shown = visible_indices()
+        stops = landable(shown)
+        if stops and selected not in stops:
+            selected = stops[0]
+
     def draw_header():
-        """Print the title/header lines (used before first draw)."""
         if header_lines:
             for line in header_lines:
-                print(line)
+                print(shorten(line, line_budget))
         else:
-            print(f'{BOLD}{title}{RESET}')
-            print('─' * 50)
+            print(f'{BOLD}{shorten(title, line_budget)}{RESET}')
+            print('─' * min(50, line_budget))
+
+    def full_redraw():
+        """Repaint everything, header included, and re-anchor the rewind.
+
+        `redraw` rewinds by `last_rows`, which is only meaningful while the
+        rows below the header are the last thing on screen. Anything that
+        paints over the whole screen — the key overlay — has to come back
+        through here, or the next rewind lands in the middle of it.
+        """
+        nonlocal last_rows
+        clear_screen()
+        draw_header()
+        last_rows = draw_all()
+        sys.stdout.flush()
 
     # ── First draw ──
     sys.stdout.write(HIDE_CURSOR)
-    clear_screen()
-    draw_header()
-    draw_all()
+    full_redraw()
+
+    def leave(result: int) -> int:
+        sys.stdout.write(SHOW_CURSOR)
+        sys.stdout.flush()
+        return result
 
     # ── Event loop ──
     while True:
         key = get_key()
-        if key in ('UP', 'DOWN'):
-            old_start, old_end, _ = get_visible_range(selected, scroll_top)
-            visible_count = old_end - old_start
-            block_lines = visible_count + 1  # items + footer
 
-            if key == 'UP':
-                selected = (selected - 1) % n
+        # Filter mode captures text; everything else is a normal binding.
+        if filtering and key not in ('ENTER', 'ESC', 'UP', 'DOWN', 'CTRL_C'):
+            if key == 'BACKSPACE':
+                query = query[:-1]
+            elif isinstance(key, str) and len(key) == 1 and key.isprintable():
+                query += key.lower()
             else:
-                selected = (selected + 1) % n
+                continue
+            refilter()
+            redraw()
+            continue
 
-            # Move cursor up to top of visible block and re-render
-            sys.stdout.write(CURSOR_UP_N.format(block_lines))
-            draw_all()
-
-        elif key in ('ENTER',):
-            sys.stdout.write(SHOW_CURSOR)
-            return selected
-
-        elif key in ('ESC', 'q', 'CTRL_C'):
-            sys.stdout.write(SHOW_CURSOR)
-            return -1
+        if key == 'UP':
+            move(-1)
+            redraw()
+        elif key == 'DOWN':
+            move(1)
+            redraw()
+        elif key == 'PGUP':
+            move(-max(1, len(window(shown)) - 1))
+            redraw()
+        elif key == 'PGDN':
+            move(max(1, len(window(shown)) - 1))
+            redraw()
+        elif key == 'HOME':
+            if stops:
+                selected = stops[0]
+            redraw()
+        elif key == 'END':
+            if stops:
+                selected = stops[-1]
+            redraw()
+        elif key == 'ENTER':
+            if filtering:
+                filtering = False
+                redraw()
+                if not stops:
+                    continue
+            return leave(selected)
+        elif key == 'ESC':
+            if filtering or query:
+                filtering, query = False, ''
+                refilter()
+                redraw()
+                continue
+            return leave(-1)
+        elif key in ('LEFT', 'q', 'CTRL_C'):
+            return leave(-1)
+        elif key == '/':
+            filtering, query = True, ''
+            refilter()
+            redraw()
+        elif key == '?':
+            _show_menu_keys()
+            full_redraw()
+        elif isinstance(key, str) and key.isdigit() and key != '0':
+            # Jump to the Nth selectable row — the menus are numbered lists.
+            target = int(key) - 1
+            if target < len(stops):
+                selected = stops[target]
+                redraw()
 
 
 def confirm_menu(title: str, items: list, header_lines: list = None,
@@ -316,16 +536,61 @@ def confirm_menu(title: str, items: list, header_lines: list = None,
 # ═══════════════════════════════════════════════════════════
 
 def show_info_page(title: str, lines: list, prompt: str = "Press any key to go back"):
-    """Display a page of info and wait for a keypress."""
-    clear_screen()
-    print(f'{BOLD}{title}{RESET}')
-    print('─' * 50)
+    """Display a page of info, scrollable, and wait for the user to leave.
+
+    Two fixes over the previous version, which printed everything and waited
+    on a bare `msvcrt.getch()`:
+
+    * **It scrolls.** The tools and skills pages are far longer than a
+      terminal, so their first screens used to scroll off the top before the
+      user could read them, with no way back.
+    * **It consumes whole keys.** `getch()` returns one byte, and an arrow key
+      sends two. The orphaned second byte stayed in the buffer and was read by
+      the *next* menu as a phantom keypress, moving the selection on its own.
+    """
+    columns = term_columns()
+    budget = max(1, columns - 1)
+    body = []
     for line in lines:
-        print(line)
-    print()
-    sys.stdout.write(DIM + prompt + '...' + RESET)
-    sys.stdout.flush()
-    msvcrt.getch()  # wait for any key
+        body.extend((line or '').split('\n'))
+
+    top = 0
+    while True:
+        page = max(3, term_lines() - 5)
+        top = max(0, min(top, max(0, len(body) - page)))
+        clear_screen()
+        print(f'{BOLD}{shorten(title, budget)}{RESET}')
+        print('─' * min(50, budget))
+        for line in body[top:top + page]:
+            print(shorten(line, budget))
+
+        more = len(body) > page
+        if more:
+            hint = (f'{DIM}{top + 1}-{min(top + page, len(body))} of {len(body)}'
+                    f'  ·  ↑↓ PgUp/PgDn scroll  ·  Esc back{RESET}')
+        else:
+            hint = DIM + prompt + '...' + RESET
+        print()
+        sys.stdout.write(shorten(hint, budget))
+        sys.stdout.flush()
+
+        key = get_key()
+        if not more:
+            return
+        if key in ('ESC', 'ENTER', 'q', 'LEFT', 'CTRL_C'):
+            return
+        if key == 'UP':
+            top -= 1
+        elif key == 'DOWN':
+            top += 1
+        elif key == 'PGUP':
+            top -= page
+        elif key == 'PGDN':
+            top += page
+        elif key == 'HOME':
+            top = 0
+        elif key == 'END':
+            top = len(body)
 
 
 def prompt_text(prompt: str, default: str = None) -> str:
@@ -488,7 +753,7 @@ def _choose_provider_to_switch() -> bool:
     display.append(f'  {RED}✕{RESET}  Cancel')
 
     idx = arrow_menu('Switch Active Provider', display,
-                     footer='↑↓ navigate · Enter select · Esc cancel')
+                     footer=DEFAULT_FOOTER)
     if idx < 0 or idx >= len(providers):
         return False
 
@@ -603,10 +868,41 @@ def page_mcps():
         get_server_env, cmd_mcp_env, test_mcp_connections,
     )
 
-    # Cache for connection test results: {name: {"connected": bool, "error": str, "disabled": bool, "tool_count": int}}
-    test_results = test_mcp_connections()
+    # Connection status is expensive (it starts every configured server), so
+    # the page never waits for it: a fresh result is reused, otherwise the
+    # probe runs on a background thread and the menu draws immediately with
+    # `[testing…]`. This page used to block for 23.3 s before its first row.
+    import net_probe
+
+    MCP_STATUS_KEY, MCP_STATUS_TTL = 'mcp_status', 90.0
+    probing = {'running': False}
+
+    def start_probe():
+        if probing['running']:
+            return
+        probing['running'] = True
+
+        def work():
+            try:
+                net_probe.put(MCP_STATUS_KEY, test_mcp_connections())
+            except Exception:
+                net_probe.put(MCP_STATUS_KEY, {})
+            finally:
+                probing['running'] = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    fresh, test_results = net_probe.peek(MCP_STATUS_KEY, MCP_STATUS_TTL)
+    if not fresh:
+        test_results = {}
+        start_probe()
 
     while True:
+        # Pick up whatever the background probe has finished by now.
+        got, latest = net_probe.peek(MCP_STATUS_KEY, MCP_STATUS_TTL)
+        if got:
+            test_results = latest
+
         servers = read_mcp_servers()
         items = []
         server_names = []
@@ -620,7 +916,9 @@ def page_mcps():
             if n_ok: status_parts.append(f'{GREEN}{n_ok} OK{RESET}')
             if n_fail: status_parts.append(f'{RED}{n_fail} fail{RESET}')
             if n_disabled: status_parts.append(f'{DIM}{n_disabled} disabled{RESET}')
-            status_str = ', '.join(status_parts)
+            if probing['running']:
+                status_parts.append(f'{DIM}testing…{RESET}')
+            status_str = ', '.join(status_parts) or f'{DIM}not tested yet{RESET}'
             items.append(f'  ⟳ Refresh connections  ({status_str})')
             # NOTE: do NOT add to server_names for the test row
 
@@ -690,11 +988,12 @@ def page_mcps():
             clear_screen()
             print(f'{BOLD}Testing MCP connections...{RESET}')
             print('─' * 50)
-            print('Connecting to each server (this may take a moment)...')
+            print(f'Connecting to {len(servers)} server(s) in parallel...')
             print()
-            import sys as _sys
-            _sys.stdout.flush()
+            sys.stdout.flush()
+            net_probe.invalidate(MCP_STATUS_KEY)
             test_results = test_mcp_connections()
+            net_probe.put(MCP_STATUS_KEY, test_results)
             # Show results
             lines = ['  Results:', '']
             for name in sorted(test_results.keys()):
@@ -943,7 +1242,7 @@ def _mcp_add_server_interactive():
         '',
     ]
     tidx = arrow_menu('', transport_items, header_lines=transport_header,
-                      footer='↑↓ navigate · Enter select · Esc cancel')
+                      footer=DEFAULT_FOOTER)
     if tidx < 0 or tidx >= 2:
         return
     is_http = (tidx == 0)
@@ -1361,14 +1660,20 @@ def page_configure_provider():
         'Custom / Other',
     ]
     # Probe for a local Ollama so the option can say whether it is there.
+    # Cached: without it this page paid 12.3 s on every open, because a
+    # missing Ollama meant three HTTP attempts that each ran to their timeout.
+    import net_probe
     import provider_manager
-    ollama_models: list[str] = []
-    try:
-        ollama_models = provider_manager.list_models(provider_manager.Provider(
-            name='Ollama (local)', type='ollama',
-            base_url=provider_manager.OLLAMA_DEFAULT_URL))
-    except Exception:
-        pass
+
+    def _probe_ollama() -> list[str]:
+        try:
+            return provider_manager.list_models(provider_manager.Provider(
+                name='Ollama (local)', type='ollama',
+                base_url=provider_manager.OLLAMA_DEFAULT_URL))
+        except Exception:
+            return []
+
+    ollama_models = net_probe.cached('ollama_models', 30.0, _probe_ollama)
 
     # Show ✓ for already-configured providers
     display = []
@@ -1383,7 +1688,7 @@ def page_configure_provider():
             display.append(f'  {p}{suffix}')
 
     idx = arrow_menu('Connect / Configure Provider', display,
-                     footer='↑↓ navigate · Enter select · Esc cancel')
+                     footer=DEFAULT_FOOTER)
     if idx < 0:
         return
 
@@ -1476,7 +1781,7 @@ def page_configure_provider():
             return
         m_idx = arrow_menu('Ollama — choose a model',
                            [f'  {m}' for m in ollama_models],
-                           footer='↑↓ navigate · Enter select · Esc cancel')
+                           footer=DEFAULT_FOOTER)
         if m_idx < 0:
             return
         model = ollama_models[m_idx]
@@ -1568,7 +1873,9 @@ def _zen_setup_proxy():
         import time
         time.sleep(0.5)
 
-        if check_status(port):
+        # Never cached: this is the check that decides whether the start we
+        # just performed worked, so a stale "not running" would be a lie.
+        if check_status(port, use_cache=False):
             update_dotenv("ANTHROPIC_API_KEY", "oc-zen-proxy")
             update_dotenv("ANTHROPIC_BASE_URL", f"http://127.0.0.1:{port}")
             update_dotenv("ANTHROPIC_EXTRA_HEADERS", "")
@@ -1849,7 +2156,7 @@ def _show_filtered_model_menu(model_entries, label, current, initial_query=None)
     f_values = [e[1] for e in filtered]
     idx = arrow_menu(f'Search Results: "{query}"  ({label})',
                      f_display,
-                     footer='↑↓ navigate · Enter select · Esc cancel')
+                     footer=DEFAULT_FOOTER)
     if idx < 0:
         return  # back to main menu
     selected = f_values[idx]
@@ -1927,7 +2234,7 @@ def page_choose_model():
     values = [e[1] for e in model_entries]
     idx = arrow_menu(f'Choose Model  ({label}) — current: {current}',
                      display,
-                     footer='↑↓ navigate · Enter select · Esc cancel')
+                     footer=DEFAULT_FOOTER)
     if idx < 0:
         return
     selected = values[idx]
@@ -2038,7 +2345,7 @@ def _fetch_openrouter_models():
     values = [e[1] for e in entries]
     idx = arrow_menu(f'OpenRouter Models ({len(entries)} available, showing first 150)',
                      display[:150],
-                     footer='↑↓ navigate · Enter select · Esc cancel')
+                     footer=DEFAULT_FOOTER)
     if idx < 0:
         return
     model = values[idx]

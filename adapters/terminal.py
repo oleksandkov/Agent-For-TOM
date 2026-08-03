@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
 
 # On a non-UTF-8 console codepage (cp1251/cp1252/cp437) the glyphs below raise
 # UnicodeEncodeError. agent.py does this too at import, but the adapter must
@@ -38,7 +40,7 @@ from core.events import (
 )
 from core.permissions import Decision
 from text_display import (
-    display_width, shorten, strip_ansi, term_width, wrap,
+    StreamWrap, display_width, shorten, strip_ansi, term_width, wrap,
 )
 
 from .ansi import BOLD, DIM, GREEN, MAGENTA, RED, RESET, YELLOW
@@ -76,6 +78,60 @@ def summarise_args(name: str, args: dict) -> str:
     return shorten(rendered, max(20, term_width() - 40))
 
 
+class Thinking:
+    """A one-line 'working' indicator for the wait before the first token.
+
+    Between sending a request and the first delta there is nothing on screen —
+    several seconds of apparently-dead terminal that reads as a hang. This
+    occupies exactly one line, erases itself completely, and never runs when
+    output is not a terminal (so transcripts and tests stay clean).
+    """
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, label: str = "thinking"):
+        self.label = label
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        try:
+            if not sys.stdout.isatty():
+                return
+        except Exception:
+            return
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+
+    def _spin(self) -> None:
+        i = 0
+        started = time.monotonic()
+        while not self._stop.wait(0.08):
+            frame = self.FRAMES[i % len(self.FRAMES)]
+            secs = time.monotonic() - started
+            elapsed = f" {secs:.0f}s" if secs >= 3 else ""
+            try:
+                sys.stdout.write(f"\r\033[2K  {DIM}{frame} {self.label}{elapsed}{RESET}")
+                sys.stdout.flush()
+            except Exception:
+                return
+            i += 1
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=0.3)
+        self._thread = None
+        try:
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+
 class TerminalAdapter:
     """Drives a run_turn generator, printing as it goes."""
 
@@ -83,6 +139,8 @@ class TerminalAdapter:
         self.interactive = interactive
         self._streaming_header_shown = False
         self._non_interactive_notice_shown = False
+        self._stream: StreamWrap | None = None
+        self._thinking: Thinking | None = None
 
     # ── Driving ────────────────────────────────────────────────────
 
@@ -101,21 +159,40 @@ class TerminalAdapter:
         """Render an already-built generator. Prefer run() — with drive() the
         caller is responsible for having set state.responder."""
         reply = ""
-        for event in gen:
-            self.render(event)
-            if isinstance(event, TurnFinished):
-                reply = event.reply
+        # Started before the first `next()`, which is where the request is
+        # actually sent and where all the waiting happens.
+        self._thinking = Thinking()
+        self._thinking.start()
+        try:
+            for event in gen:
+                self.render(event)
+                if isinstance(event, TurnFinished):
+                    reply = event.reply
+        finally:
+            self._stop_thinking()
         return reply
+
+    def _stop_thinking(self) -> None:
+        if self._thinking is not None:
+            self._thinking.stop()
+            self._thinking = None
 
     # ── Rendering ──────────────────────────────────────────────────
 
     def render(self, event) -> None:
+        # Any output at all means the wait is over.
+        if not isinstance(event, TextDelta) or not self._streaming_header_shown:
+            self._stop_thinking()
+
         if isinstance(event, TextDelta):
             if not self._streaming_header_shown:
                 print(f'  {MAGENTA}{BOLD}▌ TOMAS{RESET}')
-                print('  ', end='', flush=True)
+                sys.stdout.write('  ')
                 self._streaming_header_shown = True
-            sys.stdout.write(event.text)
+                self._stream = StreamWrap(indent='  ')
+            # Wrapped as it arrives, so a streamed reply is laid out exactly
+            # like a non-streamed one instead of running off the right edge.
+            sys.stdout.write(self._stream.feed(event.text))
             sys.stdout.flush()
 
         elif isinstance(event, AssistantMessage):
@@ -153,6 +230,10 @@ class TerminalAdapter:
                     shown += ' …'
                 mark = f'{GREEN}↳{RESET}' if event.ok else f'{RED}↳{RESET}'
                 print(f'    {mark} {DIM}{shown}{RESET}')
+            # The model is about to be called again with this result; that
+            # wait is the same dead air the indicator exists for.
+            self._thinking = Thinking()
+            self._thinking.start()
 
         elif isinstance(event, ToolResultTruncated):
             print(f'    {RED}⚠{RESET}  tool result truncated: '
@@ -183,12 +264,16 @@ class TerminalAdapter:
 
     def _end_stream_line(self) -> None:
         if self._streaming_header_shown:
+            if self._stream is not None:
+                sys.stdout.write(self._stream.flush())   # the last held word
+                self._stream = None
             print()
             self._streaming_header_shown = False
 
     # ── Answering the core's questions ─────────────────────────────
 
     def ask(self, event) -> Decision:
+        self._stop_thinking()   # never prompt underneath a spinner
         if not self.interactive:
             # Say it once, not once per call. Six silent denials in a row is
             # what made a turn look broken rather than unattended.
@@ -216,6 +301,7 @@ class TerminalAdapter:
 
     def ask_continue(self, event) -> bool:
         """The turn used its budget. Ask rather than abandon the task."""
+        self._stop_thinking()
         if not self.interactive:
             print(f'  {DIM}non-interactive — continuing automatically{RESET}')
             return True

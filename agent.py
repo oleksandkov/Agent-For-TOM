@@ -52,13 +52,15 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# Try to import Playwright
-try:
-    from playwright.async_api import async_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
-    async_playwright = None
+# Playwright for browser-based fetching (JavaScript rendering).
+# Whether it is installed is answered from the import system's metadata
+# instead of by importing it: the package costs ~105 ms to load, and the CLI
+# menus only ever need the boolean. The tools that drive a browser import it
+# themselves, at the point they are about to use it.
+import importlib.util
+
+PLAYWRIGHT_AVAILABLE = importlib.util.find_spec("playwright") is not None
+async_playwright = None  # bound on demand by the browser tools
 
 # Load variables from .env into os.environ if present.
 try:
@@ -68,14 +70,12 @@ except ImportError:
     # python-dotenv not installed — rely on real env vars instead.
     pass
 
-# Playwright for browser-based fetching (JavaScript rendering)
-try:
-    from playwright.async_api import async_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
-
-import anthropic
+# NOTE: `anthropic` is deliberately *not* imported here. It is the single
+# most expensive import in the project — 1.13 s of the CLI's 1.66 s cold
+# start — and the menus never touch it: they import TOOLS, RISK_LEVELS and
+# build_system_prompt from this module and go straight to drawing. It is
+# imported where it is used, in `_get_client` (and already lazily in
+# `core/loop.py`), so only a session that actually talks to a model pays it.
 
 # MCP and skills support
 from mcp_manager import MCPManager
@@ -225,6 +225,7 @@ def _get_client():
         client = None
 
     if client is None:
+        import anthropic  # deferred: see the note at the top of this module
         headers = json.loads(extra_hdr) if extra_hdr else None
         client = anthropic.Anthropic(
             api_key=key or None,
@@ -259,7 +260,7 @@ def _ensure_zen_proxy():
                 start_proxy(6446, daemon=True)
                 import time
                 time.sleep(0.5)
-                if check_status(6446):
+                if check_status(6446, use_cache=False):  # verifies our own start
                     print(f'  {GREEN}✓{RESET}  Zen proxy is running')
                 else:
                     print(f'  {YELLOW}⚠{RESET}  Zen proxy may not have started')
@@ -1084,6 +1085,7 @@ def handle_fetch_url_with_browser(params: dict) -> str:
             return f"Error: blocked URL pattern: {pattern}"
 
     async def _fetch():
+        from playwright.async_api import async_playwright  # deferred, see top
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             try:
@@ -1995,11 +1997,29 @@ def _get_model() -> str:
     return os.environ.get("AGENT_MODEL") or "Not set"
 
 
+# The keys the prompt actually binds. Kept next to the help renderer so a new
+# binding cannot be added without the place users look to find it.
+KEY_HELP = [
+    ("Enter",        "send · accepts the highlighted /command"),
+    ("Tab",          "complete a /command · otherwise cycle mode"),
+    ("↑ ↓",          "history · moves the /command selection"),
+    ("Esc",          "clear the line"),
+    ("Ctrl+W",       "delete the last word"),
+    ("Ctrl+U",       "clear the line"),
+    ("Ctrl+L",       "clear the screen, keep what is typed"),
+    ("Ctrl+C",       "cancel"),
+    ("⇧+Space",      "toggle auto-approve"),
+    ("F5 F6 F7 F8",  "auto · default · strict · yolo"),
+]
+
+
 def _show_commands(match: str = "") -> str:
     """Build a formatted help string for matching slash commands."""
+    from text_display import rule
+
     lines = []
     lines.append(f'  {BOLD}Available commands{RESET}')
-    lines.append(f'  {DIM}{"─" * 46}{RESET}')
+    lines.append(f'  {DIM}{rule()}{RESET}')
     for cmd, info in sorted(SLASH_COMMANDS.items()):
         if match and not cmd.startswith(match.lower()):
             continue
@@ -2007,9 +2027,19 @@ def _show_commands(match: str = "") -> str:
         desc = info["desc"]
         padded = " " * max(1, 12 - len(cmd))
         lines.append(f'    {DIM}{icon}{RESET}  {CYAN}/{cmd}{RESET}{padded}{DIM}{desc}{RESET}')
+
+    # Only when showing everything: filtered output is an answer to a specific
+    # question, and a key table underneath it is just noise.
+    if not match:
+        lines.append('')
+        lines.append(f'  {BOLD}Keys{RESET}')
+        lines.append(f'  {DIM}{rule()}{RESET}')
+        width = max(len(k) for k, _ in KEY_HELP)
+        for key, desc in KEY_HELP:
+            lines.append(f'    {CYAN}{key}{RESET}{" " * (width - len(key) + 2)}{DIM}{desc}{RESET}')
+
     lines.append('')
     lines.append(f'  {DIM}Type{RESET} {CYAN}/command{RESET} {DIM}to run — or just{RESET} {CYAN}/{RESET} {DIM}to see all{RESET}')
-    lines.append(f'  {DIM}⇧+Space{RESET} {DIM}toggle  ·  {DIM}F5/6/7/8{RESET} {DIM}auto / default / strict / yolo{RESET}')
     return '\n'.join(lines)
 
 
@@ -2719,9 +2749,18 @@ def read_input_with_suggestions(prompt: str) -> str:
             text = '  ' + '  '.join(parts) + mode_str
             selected = None
 
-        # Move to the line below, clear it, print, return
+        # Move to the line below, clear it, print, return.
+        #
+        # The hint has to fit on exactly one row. `_refresh` already keeps the
+        # input line from wrapping, but this line was written untruncated —
+        # and with no matches it lists every slash command, which is far wider
+        # than any terminal. It soft-wrapped onto a second row while the
+        # `\033[1A` below rewound only one, so the cursor came back a row low
+        # and the next redraw drew *under* the previous one: the same
+        # duplication the menus had, in the chat.
+        from text_display import shorten, term_columns
         sys.stdout.write('\033[1B\r\033[2K')
-        sys.stdout.write(text)
+        sys.stdout.write(shorten(text, max(1, term_columns() - 1)))
         sys.stdout.write('\033[1A\r')
         _refresh()
         showing = True
@@ -2866,6 +2905,41 @@ def read_input_with_suggestions(prompt: str) -> str:
                         _show()
                     else:
                         _hide()
+                continue
+
+            # ── Ctrl+W — delete the word before the cursor ────────────────
+            # This buffer has no intra-line cursor, so backspace is the only
+            # way to correct a long prompt one character at a time. Ctrl+W and
+            # Ctrl+U are the two readline keys that pay off without one.
+            if ch == '\x17':
+                while buffer and buffer[-1].isspace():
+                    buffer.pop()
+                while buffer and not buffer[-1].isspace():
+                    buffer.pop()
+                selected = None
+                _refresh()
+                _show() if _is_slash() else _hide()
+                continue
+
+            # ── Ctrl+U — clear the input line ─────────────────────────────
+            if ch == '\x15':
+                if buffer:
+                    buffer.clear()
+                    selected = None
+                    _hide()
+                    _refresh()
+                continue
+
+            # ── Ctrl+L — clear the screen, keep what was typed ─────────────
+            # Standard everywhere, and the honest way out of a terminal that
+            # some other program has left dirty. `\033[3J` drops the scrollback
+            # too, so the chat restarts from a genuinely clean screen.
+            if ch == '\x0c':
+                _hide()
+                sys.stdout.write('\033[H\033[2J\033[3J')
+                _refresh()
+                if _is_slash():
+                    _show()
                 continue
 
             # ── Escape — clear whole input ────────────────────────────────

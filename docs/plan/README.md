@@ -1,6 +1,6 @@
 # TOMAS Implementation Plan
 
-Seven phases, in dependency order. Each file is self-contained: problem statement, evidence from the codebase, why it matters, step-by-step implementation with code, tests, and acceptance criteria.
+Eight phases, in dependency order. Each file is self-contained: problem statement, evidence from the codebase, why it matters, step-by-step implementation with code, tests, and acceptance criteria.
 
 | Phase | File | Goal | Effort |
 |---|---|---|---|
@@ -8,9 +8,10 @@ Seven phases, in dependency order. Each file is self-contained: problem statemen
 | 1 | [PHASE-1-close-the-loop.md](PHASE-1-close-the-loop.md) | Make the self-improvement system actually affect behaviour | ~1 week |
 | 2 | [PHASE-2-core-ui-split.md](PHASE-2-core-ui-split.md) | Separate the engine from the terminal; make it testable | 1-2 weeks |
 | 3 | [PHASE-3-real-learning.md](PHASE-3-real-learning.md) | Replace keyword counting with genuine learning | 2-3 weeks |
-| 4 | [PHASE-4-providers-and-extensions.md](PHASE-4-providers-and-extensions.md) | Any provider, smarter MCP, uniform skills | 1-2 weeks |
+| 4 | [PHASE-4-providers-and-extensions.md](PHASE-4-providers-and-extensions.md) | Any provider, smarter MCP, uniform skills | 1-2 weeks · **done** |
 | 5 | [PHASE-5-desktop-app.md](PHASE-5-desktop-app.md) | Desktop app as a thin adapter, not a rewrite | 3-4 weeks |
-| 6 | [PHASE-6-hardening-from-simulation.md](PHASE-6-hardening-from-simulation.md) | Fix what 16 real sessions actually broke on | ~1.5 weeks |
+| 6 | [PHASE-6-hardening-from-simulation.md](PHASE-6-hardening-from-simulation.md) | Fix what 16 real sessions actually broke on | ~1.5 weeks · **done** |
+| 7 | [PHASE-7-chat-and-cyrillic.md](PHASE-7-chat-and-cyrillic.md) | A calmer, faster chat — and real Ukrainian/Russian support | ~1.5 weeks · **done** |
 
 ## Rules that apply to every phase
 
