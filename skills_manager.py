@@ -12,10 +12,13 @@ from typing import Optional
 
 # ── skill directories (searched in order) ────────────────────────────
 
+LEARNED_SKILLS_DIR = Path.home() / ".tomas" / "self-improve" / "skills"
+
 SKILL_DIRS = [
     Path.home() / ".claude" / "skills",
     Path.home() / ".agents" / "skills",
     Path.home() / "AppData" / "Roaming" / "Code" / "User" / "prompts",
+    LEARNED_SKILLS_DIR,  # skills the agent generated for itself (self_improve.py)
 ]
 
 
@@ -92,6 +95,7 @@ def discover_skills() -> list[dict]:
                     "file": skill_file,
                     "description": desc,
                     "content": body,
+                    "learned": skills_dir == LEARNED_SKILLS_DIR,
                 }
             )
 
@@ -115,31 +119,9 @@ def build_skills_section() -> str:
         "",
     ]
     for s in skills:
-        lines.append(f"- **{s['name']}**: {s['description']}")
+        origin = " *(learned from your past sessions)*" if s.get("learned") else ""
+        lines.append(f"- **{s['name']}**: {s['description']}{origin}")
     lines.append("")
-    return "\n".join(lines)
-
-
-def load_skills_content() -> str:
-    """
-    Load ALL skill contents into a single string for injection into
-    the system prompt. This gives the agent full knowledge of every skill.
-    """
-    skills = discover_skills()
-    if not skills:
-        return ""
-
-    lines = ["# Loaded Skills", ""]
-    for s in skills:
-        lines.append(f"## {s['name']}")
-        if s["description"]:
-            lines.append(f"*{s['description']}*")
-            lines.append("")
-        lines.append(s["content"])
-        lines.append("")
-        lines.append("---")
-        lines.append("")
-
     return "\n".join(lines)
 
 

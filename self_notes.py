@@ -366,10 +366,11 @@ def auto_generate_note(
 #  Context injection
 # ═══════════════════════════════════════════════════════════════
 
-def get_notes_for_context() -> str:
-    """Return all notes as a formatted string for injection into the system prompt.
+def render_notes_for_display() -> str:
+    """Terminal rendering of self-notes — titles only, ANSI-styled.
 
-    Only returns non-auto-generated notes (the agent's own reflections).
+    Not for the system prompt (see get_notes_for_context): this is for
+    human-facing display.
     """
     notes = list_notes(limit=100)
     if not notes:
@@ -390,7 +391,49 @@ def get_notes_for_context() -> str:
     return "\n".join(lines)
 
 
-# Patch for ANSI codes (used by get_notes_for_context)
+def _rank_by_relevance(notes: list[dict], query: str) -> list[dict]:
+    """Rank notes by keyword overlap with the query.
+
+    v1 stand-in for Phase 3's shared retrieval function — keep the
+    (notes, query) shape stable so that swap is a one-line change.
+    """
+    query_words = set(re.findall(r"\w+", query.lower()))
+    if not query_words:
+        return notes
+
+    def score(n: dict) -> int:
+        haystack = f"{n.get('title', '')} {' '.join(n.get('tags', []))}".lower()
+        return len(query_words & set(re.findall(r"\w+", haystack)))
+
+    return sorted(notes, key=score, reverse=True)
+
+
+def get_notes_for_context(query: str = "", k: int = 5) -> str:
+    """Plain-text note content for injection into the system prompt.
+
+    With a query, returns only the most relevant notes; without one, the
+    k most recent. Only non-auto-generated notes (the agent's own
+    reflections). Never returns decoration, never returns a bare header.
+    """
+    notes = [n for n in list_notes(limit=100) if not n.get("auto_generated")]
+    if not notes:
+        return ""
+    if query:
+        notes = _rank_by_relevance(notes, query)[:k]
+    else:
+        notes = notes[:k]
+
+    lines = ["# Notes I've written to myself", ""]
+    for n in notes:
+        body = (get_note(n["id"]) or {}).get("content", "").strip()
+        lines.append(
+            f"- [{n.get('type', 'insight')}] {n.get('title', '?')}"
+            + (f": {body[:300]}" if body else "")
+        )
+    return "\n".join(lines)
+
+
+# Patch for ANSI codes (used by render_notes_for_display)
 try:
     from agent import BOLD, DIM, RESET
 except ImportError:

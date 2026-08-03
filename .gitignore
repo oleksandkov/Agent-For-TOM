@@ -1,6 +1,9 @@
 # Secrets — never commit
 .env
 
+# User provider config — lives in ~/.tomas/ now (see agent_cli._migrate_providers_config)
+providers.json
+
 # Python
 __pycache__/
 *.pyc

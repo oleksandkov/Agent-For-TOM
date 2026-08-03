@@ -16,6 +16,7 @@ Data is stored under ~/.tomas/self-improve/:
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import re
@@ -39,6 +40,15 @@ PATTERN_TO_SKILL_THRESHOLD = 3
 
 # How many interactions before we re-analyze patterns
 ANALYZE_INTERVAL = 5
+
+# How many recent interactions pattern analysis considers — bounds per-call
+# cost independent of how long interactions.jsonl has grown.
+ANALYSIS_WINDOW = 500
+
+# Rotate interactions.jsonl once it crosses this size, keeping the log
+# tailable in O(window) instead of O(total history).
+ROTATE_AT_BYTES = 5 * 1024 * 1024
+ROTATE_KEEP = 3
 
 # How many patterns before we generate a tip
 PATTERN_TO_TIP_THRESHOLD = 5
@@ -92,9 +102,27 @@ def _save_json(path: Path, data: Any) -> None:
     )
 
 
+def _rotate_if_large(path: Path) -> None:
+    """Archive a .jsonl file once it crosses ROTATE_AT_BYTES, keeping the
+    last ROTATE_KEEP archives. Deep history has little value here — Phase 3
+    mines sessions, not raw interaction logs."""
+    try:
+        if not path.exists() or path.stat().st_size <= ROTATE_AT_BYTES:
+            return
+        path.rename(path.with_suffix(f".{int(time.time())}.jsonl"))
+        archives = sorted(
+            path.parent.glob(f"{path.stem}.*.jsonl"), key=lambda p: p.stat().st_mtime
+        )
+        for old in archives[:-ROTATE_KEEP]:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _append_jsonl(path: Path, entry: dict) -> None:
     """Append a JSON line to a .jsonl file."""
     _ensure_dirs()
+    _rotate_if_large(path)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
@@ -193,10 +221,23 @@ def log_tool_call(tool_name: str, args: dict, result_preview: str = "") -> dict:
     return entry
 
 
-def get_recent_interactions(n: int = 50) -> list[dict]:
-    """Return the most recent N interactions."""
-    all_interactions = _read_jsonl(INTERACTIONS_FILE)
-    return all_interactions[-n:]
+def get_recent_interactions(n: int = ANALYSIS_WINDOW) -> list[dict]:
+    """Return the most recent N interactions, tailing the file instead of
+    reading it in full — cost is O(n), not O(total history)."""
+    if not INTERACTIONS_FILE.exists():
+        return []
+    with INTERACTIONS_FILE.open("r", encoding="utf-8") as f:
+        tail = collections.deque(f, maxlen=n)
+    out = []
+    for line in tail:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
 
 
 def get_all_interactions() -> list[dict]:
@@ -219,7 +260,7 @@ def analyze_patterns(force: bool = False) -> dict:
     - task_patterns: sequences of tools used together
     - repetition_patterns: very similar messages
     """
-    interactions = get_all_interactions()
+    interactions = get_recent_interactions(ANALYSIS_WINDOW)
     if len(interactions) < 3:
         return {"patterns": [], "analyzed_at": time.time()}
 
@@ -251,19 +292,33 @@ def analyze_patterns(force: bool = False) -> dict:
         task_patterns[pair] = task_patterns.get(pair, 0) + 1
 
     # ── Repetition detection ──
+    # Comparing every message pair is O(n²); bucket by top keyword first so
+    # only messages that could plausibly overlap get compared at all.
     recent_msgs = [
         e for e in interactions
         if e.get("type") == "user_message"
     ]
+    buckets: dict[str, list[int]] = {}
+    for i, e in enumerate(recent_msgs):
+        for kw in e.get("keywords", [])[:3]:
+            buckets.setdefault(kw, []).append(i)
+
     repetition_groups: list[list[int]] = []
-    for i in range(len(recent_msgs)):
-        for j in range(i + 1, len(recent_msgs)):
-            score = _similarity_score(
-                recent_msgs[i].get("content", ""),
-                recent_msgs[j].get("content", ""),
-            )
-            if score > 0.6:  # similar enough
-                repetition_groups.append([i, j])
+    seen_pairs: set[tuple[int, int]] = set()
+    for indices in buckets.values():
+        for bi in range(len(indices)):
+            for bj in range(bi + 1, len(indices)):
+                i, j = indices[bi], indices[bj]
+                pair = (i, j)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                score = _similarity_score(
+                    recent_msgs[i].get("content", ""),
+                    recent_msgs[j].get("content", ""),
+                )
+                if score > 0.6:  # similar enough
+                    repetition_groups.append([i, j])
 
     # ── Build pattern entries ──
     new_patterns = []
@@ -552,10 +607,11 @@ count: {count}
 
 def _register_skill(skill_name: str, skill_file: Path) -> None:
     """
-    Register the auto-generated skill so it appears in skill listings.
-    We put a copy into the ~/.tomas/self-improve/skills/ directory.
-    The skills_manager already scans global dirs, so we also add a
-    reference in a local registry file that build_skills_section can read.
+    Bookkeeping only. The skill file itself already lives under SKILLS_DIR
+    (== skills_manager.LEARNED_SKILLS_DIR), which skills_manager.SKILL_DIRS
+    scans directly — that's what makes it reach build_skills_section() and
+    the system prompt. This registry is a separate list (skill-registry.json)
+    used only to report counts on the `/si` status screen.
     """
     registry = SELF_IMPROVE_DIR / "skill-registry.json"
     registry_data = _load_json(registry, {"skills": []})
@@ -603,7 +659,7 @@ def generate_tips() -> list[dict]:
     Returns list of tip dicts.
     """
     patterns = get_patterns()
-    interactions = get_all_interactions()
+    interactions = get_recent_interactions(ANALYSIS_WINDOW)
     tips = _load_json(TIPS_FILE, {"tips": [], "generated_at": 0})
 
     new_tips: list[dict] = []
@@ -742,7 +798,7 @@ def analyze_session_purpose(interactions: list[dict] | None = None) -> dict:
       - stage: current stage of the task
     """
     if interactions is None:
-        interactions = get_all_interactions()
+        interactions = get_recent_interactions(ANALYSIS_WINDOW)
 
     user_msgs = [
         e for e in interactions
@@ -935,10 +991,9 @@ def init() -> None:
 
 
 def record_user_message(content: str, msg_type: str = "text") -> None:
-    """Record a user message and trigger periodic analysis."""
+    """Log a user message. Analysis is triggered separately, after the turn
+    completes (see maybe_analyze_after_turn) — not on this hot path."""
     log_user_message(content, msg_type)
-    interactions = get_all_interactions()
-    _maybe_analyze(interactions)
 
 
 def record_tool_call(tool_name: str, args: dict, result_preview: str = "") -> None:
@@ -946,11 +1001,22 @@ def record_tool_call(tool_name: str, args: dict, result_preview: str = "") -> No
     log_tool_call(tool_name, args, result_preview)
 
 
+def maybe_analyze_after_turn() -> None:
+    """Call once per user turn, after the reply has been delivered, so
+    analysis never adds to response latency."""
+    _maybe_analyze(get_recent_interactions(ANALYSIS_WINDOW))
+
+
 def _maybe_analyze(interactions: list[dict]) -> None:
-    """Periodically run pattern analysis and skill generation."""
-    if len(interactions) % ANALYZE_INTERVAL != 0:
-        return
-    if len(interactions) < ANALYZE_INTERVAL:
+    """Periodically run pattern analysis and skill generation.
+
+    Counts user turns explicitly rather than raw interaction count: the log
+    also contains tool_call entries, so a turn with several tool calls could
+    jump the raw count past a multiple of ANALYZE_INTERVAL and silently skip
+    analysis for that stretch.
+    """
+    user_turns = sum(1 for i in interactions if i.get("type") == "user_message")
+    if user_turns == 0 or user_turns % ANALYZE_INTERVAL != 0:
         return
 
     # Analyze patterns

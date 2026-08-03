@@ -309,7 +309,33 @@ def get_env_value(key: str, default: str = "Not set") -> str:
 #  MULTI-PROVIDER CONFIG — persists to providers.json
 # ═══════════════════════════════════════════════════════════
 
-PROVIDERS_CONFIG_PATH = PROJECT_DIR / "providers.json"
+PROVIDERS_CONFIG_PATH = TOMAS_DIR / "providers.json"
+_LEGACY_PROVIDERS_PATH = PROJECT_DIR / "providers.json"
+
+
+def _migrate_providers_config() -> None:
+    """One-time move of provider config out of the source tree.
+
+    `TOMAS update` replaces $SrcDir (== PROJECT_DIR in a deployed install)
+    wholesale, so provider config stored there was wiped on every update.
+    """
+    if PROVIDERS_CONFIG_PATH.exists() or not _LEGACY_PROVIDERS_PATH.exists():
+        return
+    try:
+        import json
+        data = json.loads(_LEGACY_PROVIDERS_PATH.read_text(encoding="utf-8"))
+        if not data.get("providers"):
+            return  # nothing worth keeping (e.g. the committed empty stub)
+        TOMAS_DIR.mkdir(parents=True, exist_ok=True)
+        PROVIDERS_CONFIG_PATH.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        _LEGACY_PROVIDERS_PATH.rename(
+            _LEGACY_PROVIDERS_PATH.with_suffix(".json.migrated"))
+    except Exception:
+        pass
+
+
+_migrate_providers_config()
 
 
 def _load_providers_config() -> dict:

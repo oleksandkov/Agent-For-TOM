@@ -849,7 +849,8 @@ Rules:
 - Prefer edit_file over write_file for existing files.
 - Keep responses concise. Focus on code, not lengthy explanations.
 - Use absolute or project-relative paths.
-- If a task is done, stop calling tools and summarize."""
+- If a task is done, stop calling tools and summarize.
+- Memory files listed in the memory index can be read with read_file when you need their detail."""
 
 def _truncate_section(text: str, max_chars: int, label: str = "") -> str:
     """Truncate a section to max_chars, adding a notice if cut."""
@@ -871,6 +872,7 @@ MAX_INSTRUCTIONS_CHARS = 8000       # AGENTS.md + global instructions
 MAX_MEMORY_CHARS = 2000             # memory index
 MAX_SKILLS_CHARS = 4000             # skills section
 MAX_SELF_IMPROVE_CHARS = 1500       # self-improvement context
+MAX_NOTES_CHARS = 1500              # self-notes
 MAX_TOTAL_SYSTEM_PROMPT = 20000     # hard cap on the entire system prompt
 
 
@@ -893,8 +895,20 @@ def build_system_prompt() -> str:
     # memory index
     memory = load_memory_index()
     if memory:
+        if len(memory) > MAX_MEMORY_CHARS:
+            n_lines = len(memory.splitlines())
+            print(f'  {YELLOW}⚠{RESET} {DIM}memory index exceeds the prompt budget '
+                  f'({n_lines} entries) — older entries are not being loaded{RESET}')
         memory = _truncate_section(memory, MAX_MEMORY_CHARS, "memory")
         prompt += f"\n\n# Memory index\n{memory}"
+    # notes the agent has written for itself
+    try:
+        notes_section = self_notes.get_notes_for_context()
+        if notes_section:
+            notes_section = _truncate_section(notes_section, MAX_NOTES_CHARS, "notes")
+            prompt += f"\n\n{notes_section}"
+    except Exception:
+        pass
     # installed skills
     skills_section = build_skills_section()
     if skills_section:
@@ -1041,7 +1055,8 @@ def maybe_compact(messages: list, system_prompt: str = "") -> list:
 # The agent loop
 # ---------------------------------------------------------------------------
 
-MAX_TOOL_CALLS_PER_TURN = 25  # safety limit to prevent infinite tool loops
+MAX_TOOL_CALLS_PER_TURN = int(os.environ.get("TOMAS_MAX_TOOL_CALLS", "40"))  # safety limit to prevent infinite tool loops
+REPEATED_CALL_LIMIT = 3  # identical (name, input) calls in a row are treated as a stuck loop
 _streaming_disabled = False  # set True if provider doesn't support streaming
 
 
@@ -1088,6 +1103,7 @@ def agent_loop(system_prompt: str, messages: list) -> str:
 
     max_retries = 3
     tool_call_count = 0
+    recent_call_signatures: list[tuple] = []  # detects a stuck loop before MAX_TOOL_CALLS_PER_TURN does
     global _streaming_disabled
 
     while True:
@@ -1183,8 +1199,30 @@ def agent_loop(system_prompt: str, messages: list) -> str:
             1 for b in response.content if b.type == "tool_use"
         )
         tool_call_count += tool_calls_this_round
-        if tool_call_count > MAX_TOOL_CALLS_PER_TURN:
-            print(f'    {RED}⚠{RESET}  Tool-call limit reached ({MAX_TOOL_CALLS_PER_TURN}). Stopping to prevent infinite loop.')
+
+        # ── Stuck-loop detection ──
+        # A flat call-count cap can't tell "needs 30 distinct steps" from
+        # "stuck repeating the same call" — it stops both at the same
+        # threshold. Track identical (name, input) signatures and cut off
+        # fast on genuine repetition, independent of MAX_TOOL_CALLS_PER_TURN.
+        for b in response.content:
+            if b.type == "tool_use":
+                sig = (b.name, json.dumps(b.input, sort_keys=True, default=str))
+                recent_call_signatures.append(sig)
+        recent_call_signatures[:] = recent_call_signatures[-REPEATED_CALL_LIMIT:]
+        stuck_in_loop = (
+            len(recent_call_signatures) == REPEATED_CALL_LIMIT
+            and len(set(recent_call_signatures)) == 1
+        )
+
+        if stuck_in_loop or tool_call_count > MAX_TOOL_CALLS_PER_TURN:
+            if stuck_in_loop:
+                reason = f"same tool call repeated {REPEATED_CALL_LIMIT}x in a row"
+                limit_msg = f"Repeated tool call detected ({reason})."
+            else:
+                reason = f"limit {MAX_TOOL_CALLS_PER_TURN} reached"
+                limit_msg = f"Tool call limit ({MAX_TOOL_CALLS_PER_TURN}) reached."
+            print(f'    {RED}⚠{RESET}  Stopping to prevent infinite loop: {reason}.')
             # The model asked for tools we are refusing to run. Record the
             # request and answer every tool_use with a result, or the next
             # request is malformed (dangling tool_calls) and will be rejected.
@@ -1195,11 +1233,11 @@ def agent_loop(system_prompt: str, messages: list) -> str:
                 {
                     "type": "tool_result",
                     "tool_use_id": b.id,
-                    "content": f"Not executed: tool-call limit ({MAX_TOOL_CALLS_PER_TURN}) reached for this turn.",
+                    "content": f"Not executed: {reason}.",
                 }
                 for b in response.content if b.type == "tool_use"
             ] + [
-                {"type": "text", "text": f"Tool call limit ({MAX_TOOL_CALLS_PER_TURN}) reached. Please summarize what you've found so far and provide a response to the user."}
+                {"type": "text", "text": f"{limit_msg} Please summarize what you've found so far and provide a response to the user."}
             ]})
             # One more call to get the final summary
             try:
@@ -2456,6 +2494,11 @@ def main() -> int:
             if s["calls"] > 0:
                 pct = (t["input"] + t["output"]) / CONTEXT_WINDOW * 100
                 print(f'  {DIM}┄  {t["input"]:,} in  {t["output"]:,} out  ·  total: {s["input"]:,} in  {s["output"]:,} out  ·  {pct:.1f}% of {CONTEXT_WINDOW:,} ctx{RESET}')
+            # ── Self-improvement analysis, after the reply so it never adds latency ──
+            try:
+                self_improve.maybe_analyze_after_turn()
+            except Exception:
+                pass
             print()
     except KeyboardInterrupt:
         print()
