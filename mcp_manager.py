@@ -184,6 +184,12 @@ class MCPServer:
         self.url = config.get("url", "")
         self.env = config.get("env", {})
         self.tools: list[dict] = []
+        # The MCP spec defines resources (files, rows, docs the server exposes
+        # for reading) and prompts (server-provided templates) alongside
+        # tools. A lot of the ecosystem's value is in those two, and both are
+        # cheap on top of the JSON-RPC plumbing already here.
+        self.resources: list[dict] = []
+        self.prompts: list[dict] = []
         self.connected = False
         self._last_error: Optional[str] = None
         self._proc: Optional[subprocess.Popen] = None
@@ -213,6 +219,43 @@ class MCPServer:
             if self.transport == "http":
                 return self._http_call(req)
             return self._stdio_call(req)
+
+    def _request(self, method: str, params: Optional[dict] = None) -> str:
+        """Send one JSON-RPC request and return its text result."""
+        if not self.connected:
+            return f"Error: MCP server '{self.name}' is not connected."
+        with self._lock:
+            req = _make_request(method, params or {}, self._id_seq)
+            if self.transport == "http":
+                return self._http_call(req)
+            return self._stdio_call(req)
+
+    def _discover_optional(self) -> None:
+        """List resources and prompts. Both are optional in the spec, so a
+        server that does not implement them must not fail to connect."""
+        for method, attr, key in (("resources/list", "resources", "resources"),
+                                  ("prompts/list", "prompts", "prompts")):
+            try:
+                with self._lock:
+                    req = _make_request(method, {}, self._id_seq)
+                    if self.transport == "http":
+                        resp = self._http_post(req)
+                    else:
+                        self._stdio_send(req)
+                        resp = self._stdio_recv()
+                if resp and "result" in resp:
+                    setattr(self, attr, resp["result"].get(key, []) or [])
+            except Exception:
+                continue
+
+    def read_resource(self, uri: str) -> str:
+        """Read one resource by URI."""
+        return self._request("resources/read", {"uri": uri})
+
+    def get_prompt(self, name: str, arguments: Optional[dict] = None) -> str:
+        """Render one server-provided prompt template."""
+        return self._request("prompts/get",
+                             {"name": name, "arguments": arguments or {}})
 
     def disconnect(self) -> None:
         """Gracefully shut down the server."""
@@ -272,6 +315,7 @@ class MCPServer:
         if tools_resp and "result" in tools_resp:
             self.tools = tools_resp["result"].get("tools", [])
         self.connected = True
+        self._discover_optional()
         return True
 
     def _stdio_send(self, msg: dict) -> None:
@@ -288,20 +332,50 @@ class MCPServer:
             return None
         return json.loads(line.decode("utf-8"))
 
-    def _stdio_call(self, req: dict) -> str:
-        self._stdio_send(req)
-        resp = self._stdio_recv()
+    def _result_text(self, resp: Optional[dict]) -> str:
+        """Text out of any MCP result shape.
+
+        tools/call returns `content`, resources/read returns `contents`, and
+        prompts/get returns `messages`. One extractor rather than three.
+        """
         if resp is None:
             return f"Error: no response from MCP server '{self.name}'"
         if "error" in resp:
             err = resp["error"]
             return f"Error: MCP [{self.name}] {err.get('message', 'unknown error')}"
-        content = resp.get("result", {}).get("content", [])
-        texts = []
-        for c in content:
-            if c.get("type") == "text":
-                texts.append(c.get("text", ""))
-        return "\n".join(texts) if texts else "(no output)"
+        result = resp.get("result", {}) or {}
+        texts: list[str] = []
+
+        def take(block: dict) -> None:
+            if not isinstance(block, dict):
+                return
+            if block.get("text"):
+                texts.append(block["text"])
+            elif block.get("blob"):
+                mime = block.get("mimeType", "application/octet-stream")
+                texts.append(f"[binary resource, {mime}, "
+                             f"{len(block['blob'])} base64 chars]")
+
+        for block in result.get("content", []) or []:
+            take(block)
+        for block in result.get("contents", []) or []:
+            take(block)
+        for msg in result.get("messages", []) or []:
+            content = (msg or {}).get("content")
+            if isinstance(content, dict):
+                take(content)
+            elif isinstance(content, list):
+                for block in content:
+                    take(block)
+            elif isinstance(content, str):
+                texts.append(content)
+        if not texts and result.get("description"):
+            texts.append(result["description"])
+        return "\n".join(t for t in texts if t) or "(no output)"
+
+    def _stdio_call(self, req: dict) -> str:
+        self._stdio_send(req)
+        return self._result_text(self._stdio_recv())
 
     # ── HTTP transport ──────────────────────────────────────────────
 
@@ -319,6 +393,7 @@ class MCPServer:
         if tools_resp and "result" in tools_resp:
             self.tools = tools_resp["result"].get("tools", [])
         self.connected = True
+        self._discover_optional()
         return True
 
     def _http_post(self, msg: dict) -> Optional[dict]:
@@ -343,18 +418,7 @@ class MCPServer:
             raise RuntimeError(f"network error: {e.reason}")
 
     def _http_call(self, req: dict) -> str:
-        resp = self._http_post(req)
-        if resp is None:
-            return f"Error: no response from MCP server '{self.name}'"
-        if "error" in resp:
-            err = resp["error"]
-            return f"Error: MCP [{self.name}] {err.get('message', 'unknown error')}"
-        content = resp.get("result", {}).get("content", [])
-        texts = []
-        for c in content:
-            if c.get("type") == "text":
-                texts.append(c.get("text", ""))
-        return "\n".join(texts) if texts else "(no output)"
+        return self._result_text(self._http_post(req))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -429,6 +493,68 @@ class MCPManager:
         """Return the server name that owns the given tool, or None."""
         owner = self._owner.get(tool_name)
         return owner[0] if owner else None
+
+    # ── Resources ───────────────────────────────────────────────────
+
+    def list_resources(self) -> list[dict]:
+        """Every resource across connected servers, tagged with its owner."""
+        out: list[dict] = []
+        for name, server in self.servers.items():
+            for r in server.resources:
+                entry = dict(r)
+                entry["server"] = name
+                out.append(entry)
+        return out
+
+    def read_resource(self, uri: str, server: str | None = None) -> str:
+        """Read a resource by URI.
+
+        With no server given, the URI is looked up across all of them — and
+        an ambiguous URI is reported rather than silently resolved to
+        whichever server happened to connect first.
+        """
+        if server:
+            srv = self.servers.get(server)
+            if srv is None:
+                return f"Error: MCP server '{server}' is not connected."
+            return srv.read_resource(uri)
+        owners = [n for n, s in self.servers.items()
+                  if any(r.get("uri") == uri for r in s.resources)]
+        if not owners:
+            return f"Error: no connected MCP server exposes resource '{uri}'."
+        if len(owners) > 1:
+            return (f"Error: resource '{uri}' is exposed by {len(owners)} servers "
+                    f"({', '.join(owners)}). Pass server= to disambiguate.")
+        return self.servers[owners[0]].read_resource(uri)
+
+    # ── Prompts ─────────────────────────────────────────────────────
+
+    def list_prompts(self) -> list[dict]:
+        """Every server-provided prompt template, tagged with its owner."""
+        out: list[dict] = []
+        for name, server in self.servers.items():
+            for p in server.prompts:
+                entry = dict(p)
+                entry["server"] = name
+                out.append(entry)
+        return out
+
+    def get_prompt(self, name: str, arguments: dict | None = None,
+                   server: str | None = None) -> str:
+        """Render a server-provided prompt template."""
+        if server:
+            srv = self.servers.get(server)
+            if srv is None:
+                return f"Error: MCP server '{server}' is not connected."
+            return srv.get_prompt(name, arguments)
+        owners = [n for n, s in self.servers.items()
+                  if any(p.get("name") == name for p in s.prompts)]
+        if not owners:
+            return f"Error: no connected MCP server provides prompt '{name}'."
+        if len(owners) > 1:
+            return (f"Error: prompt '{name}' is provided by {len(owners)} servers "
+                    f"({', '.join(owners)}). Pass server= to disambiguate.")
+        return self.servers[owners[0]].get_prompt(name, arguments)
 
     @staticmethod
     def _to_anthropic_tool(tool: dict) -> dict:

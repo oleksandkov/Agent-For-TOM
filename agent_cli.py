@@ -127,30 +127,10 @@ def is_playwright_available() -> bool:
         return False
 
 
-def _set_env_key(path: Path, key: str, value: str) -> None:
-    """Write key=value into a .env file, replacing any existing entry."""
-    content = path.read_text(encoding="utf-8") if path.exists() else ""
-    lines = content.splitlines()
-    for i, line in enumerate(lines):
-        if line.startswith(f"{key}="):
-            lines[i] = f"{key}={value}"
-            break
-    else:
-        lines.append(f"{key}={value}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _drop_env_key(path: Path, key: str) -> bool:
-    """Remove a key from a .env file. Returns True if anything was removed."""
-    if not path.exists():
-        return False
-    lines = path.read_text(encoding="utf-8").splitlines()
-    kept = [ln for ln in lines if not ln.startswith(f"{key}=")]
-    if len(kept) == len(lines):
-        return False
-    path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
-    return True
+# The .env primitives live in provider_manager so config persistence has one
+# implementation. ENV_FILE stays a module-level name here because it is the
+# path this UI writes to (and what the durability tests substitute).
+from provider_manager import set_env_key as _set_env_key, drop_env_key as _drop_env_key
 
 
 def update_dotenv(key: str, value: str):
@@ -1377,15 +1357,30 @@ def page_configure_provider():
         'OpenAI (api.openai.com)',
         'Google AI',
         'OpenCode Zen (opencode.ai)  ◈',
+        'Ollama (local)',
         'Custom / Other',
     ]
+    # Probe for a local Ollama so the option can say whether it is there.
+    import provider_manager
+    ollama_models: list[str] = []
+    try:
+        ollama_models = provider_manager.list_models(provider_manager.Provider(
+            name='Ollama (local)', type='ollama',
+            base_url=provider_manager.OLLAMA_DEFAULT_URL))
+    except Exception:
+        pass
+
     # Show ✓ for already-configured providers
     display = []
     for p in provider_names:
+        suffix = ''
+        if p == 'Ollama (local)':
+            suffix = (f'  {DIM}— {len(ollama_models)} model(s) detected{RESET}'
+                      if ollama_models else f'  {DIM}— not running{RESET}')
         if p in configured:
-            display.append(f'{GREEN}✓{RESET} {p}')
+            display.append(f'{GREEN}✓{RESET} {p}{suffix}')
         else:
-            display.append(f'  {p}')
+            display.append(f'  {p}{suffix}')
 
     idx = arrow_menu('Connect / Configure Provider', display,
                      footer='↑↓ navigate · Enter select · Esc cancel')
@@ -1468,7 +1463,43 @@ def page_configure_provider():
         }
         config["active"] = provider_names[4]
         _save_providers_config(config)
-    elif idx == 5:  # Custom
+    elif idx == 5:  # Ollama (local)
+        if not ollama_models:
+            show_info_page('Ollama not found', [
+                f'  No Ollama server answered at {provider_manager.OLLAMA_DEFAULT_URL}.',
+                '',
+                '  Install from https://ollama.com, then:',
+                f'    {CYAN}ollama pull qwen2.5-coder{RESET}',
+                f'    {CYAN}ollama serve{RESET}',
+                '',
+                '  Then come back here — it will be detected automatically.'])
+            return
+        m_idx = arrow_menu('Ollama — choose a model',
+                           [f'  {m}' for m in ollama_models],
+                           footer='↑↓ navigate · Enter select · Esc cancel')
+        if m_idx < 0:
+            return
+        model = ollama_models[m_idx]
+        provider = provider_manager.Provider(
+            name=provider_names[5], type='ollama',
+            base_url=provider_manager.OLLAMA_DEFAULT_URL,
+            model=model,
+            env={'ANTHROPIC_BASE_URL': provider_manager.OLLAMA_DEFAULT_URL,
+                 'ANTHROPIC_API_KEY': 'ollama'})
+        # Probe now: many local models have no tool support, and the context
+        # window is usually far smaller than the cloud default. Both must be
+        # known before the first turn, not discovered during it.
+        caps = provider_manager.probe(provider)
+        provider.capabilities = caps
+        provider_manager.save(provider)
+        provider_manager.activate(provider.name)
+        reinit_client()
+        lines = [f'  ✓ Ollama configured and active — {model}.', '']
+        lines.append(f'  Context window: {caps.context_window:,} tokens')
+        lines.append(f'  Tool use:       {"yes" if caps.tool_use else "no — text protocol fallback"}')
+        lines.append(f'  Streaming:      {"yes" if caps.streaming else "no — blocking fallback"}')
+        show_info_page('Done', lines)
+    elif idx == 6:  # Custom
         name = prompt_text('Provider name')
         key = prompt_text('API key')
         base = prompt_text('Base URL')
@@ -1477,10 +1508,13 @@ def page_configure_provider():
             env_url = f"{name.upper().replace(' ', '_')}_BASE_URL"
             update_dotenv(env_key, key)
             update_dotenv(env_url, base)
+            # Type is sniffed once, here, and written down. Nothing sniffs at
+            # runtime; an unrecognised endpoint is "custom", which works.
             _save_provider_config(
                 name,
-                {env_key: key, env_url: base},
-                provider_type="custom"
+                {env_key: key, env_url: base,
+                 "ANTHROPIC_API_KEY": key, "ANTHROPIC_BASE_URL": base},
+                provider_type=provider_manager.detect_type(base)
             )
             show_info_page('Done', [f'  ✓ {name} configured and active.'])
 

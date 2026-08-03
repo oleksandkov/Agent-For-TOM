@@ -198,7 +198,12 @@ CONTINUE_SESSION_ID: Optional[str] = None
 _client_instance = None
 
 def _get_client():
-    """Return a cached Anthropic client, re-initialised if provider changed."""
+    """Return a cached client for the active provider.
+
+    An endpoint that speaks OpenAI wire format gets the in-process adapter
+    (no daemon, real incremental streaming); everything else gets the
+    Anthropic SDK. Both present the same surface to core/loop.py.
+    """
     global _client_instance
     # Read current env values each time — update_dotenv in the CLI sets os.environ
     key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -210,12 +215,23 @@ def _get_client():
         prev_key = getattr(_client_instance, "_cache_key", None)
         if prev_key == cache_key:
             return _client_instance
-    headers = json.loads(extra_hdr) if extra_hdr else None
-    _client_instance = anthropic.Anthropic(
-        api_key=key or None,
-        base_url=base or None,
-        default_headers=headers,
-    )
+
+    client = None
+    try:
+        import openai_adapter
+        if openai_adapter.should_use_adapter():
+            client = openai_adapter.build_from_active()
+    except Exception:
+        client = None
+
+    if client is None:
+        headers = json.loads(extra_hdr) if extra_hdr else None
+        client = anthropic.Anthropic(
+            api_key=key or None,
+            base_url=base or None,
+            default_headers=headers,
+        )
+    _client_instance = client
     _client_instance._cache_key = cache_key  # type: ignore[attr-defined]
     return _client_instance
 
@@ -226,7 +242,14 @@ def reinit_client():
 
 
 def _ensure_zen_proxy():
-    """Auto-start the Zen proxy daemon if the agent points at it."""
+    """Start the Zen proxy daemon — only when explicitly asked for.
+
+    Translation now runs in-process (openai_adapter), so the daemon is no
+    longer on the agent's critical path. It stays available because pointing
+    *other* tools at Zen is a real use for it: set TOMAS_ZEN_PROXY=1.
+    """
+    if os.environ.get("TOMAS_ZEN_PROXY", "") != "1":
+        return
     base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
     if "127.0.0.1:6446" in base_url or "localhost:6446" in base_url:
         try:
@@ -287,6 +310,10 @@ def _fetch_model_context_window() -> int:
 # MCP manager (initialized at startup when main() is called)
 mcp_manager: Optional[MCPManager] = None
 COMBINED_TOOLS: list[dict] = []
+# Every tool that exists after name resolution — built-ins plus every
+# connected MCP tool. COMBINED_TOOLS is the subset that fits the budget;
+# select_tools() picks that subset per turn from this list.
+ALL_TOOLS: list[dict] = []
 TOOL_TOKENS: int = 0  # estimated token count for tool definitions
 MCP_TOOL_NAME_MAP: dict[str, str] = {}  # renamed_name -> original_name for conflicting MCP tools
 
@@ -324,10 +351,13 @@ def resolve_mcp_tool_conflicts(mcp_tools: list[dict], builtin_names: Optional[se
 def apply_tool_cap(mcp_tools: list[dict], max_allowed: int = 128) -> tuple[list[dict], int]:
     """
     Merge built-in TOOLS with MCP tools and truncate to max_allowed tools.
-    Built-in tools are always kept; excess MCP tools are silently dropped.
+    Built-in tools are always kept; excess MCP tools are dropped in order.
 
-    Returns (combined_tools, dropped) where dropped is the number of MCP
-    tools that were removed to satisfy the cap.
+    This is the no-context fallback. When there is a user message to select
+    against, `select_tools` picks by relevance instead — see P4-8. Kept
+    because startup has no context yet and something must be sent.
+
+    Returns (combined_tools, dropped).
     """
     n_builtin = len(TOOLS)
     keep = max(0, max_allowed - n_builtin)
@@ -337,12 +367,138 @@ def apply_tool_cap(mcp_tools: list[dict], max_allowed: int = 128) -> tuple[list[
     return TOOLS + mcp_tools, 0
 
 
-def is_free_tier_model(model_name: Optional[str] = None) -> bool:
-    """True when the active endpoint restricts tool payloads (~32 tools max)."""
-    if model_name is None:
-        model_name = (_get_model() or "").lower()
-    base = os.environ.get("ANTHROPIC_BASE_URL", "").lower()
-    return "free" in model_name or "openrouter" in base or "127.0.0.1" in base
+def tool_relevance(tool: dict, query_keywords: set) -> float:
+    """Score one tool against the words the user just used.
+
+    Same shape as `learning.retrieval.score_fact` — one scoring idea, two
+    uses. Name matches count double: a tool called `take_screenshot` is a
+    better answer to "screenshot" than one that merely mentions screenshots
+    in its description.
+    """
+    if not query_keywords:
+        return 0.0
+    from learning.text import extract_keywords
+    name = (tool.get("name") or "").replace("_", " ").replace("-", " ")
+    desc = tool.get("description") or ""
+    name_words = set(extract_keywords(name, max_keywords=8))
+    desc_words = set(extract_keywords(desc, max_keywords=20))
+    score = 2.0 * len(query_keywords & name_words) + len(query_keywords & desc_words)
+    # Cheap substring credit for compound names retrieval would not split.
+    lowered = f"{tool.get('name','')} {desc}".lower()
+    score += 0.5 * sum(1 for kw in query_keywords if len(kw) > 4 and kw in lowered)
+    return score
+
+
+def select_tools(all_tools: list[dict], context: str,
+                 budget: int) -> tuple[list[dict], list[dict]]:
+    """Fit the tool list to the budget by relevance to the current turn.
+
+    Built-ins are always kept — they are what the agent is. The rest of the
+    budget goes to the MCP tools most relevant to what the user is actually
+    doing, rather than to whichever server connected first, which is what
+    list-order truncation really selected on.
+
+    Returns (selected, withheld).
+    """
+    builtin_names = {t["name"] for t in TOOLS}
+    builtins = [t for t in all_tools if t["name"] in builtin_names]
+    mcp = [t for t in all_tools if t["name"] not in builtin_names]
+    remaining = max(0, budget - len(builtins))
+
+    if len(mcp) <= remaining:
+        return builtins + mcp, []
+    if remaining == 0:
+        return builtins, mcp
+
+    from learning.text import extract_keywords
+    query_keywords = set(extract_keywords(context or "", max_keywords=15))
+    if not query_keywords:
+        return builtins + mcp[:remaining], mcp[remaining:]
+
+    scored = sorted(
+        ((tool_relevance(t, query_keywords), i, t) for i, t in enumerate(mcp)),
+        key=lambda x: (-x[0], x[1]),          # stable: original order breaks ties
+    )
+    chosen = [t for _, _, t in scored[:remaining]]
+    withheld = [t for _, _, t in scored[remaining:]]
+    return builtins + chosen, withheld
+
+
+def withheld_tools_notice(withheld: list[dict]) -> str:
+    """One line telling the model what it does not currently have.
+
+    A silent capability gap is unrecoverable — the model cannot ask for a
+    tool it has no idea exists. Naming the servers makes it recoverable.
+    """
+    if not withheld:
+        return ""
+    servers = []
+    for t in withheld:
+        origin = _tool_origin(t.get("name", ""))
+        if origin.startswith("MCP: "):
+            srv = origin[5:]
+            if srv not in servers:
+                servers.append(srv)
+    where = f" from {', '.join(sorted(servers)[:6])}" if servers else ""
+    return (f"\n\n{len(withheld)} additional tool(s){where} are connected but not "
+            f"loaded for this turn. If you need one, say which capability you "
+            f"need and the user can re-ask; do not assume it is unavailable.")
+
+
+def _active_capabilities():
+    """Probed capabilities of the active provider, or optimistic defaults.
+
+    Never probes on this path — capabilities are data read from disk, and a
+    turn must not pay network latency to find out what it can do.
+    """
+    try:
+        import provider_manager
+        return provider_manager.capabilities_for_active()
+    except Exception:
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            streaming=True, tool_use=True, parallel_tool_calls=True,
+            system_prompt=True, prompt_caching=False, vision=False,
+            context_window=DEFAULT_CONTEXT_WINDOW, max_tools=128,
+            max_output_tokens=MAX_TOKENS, probed_at=0.0)
+
+
+def degrade_capability(field: str, reason: str = "") -> None:
+    """Record that the provider cannot do something, and remember it.
+
+    This is the whole of 'degrade, never fail': a capability the provider
+    lacks costs the user a feature, never the session. The first discovery is
+    paid once, then persisted so the next session starts already knowing.
+    """
+    try:
+        import provider_manager
+        provider = provider_manager.get_active()
+        if provider is None or not getattr(provider.capabilities, field, False):
+            return
+        setattr(provider.capabilities, field, False)
+        provider_manager.persist_capabilities(provider)
+        note = f" ({reason})" if reason else ""
+        print(f'  {YELLOW}⚠{RESET}  {provider.name} cannot {field.replace("_", " ")}'
+              f'{note} — falling back{DIM}, remembered for next time{RESET}')
+    except Exception:
+        pass
+
+
+def tool_ceiling() -> int:
+    """How many tools this endpoint will accept.
+
+    Read from the active provider's probed capabilities. It used to be
+    inferred from whether the model name contained the substring "free" —
+    which cut a model called `my-free-model` to a quarter of its budget for
+    its name, and gave a self-hosted endpoint the cloud default it could not
+    honour.
+    """
+    try:
+        import provider_manager
+        return max(1, int(provider_manager.capabilities_for_active().max_tools))
+    except Exception:
+        return 128
+
 
 # ── ANSI color constants for the chat UI ──
 RESET = '\033[0m'
@@ -491,6 +647,22 @@ TOOLS: list[dict] = [
             "required": ["query"],
         },
     },
+    {
+        "name": "read_mcp_resource",
+        "description": (
+            "Read a resource exposed by a connected MCP server (a file, "
+            "database row, document, or similar). Call with no arguments to "
+            "list what is available. Resources are read-only data the server "
+            "publishes; they are not tools."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "uri": {"type": "string", "description": "Resource URI. Omit to list all available resources."},
+                "server": {"type": "string", "description": "MCP server name. Only needed when two servers publish the same URI."},
+            },
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -508,6 +680,7 @@ RISK_LEVELS: dict[str, str] = {
     "fetch_url": "low",
     "fetch_url_with_browser": "medium",
     "search_web": "low",
+    "read_mcp_resource": "low",
 }
 
 # Commands that only read. `run_command` is the most-used tool in the corpus
@@ -817,6 +990,30 @@ def handle_save_memory(params: dict) -> str:
     return f"Saved memory '{params['key']}'"
 
 
+def handle_read_mcp_resource(params: dict) -> str:
+    """Read (or list) MCP resources.
+
+    The MCP spec defines resources alongside tools, and much of the
+    ecosystem's value sits there; the manager surfaced only tools until now.
+    """
+    if mcp_manager is None:
+        return "Error: no MCP servers are connected."
+    uri = (params or {}).get("uri", "").strip()
+    server = (params or {}).get("server") or None
+    if not uri:
+        resources = mcp_manager.list_resources()
+        if not resources:
+            return "No MCP resources are available from the connected servers."
+        lines = [f"{len(resources)} MCP resource(s) available:"]
+        for r in resources[:100]:
+            desc = (r.get("description") or r.get("name") or "")[:90]
+            lines.append(f"  [{r['server']}] {r.get('uri', '?')}  {desc}")
+        if len(resources) > 100:
+            lines.append(f"  ... and {len(resources) - 100} more")
+        return "\n".join(lines)
+    return mcp_manager.read_resource(uri, server=server)
+
+
 def handle_fetch_url(params: dict) -> str:
     """Fetch content from a URL."""
     import urllib.request
@@ -1047,6 +1244,7 @@ HANDLERS: dict[str, Callable[[dict], str]] = {
     "fetch_url": handle_fetch_url,
     "fetch_url_with_browser": handle_fetch_url_with_browser,
     "search_web": handle_search_web,
+    "read_mcp_resource": handle_read_mcp_resource,
 }
 
 def execute_tool(name: str, params: dict) -> str:
@@ -1500,15 +1698,107 @@ def _record_tool_call(name: str, args: dict, preview: str,
     _tool_log.append(entry)
 
 
+def _last_user_text(messages: list) -> str:
+    """The most recent user message as plain text, for tool selection."""
+    for m in reversed(messages or []):
+        if m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            # Tool-result turns carry no user intent; keep looking back.
+            texts = [b.get("text", "") for b in content
+                     if isinstance(b, dict) and b.get("type") == "text"]
+            if texts:
+                return "\n".join(texts)
+    return ""
+
+
+def tools_for_turn(messages: list) -> tuple[list[dict], list[dict]]:
+    """Pick this turn's tool payload.
+
+    Re-selected per turn rather than per session: a user who starts with file
+    edits and moves to browser automation should get browser tools when they
+    ask for them, not whichever server connected first at startup.
+    """
+    pool = ALL_TOOLS or COMBINED_TOOLS or TOOLS
+    context = _last_user_text(messages)
+    try:
+        context = f"{context}\n{self_improve.get_session_analysis().get('purpose', '')}"
+    except Exception:
+        pass
+    return select_tools(pool, context, tool_ceiling())
+
+
+TEXT_TOOL_PROTOCOL = """
+
+## Tool use (text protocol)
+
+This endpoint does not support native tool calling, so tools are invoked by
+writing a fenced block. To call one, emit exactly:
+
+```tool_call
+{"name": "<tool name>", "input": {...}}
+```
+
+Emit one block per call and then stop; the result is returned to you in the
+next message. Available tools:
+"""
+
+_TEXT_TOOL_RE = re.compile(r"```tool_call\s*\n(.*?)\n?```", re.S)
+
+
+def describe_tools_as_text(tools: list[dict]) -> str:
+    """Render the tool list into the system prompt for the text protocol."""
+    lines = [TEXT_TOOL_PROTOCOL]
+    for t in tools:
+        schema = t.get("input_schema", {}) or {}
+        params = ", ".join(schema.get("properties", {}).keys()) or "none"
+        lines.append(f"- `{t['name']}`({params}) — {t.get('description', '')[:160]}")
+    return "\n".join(lines)
+
+
+def parse_text_tool_calls(text: str) -> list[dict]:
+    """Extract tool calls a model wrote as text. Malformed blocks are skipped."""
+    calls = []
+    for block in _TEXT_TOOL_RE.findall(text or ""):
+        try:
+            payload = json.loads(block.strip())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("name"):
+            calls.append({"name": payload["name"],
+                          "input": payload.get("input") or {}})
+    return calls
+
+
 def build_state(system_prompt: str, messages: list, responder) -> AgentState:
     """Assemble the turn context the core needs out of this module's globals."""
+    selected, withheld = tools_for_turn(messages)
+    if withheld:
+        system_prompt = system_prompt + withheld_tools_notice(withheld)
+    caps = _active_capabilities()
+
+    # ── Degradations. Each costs a feature; none costs the session. ──
+    if not caps.tool_use:
+        # No native tool calling: describe the tools and parse a text
+        # protocol out of the reply instead (see agent_loop).
+        system_prompt = system_prompt + describe_tools_as_text(selected)
+    if not caps.system_prompt:
+        # No system role: prepend it as the first user message.
+        messages = ([{"role": "user", "content": system_prompt},
+                     {"role": "assistant", "content": "Understood."}]
+                    + list(messages))
+        system_prompt = ""
+
     return AgentState(
         system_prompt=system_prompt,
         messages=messages,
         get_client=_get_client,
         get_model=_get_model,
-        tools=COMBINED_TOOLS,
-        max_tokens=MAX_TOKENS,
+        tools=selected if caps.tool_use else [],
+        max_tokens=min(MAX_TOKENS, caps.max_output_tokens) or MAX_TOKENS,
         execute_tool=execute_tool,
         risk_of=risk_for,
         origin_of=_tool_origin,
@@ -1517,9 +1807,47 @@ def build_state(system_prompt: str, messages: list, responder) -> AgentState:
         auto_approve_low=AUTO_APPROVE_LOW,
         yolo=YOLO_MODE,
         tool_budget=MAX_TOOL_CALLS_PER_TURN,
-        streaming_enabled=not _streaming_disabled,
+        streaming_enabled=(not _streaming_disabled) and caps.streaming,
         on_tool_call=_record_tool_call,
     )
+
+
+TEXT_PROTOCOL_MAX_ROUNDS = 6
+
+
+def _run_text_protocol(state, adapter, reply: str, messages: list) -> str:
+    """Drive tool calls for providers with no native tool support.
+
+    The model writes ```tool_call blocks; we execute them, feed the results
+    back, and let it continue. Slower and less reliable than native tool use
+    — which is the point: the missing capability costs a feature, not the
+    session.
+    """
+    for _ in range(TEXT_PROTOCOL_MAX_ROUNDS):
+        calls = parse_text_tool_calls(reply)
+        if not calls:
+            return reply
+        results = []
+        for call in calls:
+            name, params = call["name"], call["input"]
+            if not request_permission(name, params):
+                results.append(f"[{name}] Error: user denied this tool call.")
+                continue
+            t0 = time.perf_counter()
+            try:
+                out = execute_tool(name, params)
+                ok = True
+            except Exception as e:
+                out, ok = f"Error: tool raised {type(e).__name__}: {e}", False
+            _record_tool_call(name, params, str(out)[:200],
+                              int((time.perf_counter() - t0) * 1000), ok)
+            results.append(f"[{name}]\n{str(out)[:state.max_result_chars]}")
+        messages.append({"role": "assistant", "content": reply})
+        messages.append({"role": "user",
+                         "content": "Tool results:\n\n" + "\n\n".join(results)})
+        state.messages = messages
+        reply = adapter.run(state)
+    return reply
 
 
 def agent_loop(system_prompt: str, messages: list) -> str:
@@ -1541,13 +1869,25 @@ def agent_loop(system_prompt: str, messages: list) -> str:
     try:
         # messages already carries the user's turn, so no user_message here.
         reply = adapter.run(state)
+        if not _active_capabilities().tool_use:
+            reply = _run_text_protocol(state, adapter, reply, messages)
     except BaseException as e:
         error = e
         raise
     finally:
         _turn_timings.append(time.perf_counter() - t0)
         # Propagate what the turn learned back into module state.
+        was_streaming = not _streaming_disabled
         _streaming_disabled = not state.streaming_enabled
+        if was_streaming and _streaming_disabled:
+            # The core already fell back. Persist that only when the failure
+            # says something about the provider: a 429 or a 5xx means the
+            # endpoint was busy, not that it cannot stream, and writing it
+            # down would disable streaming for good over a transient blip.
+            if state.streaming_error_retryable:
+                _streaming_disabled = False   # retry streaming next turn
+            else:
+                degrade_capability("streaming", state.streaming_error or "stream failed")
         _last_turn_usage["input"] = state.usage.get("input", 0)
         _last_turn_usage["output"] = state.usage.get("output", 0)
         _session_tokens["input"] += state.usage.get("total_input", 0)
@@ -1557,10 +1897,19 @@ def agent_loop(system_prompt: str, messages: list) -> str:
         # what let a session with eight prompts and zero replies be saved,
         # and then be reported as eight turns of completed work.
         if error is not None or not (reply or "").strip():
+            # Prefer the reason the core recorded — "empty_reply" with no
+            # explanation is the unreadable record P6-11 exists to prevent.
+            core_error = getattr(state, "last_error", None)
+            if error is not None:
+                reason, detail = type(error).__name__, str(error)
+            elif core_error:
+                reason, detail = "turn_error", core_error
+            else:
+                reason, detail = "empty_reply", ""
             _failed_turns.append({
                 "turn": turn_index,
-                "reason": type(error).__name__ if error else "empty_reply",
-                "error": str(error)[:300] if error else "",
+                "reason": reason,
+                "error": detail[:300],
             })
     return reply
 
@@ -1578,6 +1927,9 @@ SLASH_COMMANDS = {
     "compact":      {"desc": "Force compact conversation now",    "icon": "⚙"},
     "skills":       {"desc": "List installed skills",            "icon": "⚡"},
     "skill":        {"desc": "Run a skill: /skill <name>",        "icon": "⚡"},
+    "mcp-prompt":   {"desc": "MCP prompt templates: /mcp-prompt [name]", "icon": "◈"},
+    "mcp-resources": {"desc": "List resources published by MCP servers", "icon": "◈"},
+    "provider":     {"desc": "Show provider capabilities; /provider probe to re-measure", "icon": "◎"},
     "pdf-report":   {"desc": "Generate AI news PDF report",      "icon": "📄"},
     "zen":          {"desc": "OpenCode Zen proxy status",         "icon": "◉"},
     "self-improve": {"desc": "What the agent has learned",        "icon": "🧠"},
@@ -1804,6 +2156,64 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
             return '\n'.join(lines)
         except Exception as e:
             return f'  {YELLOW}Zen: {e}{RESET}'
+
+    if cmd == "provider":
+        import provider_manager
+        provider = provider_manager.get_active()
+        if provider is None:
+            return f'  {DIM}No provider is configured. Use{RESET} {CYAN}agent_cli.py{RESET}{DIM} to add one.{RESET}'
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        if sub == "probe":
+            # A capability learned by degradation is sticky by design, so
+            # there has to be a way to re-measure — a transient failure must
+            # not disable streaming forever.
+            caps = provider_manager.probe_and_persist(provider)
+            head = f'  {GREEN}✓{RESET} Re-probed {CYAN}{provider.name}{RESET}'
+        else:
+            caps = provider.capabilities
+            head = f'  {BOLD}{provider.name}{RESET} {DIM}({provider.type}){RESET}'
+        when = ('never — using optimistic defaults' if not caps.probed
+                else time.strftime('%Y-%m-%d %H:%M', time.localtime(caps.probed_at)))
+        yn = lambda v: f'{GREEN}yes{RESET}' if v else f'{YELLOW}no{RESET}'
+        return '\n'.join([
+            head,
+            f'  {DIM}{"─" * 46}{RESET}',
+            f'  {DIM}Model:{RESET}          {provider.model or "(unset)"}',
+            f'  {DIM}Endpoint:{RESET}       {provider.base_url or "(from env)"}',
+            f'  {DIM}Probed:{RESET}         {when}',
+            '',
+            f'  {DIM}Streaming:{RESET}      {yn(caps.streaming)}',
+            f'  {DIM}Tool use:{RESET}       {yn(caps.tool_use)}',
+            f'  {DIM}System prompt:{RESET}  {yn(caps.system_prompt)}',
+            f'  {DIM}Context window:{RESET} {caps.context_window:,}',
+            f'  {DIM}Tool ceiling:{RESET}   {caps.max_tools}',
+            '',
+            f'  {DIM}Run{RESET} {CYAN}/provider probe{RESET} {DIM}to re-measure against the endpoint.{RESET}',
+        ])
+
+    if cmd in ("mcp-prompt", "mcp-prompts"):
+        # Server-provided prompt templates, surfaced the same way skills are.
+        if mcp_manager is None:
+            return f'  {DIM}No MCP servers are connected.{RESET}'
+        prompts = mcp_manager.list_prompts()
+        name = parts[1] if len(parts) > 1 else ""
+        if not name:
+            if not prompts:
+                return f'  {DIM}No connected MCP server provides prompts.{RESET}'
+            lines = [f'  {BOLD}MCP Prompts{RESET}', f'  {DIM}{"─" * 46}{RESET}']
+            for p in prompts:
+                lines.append(f'    {CYAN}{p.get("name", "?")}{RESET} '
+                             f'{DIM}[{p["server"]}] {(p.get("description") or "")[:70]}{RESET}')
+            lines.append('')
+            lines.append(f'  {DIM}Run one with{RESET} {CYAN}/mcp-prompt <name>{RESET}')
+            return '\n'.join(lines)
+        rendered = mcp_manager.get_prompt(name)
+        if rendered.startswith("Error:"):
+            return f'  {RED}{rendered}{RESET}'
+        return rendered
+
+    if cmd == "mcp-resources":
+        return handle_read_mcp_resource({})
 
     if cmd == "skills":
         return cmd_skill_list()
@@ -2554,29 +2964,29 @@ def main() -> int:
             for srv_name, err_msg in mcp_manager.failed_servers.items():
                 print(f'  {RED}  ✗{RESET} {srv_name}: {DIM}{err_msg[:120]}{RESET}')
 
-        # Pre-compute the final tool list once (not on every turn)
-        global TOOL_TOKENS, MCP_TOOL_NAME_MAP
+        # Resolve names once. Which tools are *sent* is decided per turn by
+        # select_tools(), against what the user is actually asking for.
+        global TOOL_TOKENS, MCP_TOOL_NAME_MAP, ALL_TOOLS
         if mcp_manager.tools:
-            # Check for name conflicts with built-in tools and rename MCP tools accordingly
             mcp_tools, MCP_TOOL_NAME_MAP, renames = resolve_mcp_tool_conflicts(mcp_manager.tools)
             if renames:
                 print(f'  {YELLOW}⚠{RESET}  Renamed {renames} MCP tool(s) to avoid built-in name conflicts')
-            model_name = (_get_model() or "").lower()
-            # Free tier endpoints & OpenRouter models have strict payload limits (max ~32 tools)
-            is_free_tier = is_free_tier_model(model_name)
-            max_allowed = 32 if is_free_tier else 128
-
-            COMBINED_TOOLS, dropped = apply_tool_cap(mcp_tools, max_allowed=max_allowed)
+            ALL_TOOLS = TOOLS + mcp_tools
+            budget = tool_ceiling()
+            COMBINED_TOOLS, dropped = apply_tool_cap(mcp_tools, max_allowed=budget)
             if dropped:
-                limit_reason = f"{_get_model()} payload limit" if is_free_tier else "API 128-tool limit"
-                print(f'  {YELLOW}⚠{RESET}  Truncated MCP tools: keeping {len(mcp_tools) - dropped} of {len(mcp_tools)} ({dropped} dropped, {limit_reason})')
+                print(f'  {CYAN}◈{RESET}  {len(mcp_tools)} MCP tools available, '
+                      f'{budget} fit per turn {DIM}(selected by relevance to each '
+                      f'message; the model is told what is held back){RESET}')
         else:
+            ALL_TOOLS = list(TOOLS)
             COMBINED_TOOLS = TOOLS
             MCP_TOOL_NAME_MAP = {}
         TOOL_TOKENS = sum(len(json.dumps(t)) for t in COMBINED_TOOLS) // 6
     except Exception as e:
         print(f'  {RED}⚠{RESET}  MCP initialization failed: {e}')
         mcp_manager = MCPManager()
+        ALL_TOOLS = list(TOOLS)
         COMBINED_TOOLS = TOOLS
         MCP_TOOL_NAME_MAP = {}
         TOOL_TOKENS = sum(len(json.dumps(t)) for t in COMBINED_TOOLS) // 6
