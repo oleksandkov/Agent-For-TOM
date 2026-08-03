@@ -12,13 +12,18 @@ from typing import Optional
 
 # ── skill directories (searched in order) ────────────────────────────
 
-LEARNED_SKILLS_DIR = Path.home() / ".tomas" / "self-improve" / "skills"
+# Skills the agent wrote for itself. The learned/ path is where reflection
+# writes (Phase 3); the self-improve/ path is the older template generator,
+# kept until that code is deleted.
+LEARNED_SKILLS_DIR = Path.home() / ".tomas" / "learned" / "global" / "skills"
+LEGACY_LEARNED_SKILLS_DIR = Path.home() / ".tomas" / "self-improve" / "skills"
 
 SKILL_DIRS = [
     Path.home() / ".claude" / "skills",
     Path.home() / ".agents" / "skills",
     Path.home() / "AppData" / "Roaming" / "Code" / "User" / "prompts",
-    LEARNED_SKILLS_DIR,  # skills the agent generated for itself (self_improve.py)
+    LEARNED_SKILLS_DIR,
+    LEGACY_LEARNED_SKILLS_DIR,
 ]
 
 
@@ -95,7 +100,8 @@ def discover_skills() -> list[dict]:
                     "file": skill_file,
                     "description": desc,
                     "content": body,
-                    "learned": skills_dir == LEARNED_SKILLS_DIR,
+                    "learned": skills_dir in (LEARNED_SKILLS_DIR,
+                                              LEGACY_LEARNED_SKILLS_DIR),
                 }
             )
 

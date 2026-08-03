@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 import json
 import subprocess
 import urllib.request
@@ -94,6 +95,16 @@ from session_manager import (
 from instructions_manager import (
     build_instructions_section, get_global_instructions,
 )
+
+# Learning system (facts, retrieval, reflection)
+import learning
+
+# Agent core (headless, event-emitting) + the terminal front end for it
+from core import loop as core_loop
+from core.loop import run_turn
+from core.permissions import ApprovalStore
+from core.state import AgentState
+from adapters.terminal import TerminalAdapter
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -812,29 +823,29 @@ def execute_tool(name: str, params: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def check_permission(name: str, params: dict) -> bool:
-    global YOLO_MODE
+    """Legacy entry point. The agent loop now asks through a
+    PermissionResponder (core/permissions.py); this remains for any direct
+    caller and shares the same session-scoped ApprovalStore.
+
+    Note it no longer downgrades RISK_LEVELS on "always": that turned one
+    approval of, say, `git status` into a blanket grant on every future
+    run_command. Approval is scoped to the exact call the user saw.
+    """
     if YOLO_MODE:
         return True  # YOLO mode approves everything
+    if APPROVALS.is_approved(name, params):
+        return True
     risk = RISK_LEVELS.get(name, "high")
     if risk == "low" and AUTO_APPROVE_LOW:
         return True
-    risk_colors = {"low": GREEN, "medium": YELLOW, "high": RED}
-    risk_color = risk_colors.get(risk, RED)
-    print(f'\n  {risk_color}{BOLD}⚠ Permission ({risk.upper()} risk){RESET}')
-    print(f'  {DIM}Tool:{RESET} {BOLD}{name}{RESET}')
-    for k, v in params.items():
-        display = str(v)[:200]
-        if len(str(v)) > 200:
-            display += "..."
-        print(f'  {DIM}{k}:{RESET} {display}')
-    try:
-        resp = input(f'  {YELLOW}Allow?{RESET} [y/N/always]: ').strip().lower()
-    except EOFError:
-        return False
-    if resp == "always":
-        RISK_LEVELS[name] = "low"
+
+    from core.events import PermissionNeeded
+    decision = TerminalAdapter().ask(
+        PermissionNeeded("", name, params, risk))
+    if decision == "always_allow_this_call":
+        APPROVALS.approve(name, params)
         return True
-    return resp == "y"
+    return decision == "allow"
 
 # ---------------------------------------------------------------------------
 # System prompt + project context re-injection
@@ -869,14 +880,18 @@ def _truncate_section(text: str, max_chars: int, label: str = "") -> str:
 
 # Maximum size for each system-prompt section (in characters)
 MAX_INSTRUCTIONS_CHARS = 8000       # AGENTS.md + global instructions
-MAX_MEMORY_CHARS = 2000             # memory index
+MAX_LEARNED_CHARS = 1500            # retrieved facts (bounded by k, not by store size)
 MAX_SKILLS_CHARS = 4000             # skills section
-MAX_SELF_IMPROVE_CHARS = 1500       # self-improvement context
-MAX_NOTES_CHARS = 1500              # self-notes
 MAX_TOTAL_SYSTEM_PROMPT = 20000     # hard cap on the entire system prompt
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(user_message: str = "") -> str:
+    """Build the system prompt for this turn.
+
+    `user_message` is what learned knowledge is retrieved against. An empty
+    query falls back to the most recently confirmed facts, so callers that
+    have no message yet still get something sensible.
+    """
     prompt = BASE_PROMPT
     # project-level instructions from AGENTS.md / agent.md + .tomas/instructions/
     instructions_section = build_instructions_section(PROJECT_DIR)
@@ -892,21 +907,17 @@ def build_system_prompt() -> str:
             legacy = _truncate_section(legacy, 2000, candidate.name)
             prompt += f"\n\n# Agent Instructions ({candidate.name})\n{legacy}"
             break
-    # memory index
-    memory = load_memory_index()
-    if memory:
-        if len(memory) > MAX_MEMORY_CHARS:
-            n_lines = len(memory.splitlines())
-            print(f'  {YELLOW}⚠{RESET} {DIM}memory index exceeds the prompt budget '
-                  f'({n_lines} entries) — older entries are not being loaded{RESET}')
-        memory = _truncate_section(memory, MAX_MEMORY_CHARS, "memory")
-        prompt += f"\n\n# Memory index\n{memory}"
-    # notes the agent has written for itself
+    # ── What the agent has learned — retrieved, not dumped ──
+    # This replaces the old memory-index dump, the notes dump and the tips
+    # block. Those three grew with everything ever learned until entries
+    # silently fell off the end of the budget; retrieval keeps the prompt
+    # flat in size no matter how much is stored.
     try:
-        notes_section = self_notes.get_notes_for_context()
-        if notes_section:
-            notes_section = _truncate_section(notes_section, MAX_NOTES_CHARS, "notes")
-            prompt += f"\n\n{notes_section}"
+        learned = learning.recall(user_message, k=5)
+        if learned:
+            learned = _truncate_section(learned, MAX_LEARNED_CHARS, "learned")
+            prompt += ("\n\n# What I've learned about this user and project\n"
+                       f"{learned}")
     except Exception:
         pass
     # installed skills
@@ -916,36 +927,11 @@ def build_system_prompt() -> str:
             skills_section, MAX_SKILLS_CHARS, "skills"
         )
         prompt += f"\n\n{skills_section}"
-    # ── Self-improvement context ──
-    try:
-        si_parts: list[str] = []
-        si_session = self_improve.get_session_analysis()
-        if si_session and si_session.get("purpose") != "unknown":
-            purpose = si_session.get("purpose", "unknown")
-            stage = si_session.get("stage", "unknown")
-            keywords = si_session.get("keywords", [])
-            si_parts.append(
-                f"# Session Context (self-improving system)\n"
-                f"Current session purpose: {purpose}\n"
-                f"Current task stage: {stage}\n"
-                f"Recent topics: {', '.join(keywords[:8])}\n"
-                f"Complexity: {si_session.get('complexity', 'unknown')}\n"
-            )
-        # Active self-improvement tips
-        active_tips = self_improve.get_active_tips()
-        if active_tips:
-            tips_lines = ["# Self-Improvement Tips for This Session"]
-            for i, tip in enumerate(active_tips[:5], 1):
-                tips_lines.append(f"{i}. {tip.get('message', '')}")
-            si_parts.append("\n".join(tips_lines))
-        if si_parts:
-            si_text = "\n\n".join(si_parts)
-            si_text = _truncate_section(
-                si_text, MAX_SELF_IMPROVE_CHARS, "self-improvement"
-            )
-            prompt += f"\n\n{si_text}"
-    except Exception:
-        pass
+    # NOTE: the self-improvement tips/session-context block used to be injected
+    # here. It was template text addressed to a human developer ("Consider
+    # creating shortcuts or aliases for this tool") that consumed context and
+    # changed nothing about the model's behaviour. Reflection replaces it; the
+    # generator code is still in self_improve.py pending deletion.
     # ── Hard cap on the total system prompt ──
     if len(prompt) > MAX_TOTAL_SYSTEM_PROMPT:
         prompt = _truncate_section(
@@ -964,6 +950,13 @@ def load_memory_index() -> str:
     return ""
 
 def save_memory(key: str, description: str, content: str) -> None:
+    """Persist an explicit "remember this" from the user.
+
+    Writes the markdown file (still useful to read and edit by hand) and
+    records the same thing as an `explicit` fact, which is what retrieval
+    actually reads. Explicit means the user said it outright — no inference —
+    so it goes active immediately rather than through the evidence gate.
+    """
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     filename = f"{key.replace(' ', '-').lower()}.md"
     filepath = MEMORY_DIR / filename
@@ -983,6 +976,160 @@ def save_memory(key: str, description: str, content: str) -> None:
     if not updated:
         lines.append(new_entry)
     idx.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    if learning.is_enabled():
+        try:
+            learning.remember("explicit", f"{description}: {content}".strip(": "),
+                              evidence=f"user asked to remember '{key}'",
+                              scope="global")
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Learning system wiring
+# ---------------------------------------------------------------------------
+
+def _learning_call_model(model: str, system: str, messages: list,
+                         max_tokens: int) -> str:
+    """Adapter so learning/ can reach the model without importing agent."""
+    resp = _get_client().messages.create(
+        model=model, max_tokens=max_tokens, system=system, messages=messages,
+    )
+    return "".join(b.text for b in resp.content if hasattr(b, "text"))
+
+
+def init_learning() -> None:
+    """Scope the store to this project and import the pre-Phase-3 stores."""
+    try:
+        learning.set_project(PROJECT_DIR)
+        imported = learning.migrate_legacy_stores()
+        if imported:
+            print(f'  {GREEN}✦{RESET} {DIM}Imported {imported} existing '
+                  f'memories/notes into the learning store{RESET}')
+    except Exception:
+        pass
+
+
+def reflect_on_session_end(messages: list) -> None:
+    """Learn from the finished session. Never raises, never blocks the user."""
+    if not learning.is_enabled():
+        return
+    try:
+        outcome = learning.run_session_reflection(
+            messages, call_model=_learning_call_model)
+        for scope in ("global", "project"):
+            learning.decay(scope)
+        if not outcome:
+            return
+        if outcome.get("mode") == "shadow":
+            print(f'  {DIM}🧠 Reflection logged (shadow mode) — '
+                  f'review it with /si reflect{RESET}')
+        for summary in outcome.get("promoted", []):
+            print(f'  {DIM}🧠 Learned: {summary}{RESET}')
+    except Exception:
+        pass
+
+
+def _ago(timestamp: float) -> str:
+    if not timestamp:
+        return "never"
+    seconds = max(0, time.time() - timestamp)
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{int(seconds // size)}{unit} ago"
+    return "just now"
+
+
+def _render_learned_facts() -> str:
+    """Everything the agent believes, with the evidence behind it."""
+    try:
+        rows = []
+        for scope in ("global", "project"):
+            for fact in learning.load_facts(scope):
+                fact = dict(fact)
+                fact["scope"] = scope
+                rows.append(fact)
+    except Exception as e:
+        return f'  {RED}✗{RESET} Could not read the learning store: {e}'
+
+    if not rows:
+        return (f'  {DIM}Nothing learned yet. Facts appear here as sessions '
+                f'accumulate evidence.{RESET}')
+
+    order = {"active": 0, "candidate": 1, "observed": 2}
+    rows.sort(key=lambda f: (order.get(f.get("status"), 3),
+                             -f.get("evidence_count", 0)))
+    active = sum(1 for f in rows if f.get("status") == "active")
+
+    lines = [
+        f'  {BOLD}What I have learned{RESET}',
+        f'  {DIM}{"─" * 56}{RESET}',
+        f'  {DIM}{active} active · {len(rows) - active} still gathering evidence '
+        f'· promotes at {learning.PROMOTE_AT}{RESET}',
+        '',
+    ]
+    for fact in rows:
+        status = fact.get("status", "observed")
+        mark = {"active": f'{GREEN}●{RESET}',
+                "candidate": f'{YELLOW}◐{RESET}'}.get(status, f'{DIM}○{RESET}')
+        scope = fact.get("scope", "global")
+        text = (fact.get("fact") or "").replace("\n", " ")[:100]
+        lines.append(f'  {mark} {text}')
+        lines.append(f'      {DIM}{fact.get("id", "?")} · {scope} · '
+                     f'{fact.get("evidence_count", 0)}× · '
+                     f'confirmed {_ago(fact.get("last_seen", 0))}{RESET}')
+        evidence = (fact.get("evidence") or [])
+        if evidence:
+            lines.append(f'      {DIM}└ {str(evidence[-1])[:90]}{RESET}')
+    lines.append('')
+    lines.append(f'  {DIM}/forget <id> removes one permanently.{RESET}')
+    return '\n'.join(lines)
+
+
+def _render_reflection_log(limit: int = 5) -> str:
+    """What reflection would have learned — the shadow-mode review screen."""
+    path = learning.LEARNED_DIR / "reflection-log.jsonl"
+    if not path.exists():
+        return (f'  {DIM}No reflection runs yet. Reflection happens when a '
+                f'session ends.{RESET}')
+    try:
+        entries = [json.loads(ln) for ln in
+                   path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except (OSError, json.JSONDecodeError) as e:
+        return f'  {RED}✗{RESET} Could not read the reflection log: {e}'
+    if not entries:
+        return f'  {DIM}Reflection log is empty.{RESET}'
+
+    lines = [
+        f'  {BOLD}Reflection log{RESET} {DIM}(last {min(limit, len(entries))} '
+        f'of {len(entries)}){RESET}',
+        f'  {DIM}{"─" * 56}{RESET}',
+    ]
+    for entry in entries[-limit:]:
+        result = entry.get("result", {})
+        lines.append(f'  {DIM}{_ago(entry.get("at", 0))} · mode={entry.get("mode")} '
+                     f'· {entry.get("signals", 0)} correction signals{RESET}')
+        for key, label in (("user_preferences", "preference"),
+                           ("corrections", "lesson"),
+                           ("project_notes", "project"),
+                           ("skill_candidates", "skill")):
+            for item in (result.get(key) or []):
+                text = (item.get("fact") or item.get("lesson")
+                        or item.get("name") or "")
+                if text:
+                    lines.append(f'      {DIM}[{label}]{RESET} {str(text)[:90]}')
+        if not any(result.get(k) for k in
+                   ("user_preferences", "corrections", "project_notes",
+                    "skill_candidates")):
+            lines.append(f'      {DIM}(learned nothing — the correct answer '
+                         f'for most sessions){RESET}')
+    mode_now = os.environ.get("TOMAS_REFLECT", "shadow")
+    if mode_now == "shadow":
+        lines.append('')
+        lines.append(f'  {DIM}Shadow mode: nothing above was written to the '
+                     f'store. Set TOMAS_REFLECT=active to enable.{RESET}')
+    return '\n'.join(lines)
 
 # ---------------------------------------------------------------------------
 # Context management — auto-compaction
@@ -1055,334 +1202,83 @@ def maybe_compact(messages: list, system_prompt: str = "") -> list:
 # The agent loop
 # ---------------------------------------------------------------------------
 
-MAX_TOOL_CALLS_PER_TURN = int(os.environ.get("TOMAS_MAX_TOOL_CALLS", "40"))  # safety limit to prevent infinite tool loops
-REPEATED_CALL_LIMIT = 3  # identical (name, input) calls in a row are treated as a stuck loop
+MAX_TOOL_CALLS_PER_TURN = int(os.environ.get("TOMAS_MAX_TOOL_CALLS", "40"))
 _streaming_disabled = False  # set True if provider doesn't support streaming
 
+# The loop itself now lives in core/loop.py. These aliases keep older call
+# sites working while this shim is still in place.
+_is_retryable_error = core_loop.is_retryable_error
+_is_client_error = core_loop.is_client_error
 
-def _is_retryable_error(err: Exception) -> bool:
-    """Return True if the error is transient and worth retrying (429, 5xx, timeout)."""
-    err_msg = str(err)
-    # Rate limits and server errors are retryable
-    if any(k in err_msg for k in ("429", "rate_limit", "Too Many Requests",
-                                    "502", "503", "504", "Bad Gateway",
-                                    "Service Unavailable", "Gateway Timeout",
-                                    "timeout", "timed out")):
-        return True
-    # Check for status code attribute
-    status = getattr(err, 'status_code', None)
-    if status and status >= 500:
-        return True
-    return False
+# Session-scoped tool approvals. Answering "always" records the exact call the
+# user saw; it no longer rewrites RISK_LEVELS for the rest of the process.
+APPROVALS = ApprovalStore()
 
 
-def _is_client_error(err: Exception) -> bool:
-    """Return True if the error is a client-side error (400, 401, 403, 422) that should NOT be retried."""
-    err_msg = str(err)
-    if any(k in err_msg for k in ("400", "Bad Request", "invalid_request",
-                                    "401", "Unauthorized", "authentication",
-                                    "403", "Forbidden", "permission",
-                                    "422", "Unprocessable")):
-        return True
-    status = getattr(err, 'status_code', None)
-    if status and 400 <= status < 500 and status != 429:
-        return True
-    return False
+def _tool_origin(name: str) -> str:
+    """Human-readable provenance for a tool name."""
+    if name in HANDLERS:
+        return "built-in"
+    if mcp_manager:
+        srv = mcp_manager.get_server_for_tool(MCP_TOOL_NAME_MAP.get(name, name))
+        if srv:
+            return f"MCP: {srv}"
+    return "built-in"
+
+
+def _record_tool_call(name: str, args: dict, preview: str) -> None:
+    try:
+        self_improve.record_tool_call(name, args, preview)
+    except Exception:
+        pass
+
+
+def build_state(system_prompt: str, messages: list, responder) -> AgentState:
+    """Assemble the turn context the core needs out of this module's globals."""
+    return AgentState(
+        system_prompt=system_prompt,
+        messages=messages,
+        get_client=_get_client,
+        get_model=_get_model,
+        tools=COMBINED_TOOLS,
+        max_tokens=MAX_TOKENS,
+        execute_tool=execute_tool,
+        risk_of=lambda n: RISK_LEVELS.get(n, "high"),
+        origin_of=_tool_origin,
+        responder=responder,
+        approvals=APPROVALS,
+        auto_approve_low=AUTO_APPROVE_LOW,
+        yolo=YOLO_MODE,
+        tool_budget=MAX_TOOL_CALLS_PER_TURN,
+        streaming_enabled=not _streaming_disabled,
+        on_tool_call=_record_tool_call,
+    )
 
 
 def agent_loop(system_prompt: str, messages: list) -> str:
-    """Keep calling the model until it stops requesting tools.
+    """Shim — drives core.loop.run_turn through the terminal adapter.
 
-    Includes:
-    - Streaming output (tokens printed as they arrive)
-    - Tool-call loop limit (MAX_TOOL_CALLS_PER_TURN) to prevent infinite loops
-    - Smart retry: retries 429/5xx with exponential backoff, never retries 400/401
+    Kept so the REPL and agent_cli.py keep working unchanged. New front ends
+    should drive run_turn directly with their own adapter instead.
     """
-    import time
-    import anthropic
-
-    max_retries = 3
-    tool_call_count = 0
-    recent_call_signatures: list[tuple] = []  # detects a stuck loop before MAX_TOOL_CALLS_PER_TURN does
     global _streaming_disabled
 
-    while True:
-        combined_tools = COMBINED_TOOLS
+    interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
+    adapter = TerminalAdapter(interactive=interactive)
+    state = build_state(system_prompt, messages, adapter)
 
-        # ── API call with smart retry ──
-        response = None
-        for attempt in range(max_retries + 1):
-            try:
-                # Try streaming for real-time output (only if not previously disabled)
-                if not _streaming_disabled:
-                    try:
-                        stream_result = _agent_loop_streamed(
-                            system_prompt, messages, combined_tools, tool_call_count
-                        )
-                        if stream_result == "__TOOLS__":
-                            # Model requested tools during streaming — fall back to
-                            # non-streaming to get the complete tool_use blocks
-                            pass
-                        else:
-                            return stream_result
-                    except (AttributeError, TypeError):
-                        # Streaming not supported by this provider — disable for rest of session
-                        _streaming_disabled = True
-                    except anthropic.InternalServerError:
-                        # A provider whose streaming endpoint 5xxs still works
-                        # fine non-streamed. Disable streaming and fall through
-                        # to the blocking call below instead of re-raising into
-                        # the retry loop, which would retry the *streaming*
-                        # call three times and then give up entirely.
-                        print(f'\n  {YELLOW}⚠{RESET} {DIM}streaming unavailable on this provider — continuing without it{RESET}')
-                        _streaming_disabled = True
+    # messages already carries the user's turn, so no user_message here.
+    reply = adapter.run(state)
 
-                response = _get_client().messages.create(
-                    model=_get_model(),
-                    max_tokens=MAX_TOKENS,
-                    system=system_prompt,
-                    tools=combined_tools,
-                    messages=messages,
-                )
-                break  # success
-            except anthropic.InternalServerError as e:
-                if _is_client_error(e) and not _is_retryable_error(e):
-                    # 400/401/403 — don't retry, it's a client error
-                    print(f"\n  {RED}✗{RESET} API client error (not retrying): {e}")
-                    return f"I'm sorry, but the AI service rejected the request. The system prompt or message may be too large. Try /compact to reduce context size."
-                if not _is_retryable_error(e):
-                    # Other non-retryable error
-                    print(f"\n  {RED}✗{RESET} API error: {e}")
-                    return "I'm sorry, but there was an error communicating with the AI service."
-                if attempt < max_retries:
-                    delay = 5 * (2 ** attempt)  # 5, 10, 20 seconds
-                    print(f"\n  {YELLOW}⚠{RESET} Transient error ({e}) — retrying in {delay}s (attempt {attempt + 1}/{max_retries})...")
-                    time.sleep(delay)
-                else:
-                    print(f"  {RED}✗{RESET} Still failing after {max_retries} retries ({e}).")
-                    return f"I'm sorry, but the AI service is unavailable right now: {e}"
-            except Exception as e:
-                if attempt < max_retries and _is_retryable_error(e):
-                    delay = 5 * (2 ** attempt)
-                    print(f"\n  {YELLOW}⚠{RESET} Retrying in {delay}s ({e}) (attempt {attempt + 1}/{max_retries})...")
-                    time.sleep(delay)
-                else:
-                    print(f"\n  {RED}✗{RESET} Unexpected error: {e}")
-                    return f"I'm sorry, but an unexpected error occurred: {e}"
+    # Propagate what the turn learned back into module state.
+    _streaming_disabled = not state.streaming_enabled
+    _last_turn_usage["input"] = state.usage.get("input", 0)
+    _last_turn_usage["output"] = state.usage.get("output", 0)
+    _session_tokens["input"] += state.usage.get("total_input", 0)
+    _session_tokens["output"] += state.usage.get("total_output", 0)
+    _session_tokens["calls"] += state.usage.get("calls", 0)
+    return reply
 
-        if response is None:
-            return "I'm sorry, but the AI service could not be reached."
-
-        # ── Track token usage ──
-        global _last_turn_usage, _session_tokens
-        if hasattr(response, "usage") and response.usage:
-            _last_turn_usage["input"] = response.usage.input_tokens or 0
-            _last_turn_usage["output"] = response.usage.output_tokens or 0
-            _session_tokens["input"] += _last_turn_usage["input"]
-            _session_tokens["output"] += _last_turn_usage["output"]
-            _session_tokens["calls"] += 1
-
-        if response.stop_reason != "tool_use":
-            text = "".join(b.text for b in response.content if hasattr(b, "text"))
-            # Record what we said. Without this the model has no memory of its
-            # own replies — every turn would see a transcript of user messages
-            # only, and saved sessions would contain no assistant turns.
-            if text:
-                messages.append({"role": "assistant", "content": text})
-                # Print the response with label (non-streaming path)
-                print(f'  {MAGENTA}{BOLD}▌ TOMAS{RESET}')
-                print(f'  {text}')
-            return text
-
-        # ── Tool-call loop limit ──
-        tool_calls_this_round = sum(
-            1 for b in response.content if b.type == "tool_use"
-        )
-        tool_call_count += tool_calls_this_round
-
-        # ── Stuck-loop detection ──
-        # A flat call-count cap can't tell "needs 30 distinct steps" from
-        # "stuck repeating the same call" — it stops both at the same
-        # threshold. Track identical (name, input) signatures and cut off
-        # fast on genuine repetition, independent of MAX_TOOL_CALLS_PER_TURN.
-        for b in response.content:
-            if b.type == "tool_use":
-                sig = (b.name, json.dumps(b.input, sort_keys=True, default=str))
-                recent_call_signatures.append(sig)
-        recent_call_signatures[:] = recent_call_signatures[-REPEATED_CALL_LIMIT:]
-        stuck_in_loop = (
-            len(recent_call_signatures) == REPEATED_CALL_LIMIT
-            and len(set(recent_call_signatures)) == 1
-        )
-
-        if stuck_in_loop or tool_call_count > MAX_TOOL_CALLS_PER_TURN:
-            if stuck_in_loop:
-                reason = f"same tool call repeated {REPEATED_CALL_LIMIT}x in a row"
-                limit_msg = f"Repeated tool call detected ({reason})."
-            else:
-                reason = f"limit {MAX_TOOL_CALLS_PER_TURN} reached"
-                limit_msg = f"Tool call limit ({MAX_TOOL_CALLS_PER_TURN}) reached."
-            print(f'    {RED}⚠{RESET}  Stopping to prevent infinite loop: {reason}.')
-            # The model asked for tools we are refusing to run. Record the
-            # request and answer every tool_use with a result, or the next
-            # request is malformed (dangling tool_calls) and will be rejected.
-            messages.append({"role": "assistant", "content": response.content})
-            # tool_result blocks first, then the instruction — one user message,
-            # so the transcript keeps alternating cleanly.
-            messages.append({"role": "user", "content": [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": b.id,
-                    "content": f"Not executed: {reason}.",
-                }
-                for b in response.content if b.type == "tool_use"
-            ] + [
-                {"type": "text", "text": f"{limit_msg} Please summarize what you've found so far and provide a response to the user."}
-            ]})
-            # One more call to get the final summary
-            try:
-                final_resp = _get_client().messages.create(
-                    model=_get_model(),
-                    max_tokens=MAX_TOKENS,
-                    system=system_prompt,
-                    tools=combined_tools,
-                    messages=messages,
-                )
-                final_text = "".join(b.text for b in final_resp.content if hasattr(b, "text"))
-                if final_text:
-                    messages.append({"role": "assistant", "content": final_text})
-                return final_text
-            except Exception:
-                return "I've reached the tool-call limit. Here's what I found so far — please ask me to continue if you need more."
-
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                args_str = json.dumps(block.input)[:120]
-                # Determine tool origin label
-                tool_origin = ""
-                if block.name in HANDLERS:
-                    tool_origin = f"{DIM}[built-in]{RESET}"
-                elif mcp_manager:
-                    # Check renamed MCP tools first, then original names
-                    mcp_orig = MCP_TOOL_NAME_MAP.get(block.name, block.name)
-                    srv = mcp_manager.get_server_for_tool(mcp_orig)
-                    if srv:
-                        tool_origin = f"{DIM}[MCP: {srv}]{RESET}"
-                print(f'    {YELLOW}⚡{RESET} {BOLD}{block.name}{RESET} {tool_origin}({DIM}{args_str}...{RESET})')
-                if not check_permission(block.name, block.input):
-                    result = "Error: user denied this tool call."
-                else:
-                    result = execute_tool(block.name, block.input)
-                # ── Record tool call for self-improvement ──
-                try:
-                    self_improve.record_tool_call(block.name, block.input, result[:200])
-                except Exception:
-                    pass
-                # Truncate large tool results to avoid blowing up context
-                if isinstance(result, str) and len(result) > 100_000:
-                    print(f'    {RED}⚠{RESET}  tool result truncated: {len(result)} chars → 100K')
-                    result = result[:100_000] + f"\n[...truncated, full result was {len(result)} chars]"
-                # ── Show a brief result preview so the user can see the
-                #    tool's output inline in the chat (first 1-2 lines). ──
-                if isinstance(result, str) and result.strip():
-                    preview = result.strip().splitlines()
-                    shown = preview[0][:160] if preview else ""
-                    if len(preview) > 1 or len(result) > 160:
-                        shown += f' {DIM}…{RESET}'
-                    print(f'    {GREEN}↳{RESET} {DIM}{shown}{RESET}')
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result,
-                })
-        # The assistant's tool_use blocks MUST be in the transcript before the
-        # tool results. OpenAI-format upstreams (everything behind zen_proxy)
-        # translate tool_result into a `role: "tool"` message, which is only
-        # valid as a response to a preceding message carrying `tool_calls`.
-        # Without this append the upstream rejects the request outright.
-        messages.append({"role": "assistant", "content": response.content})
-        messages.append({"role": "user", "content": tool_results})
-
-
-def _agent_loop_streamed(
-    system_prompt: str, messages: list, combined_tools: list, tool_call_count: int
-) -> str:
-    """Stream the model response token-by-token for real-time output.
-
-    Only handles the text-streaming part. If the model requests tools,
-    returns the sentinel "__TOOLS__" so the caller can fall back to
-    non-streaming for tool processing.
-
-    Returns:
-        - The full text response (if no tools were called)
-        - "__TOOLS__" sentinel (if the model requested tool calls)
-    """
-    import anthropic
-
-    text_parts: list[str] = []
-    has_tool_use = False
-    stop_reason = None
-    usage_info = None
-
-    print(f'  {MAGENTA}{BOLD}▌ TOMAS{RESET}')
-    print(f'  ', end='', flush=True)
-
-    try:
-        with _get_client().messages.stream(
-            model=_get_model(),
-            max_tokens=MAX_TOKENS,
-            system=system_prompt,
-            tools=combined_tools,
-            messages=messages,
-        ) as stream:
-            for event in stream:
-                if event.type == "content_block_delta":
-                    if event.delta.type == "text_delta":
-                        text = event.delta.text
-                        text_parts.append(text)
-                        sys.stdout.write(text)
-                        sys.stdout.flush()
-                elif event.type == "content_block_start":
-                    if event.content_block.type == "tool_use":
-                        has_tool_use = True
-                elif event.type == "message_stop":
-                    final_msg = stream.get_final_message()
-                    stop_reason = final_msg.stop_reason
-                    usage_info = getattr(final_msg, "usage", None)
-            print()  # end the streamed line
-    except (AttributeError, TypeError) as e:
-        # Provider doesn't support streaming — raise to trigger fallback
-        raise
-    except anthropic.InternalServerError:
-        raise
-    except Exception as e:
-        # Other streaming errors — fall back
-        print(f'\n  {YELLOW}⚠{RESET} Streaming interrupted, falling back...')
-        raise TypeError(f"streaming failed: {e}")
-
-    # Track usage
-    global _last_turn_usage, _session_tokens
-    if usage_info:
-        _last_turn_usage["input"] = usage_info.input_tokens or 0
-        _last_turn_usage["output"] = usage_info.output_tokens or 0
-        _session_tokens["input"] += _last_turn_usage["input"]
-        _session_tokens["output"] += _last_turn_usage["output"]
-        _session_tokens["calls"] += 1
-
-    full_text = "".join(text_parts)
-
-    # If the model requested tools, return sentinel so caller falls back
-    if has_tool_use or stop_reason == "tool_use":
-        return "__TOOLS__"
-
-    # Record the reply here too — the caller returns this text directly, so
-    # without this append the streaming path silently reintroduces the
-    # no-conversation-memory bug that the non-streaming path just fixed.
-    if full_text:
-        messages.append({"role": "assistant", "content": full_text})
-
-    return full_text
 
 # ---------------------------------------------------------------------------
 # Slash commands
@@ -1399,8 +1295,10 @@ SLASH_COMMANDS = {
     "skill":        {"desc": "Run a skill: /skill <name>",        "icon": "⚡"},
     "pdf-report":   {"desc": "Generate AI news PDF report",      "icon": "📄"},
     "zen":          {"desc": "OpenCode Zen proxy status",         "icon": "◉"},
-    "self-improve": {"desc": "Self-improvement system status",    "icon": "🧠"},
+    "self-improve": {"desc": "What the agent has learned",        "icon": "🧠"},
     "si":           {"desc": "Alias for /self-improve",           "icon": "🧠"},
+    "forget":       {"desc": "Forget a learned fact: /forget <id>", "icon": "🗑"},
+    "private":      {"desc": "Toggle incognito (learn nothing)",  "icon": "🕶"},
     "save":         {"desc": "Save current session",              "icon": "💾"},
     "load":         {"desc": "Load a saved session: /load <id>",  "icon": "📂"},
     "session":      {"desc": "Session mgmt: list/save/continue",  "icon": "📋"},
@@ -1547,7 +1445,8 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
         elif arg in ("strict",):
             AUTO_APPROVE_LOW = False
             YOLO_MODE = False
-            # Strict mode removes any risk-level overrides made via "always"
+            # Strict mode clears every approval granted via "always"
+            APPROVALS.clear()
             for k in list(RISK_LEVELS.keys()):
                 if k not in ("read_file", "list_files", "search_code", "edit_file",
                              "write_file", "save_memory", "run_command", "fetch_url",
@@ -1774,6 +1673,17 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
     if cmd in ("self-improve", "si"):
         sub = parts[1].lower() if len(parts) > 1 else ""
 
+        # ── The learning store (Phase 3) ──
+        # The requirement is that the user does not see the machinery. That
+        # must not mean the user cannot see it: an agent that silently
+        # accumulates wrong beliefs with no way to inspect them is worse than
+        # one that does not learn.
+        if sub in ("", "facts", "learned"):
+            return _render_learned_facts()
+
+        if sub in ("reflect", "reflection"):
+            return _render_reflection_log()
+
         if sub in ("analyze", "scan"):
             self_improve.analyze_patterns(force=True)
             self_improve.generate_skills_for_all_ready_patterns()
@@ -1831,6 +1741,27 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
 
         # Default: show status
         return self_improve.get_self_improve_status()
+
+    if cmd == "forget":
+        fact_id = parts[1].strip() if len(parts) > 1 else ""
+        if not fact_id:
+            return (f'  {YELLOW}Usage:{RESET} {CYAN}/forget <id>{RESET}\n'
+                    f'  {DIM}Ids are shown by /si.{RESET}')
+        try:
+            removed = learning.forget(fact_id)
+        except Exception as e:
+            return f'  {RED}✗{RESET} Could not forget: {e}'
+        if not removed:
+            return f'  {DIM}No fact with id {fact_id}.{RESET}'
+        return (f'  {GREEN}✓{RESET} Forgotten: {removed.get("fact", "")[:80]}\n'
+                f'  {DIM}Tombstoned — reflection will not re-learn it.{RESET}')
+
+    if cmd == "private":
+        learning.set_enabled(not learning.is_enabled())
+        if learning.is_enabled():
+            return f'  {GREEN}✓{RESET} Learning re-enabled for this session.'
+        return (f'  {GREEN}✓{RESET} Incognito: nothing from this session will be '
+                f'reflected on or stored.')
 
     # ── Self-note commands ──
     if cmd == "note":
@@ -1997,7 +1928,8 @@ def read_input_with_suggestions(prompt: str) -> str:
             AUTO_APPROVE_LOW = False
         elif m == "strict":
             AUTO_APPROVE_LOW = False
-            # Reset non-built-in risk overrides
+            # Reset non-built-in risk overrides and clear "always" approvals
+            APPROVALS.clear()
             builtins = {"read_file", "list_files", "search_code", "edit_file",
                         "write_file", "save_memory", "run_command", "fetch_url",
                         "fetch_url_with_browser", "search_web"}
@@ -2421,6 +2353,7 @@ def main() -> int:
 
     # ── Initialize self-improving system ──
     self_improve.init()
+    init_learning()
     print(f'  {GREEN}✦{RESET}  Self-improving system active — learning from interactions')
 
     print(f'  {DIM}─── Type {RESET}{BOLD}quit{RESET}{DIM} or {RESET}{BOLD}exit{RESET}{DIM} to leave · {RESET}{BOLD}/help{RESET}{DIM} for commands · Ctrl+C also works ───{RESET}')
@@ -2477,7 +2410,8 @@ def main() -> int:
                 # Regular user message
                 messages.append({"role": "user", "content": user_input})
             messages = maybe_compact(messages)
-            system_prompt = build_system_prompt()  # re-inject every turn
+            # Retrieve learned knowledge against what the user just asked.
+            system_prompt = build_system_prompt(user_input)  # re-inject every turn
             # Re-check compaction with the actual system prompt size
             messages = maybe_compact(messages, system_prompt)
             result = agent_loop(system_prompt, messages)
@@ -2517,6 +2451,7 @@ def main() -> int:
             except Exception as e:
                 print(f'  {DIM}⚠  Session save skipped: {e}{RESET}')
             CONTINUE_SESSION_ID = None
+            reflect_on_session_end(messages)
         # ── Clean up MCP connections ──
         if mcp_manager:
             mcp_manager.disconnect_all()

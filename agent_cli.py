@@ -60,10 +60,47 @@ PROJECT_DIR = Path(__file__).parent.resolve()
 TOMAS_DIR = Path.home() / ".tomas"
 sys.path.insert(0, str(PROJECT_DIR))
 
-# Load .env — first from TOMAS install dir, then from src dir (project overrides)
+ENV_FILE = TOMAS_DIR / ".env"           # durable config; survives an update
+_LEGACY_ENV_FILE = PROJECT_DIR / ".env"  # inside $SrcDir in a deployed install
+
+
+def _migrate_src_env() -> None:
+    """Rescue config the CLI used to write into the source tree.
+
+    `TOMAS update` deletes $SrcDir wholesale (install.ps1:231), so API keys,
+    base URLs and the model selection written there were destroyed on every
+    upgrade. Only runs for a real deployed install ($SrcDir == ~/.tomas/src) —
+    a dev checkout's .env is the developer's own file and is left alone.
+    """
+    if PROJECT_DIR != TOMAS_DIR / "src" or not _LEGACY_ENV_FILE.exists():
+        return
+    try:
+        existing = ""
+        if ENV_FILE.exists():
+            existing = ENV_FILE.read_text(encoding="utf-8")
+        have = {ln.split("=", 1)[0].strip()
+                for ln in existing.splitlines() if "=" in ln}
+
+        rescued = [ln for ln in _LEGACY_ENV_FILE.read_text(encoding="utf-8").splitlines()
+                   if "=" in ln and ln.split("=", 1)[0].strip() not in have]
+        if rescued:
+            TOMAS_DIR.mkdir(parents=True, exist_ok=True)
+            merged = existing.rstrip("\n")
+            merged = (merged + "\n" if merged else "") + "\n".join(rescued) + "\n"
+            ENV_FILE.write_text(merged, encoding="utf-8")
+        # with_suffix would give ".env.env.migrated" — for a dotfile the whole
+        # name is the stem, so set the name outright.
+        _LEGACY_ENV_FILE.rename(_LEGACY_ENV_FILE.with_name(".env.migrated"))
+    except Exception:
+        pass
+
+
+_migrate_src_env()
+
+# Load .env — durable config first, then any dev-checkout overrides
 from dotenv import load_dotenv
-load_dotenv(TOMAS_DIR / ".env")  # main config (API key, etc.)
-load_dotenv(PROJECT_DIR / ".env", override=True)  # project overrides (model)
+load_dotenv(ENV_FILE)  # main config (API key, etc.)
+load_dotenv(_LEGACY_ENV_FILE, override=True)  # dev-checkout overrides (model)
 
 # Import agent modules
 from agent import (
@@ -90,22 +127,45 @@ def is_playwright_available() -> bool:
         return False
 
 
-def update_dotenv(key: str, value: str):
-    """Update a key in both .env file and the running os.environ."""
-    env_file = PROJECT_DIR / ".env"
-    content = env_file.read_text(encoding="utf-8") if env_file.exists() else ""
-
-    # Update in file content
+def _set_env_key(path: Path, key: str, value: str) -> None:
+    """Write key=value into a .env file, replacing any existing entry."""
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
     lines = content.splitlines()
-    found = False
     for i, line in enumerate(lines):
         if line.startswith(f"{key}="):
             lines[i] = f"{key}={value}"
-            found = True
             break
-    if not found:
+    else:
         lines.append(f"{key}={value}")
-    env_file.write_text("\n".join(lines), encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _drop_env_key(path: Path, key: str) -> bool:
+    """Remove a key from a .env file. Returns True if anything was removed."""
+    if not path.exists():
+        return False
+    lines = path.read_text(encoding="utf-8").splitlines()
+    kept = [ln for ln in lines if not ln.startswith(f"{key}=")]
+    if len(kept) == len(lines):
+        return False
+    path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    return True
+
+
+def update_dotenv(key: str, value: str):
+    """Persist a config key and apply it to the running process.
+
+    Writes to ~/.tomas/.env, which survives an update — this used to write
+    into the source tree, so every API key and provider chosen through the
+    menus was wiped by `TOMAS update`.
+
+    Because a dev checkout's .env is loaded afterwards with override=True, a
+    stale entry there would silently shadow what the user just set, so the
+    key is dropped from that file too.
+    """
+    _set_env_key(ENV_FILE, key, value)
+    _drop_env_key(_LEGACY_ENV_FILE, key)
 
     # Also update the running process environment so get_model() works immediately
     os.environ[key] = value
