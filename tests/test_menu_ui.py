@@ -42,6 +42,10 @@ class VirtualTerminal:
     def __init__(self):
         self.rows: list[str] = ['']
         self.cur = 0
+        # Widest row ever drawn, not merely the widest still on screen. The
+        # prompt erases its hint line before returning, so anything that
+        # asserts on the final screen cannot see the row that overflowed.
+        self.widest = 0
 
     def _ensure(self, idx: int) -> None:
         while len(self.rows) <= idx:
@@ -56,6 +60,12 @@ class VirtualTerminal:
                 n = int(arg) if arg.isdigit() else 0
                 if code == 'A':
                     self.cur = max(0, self.cur - max(1, n))
+                elif code == 'B':
+                    # The prompt writes its hint on the line below and comes
+                    # back up; without 'B' the two cancel out and the test
+                    # would not see where the hint actually landed.
+                    self.cur += max(1, n)
+                    self._ensure(self.cur)
                 elif code == 'H':
                     self.cur = 0
                 elif code == 'K' and n == 2:
@@ -80,6 +90,8 @@ class VirtualTerminal:
             else:
                 self._ensure(self.cur)
                 self.rows[self.cur] += ch
+                from text_display import display_width
+                self.widest = max(self.widest, display_width(self.rows[self.cur]))
             i += 1
 
     def flush(self):
@@ -344,6 +356,122 @@ class TestStreamWrap(unittest.TestCase):
         code = '```\n' + 'x' * 80 + '\n```'
         rendered = self._render(code, 40)
         self.assertIn('x' * 80, rendered)
+
+
+class TestShortenCarriesColour(unittest.TestCase):
+    """`shorten` measures with ANSI stripped; it must truncate that way too.
+
+    The truncation loop used to walk the raw string, charging a column for
+    each byte of `\\x1b[92m`. A coloured row was cut several columns early and
+    could be cut inside an escape — leaving `[9` on screen with the colour
+    stuck on for the rest of the line.
+    """
+
+    GREEN, RESET = '\x1b[92m', '\x1b[0m'
+
+    def test_visible_width_is_respected(self):
+        from text_display import display_width, shorten
+        coloured = f'{self.GREEN}{"x" * 60}{self.RESET}'
+        self.assertLessEqual(display_width(shorten(coloured, 20)), 20)
+
+    def test_colour_is_not_charged_as_width(self):
+        """Colouring a string must not change how much of it survives."""
+        from text_display import shorten, strip_ansi
+        plain = 'y' * 60
+        coloured = f'{self.GREEN}{plain}{self.RESET}'
+        self.assertEqual(strip_ansi(shorten(coloured, 20)), shorten(plain, 20))
+
+    def test_never_cuts_inside_an_escape(self):
+        from text_display import shorten
+        out = shorten(''.join(f'{self.GREEN}{c}{self.RESET}' for c in 'abcdefghij'), 4)
+        for fragment in re.findall(r'\x1b\[[0-9;]*[A-Za-z]?', out):
+            self.assertRegex(fragment, r'^\x1b\[[0-9;]*[A-Za-z]$')
+
+    def test_truncated_colour_is_closed(self):
+        """A cut row must not bleed its colour into the rest of the line."""
+        from text_display import shorten
+        self.assertTrue(shorten(f'{self.GREEN}{"z" * 60}', 10).endswith(self.RESET))
+
+    def test_plain_text_is_unchanged(self):
+        from text_display import shorten
+        self.assertEqual(shorten('short', 40), 'short')
+        self.assertFalse(shorten('a' * 60, 10).endswith(self.RESET))
+
+
+class TestPromptHintFitsOnOneRow(unittest.TestCase):
+    """The chat prompt's hint line must occupy exactly one row.
+
+    `_show` writes the hint on the line below and returns with `\\033[1A`. With
+    no matches the hint lists every slash command, which is far wider than any
+    terminal: it soft-wrapped onto a second row while the rewind moved up only
+    one, so the next redraw drew under the previous one — the menu duplication
+    bug, in the chat.
+    """
+
+    def _type(self, text, columns=80):
+        """Type `text` then Enter at the real prompt. Returns the screen."""
+        import msvcrt
+        import shutil
+        import agent
+        screen = VirtualTerminal()
+        keys = iter(list(text) + ['\r'])
+        saved = (msvcrt.getwch, sys.stdout, shutil.get_terminal_size)
+        msvcrt.getwch = lambda: next(keys)
+        sys.stdout = screen
+        # term_columns reads this at call time, so the width under test is the
+        # one the prompt will actually see.
+        shutil.get_terminal_size = lambda *a, **k: os.terminal_size((columns, 24))
+        try:
+            agent.read_input_with_suggestions('> ')
+        finally:
+            msvcrt.getwch, sys.stdout, shutil.get_terminal_size = saved
+        return screen
+
+    def test_hint_with_no_matches_stays_within_the_terminal(self):
+        # '/zzz' matches nothing, which is the branch that lists every command.
+        self.assertLessEqual(self._type('/zzz', columns=80).widest, 80)
+
+    def test_hint_with_matches_stays_within_the_terminal(self):
+        self.assertLessEqual(self._type('/s', columns=60).widest, 60)
+
+    def test_a_narrow_terminal_is_still_one_row(self):
+        self.assertLessEqual(self._type('/', columns=40).widest, 40)
+
+    def test_the_hint_is_actually_drawn(self):
+        """Guards the three assertions above: a prompt that drew no hint at
+        all would satisfy them trivially."""
+        self.assertGreater(self._type('/', columns=80).widest, 20)
+
+
+class TestMenuKeyOverlay(unittest.TestCase):
+    """`?` opens the key list and returns to an intact menu."""
+
+    ITEMS = ['alpha', 'beta', 'gamma']
+
+    def test_overlay_lists_the_keys(self):
+        screen = VirtualTerminal()
+        saved_stdout, saved_get_key = sys.stdout, agent_cli.get_key
+        sys.stdout = screen
+        agent_cli.get_key = lambda: 'ENTER'
+        try:
+            agent_cli._show_menu_keys()
+        finally:
+            sys.stdout, agent_cli.get_key = saved_stdout, saved_get_key
+        self.assertIn('Menu keys', screen.text)
+        self.assertIn('filter the list', screen.text)
+
+    # The overlay waits for a keypress of its own, so every script below
+    # spends one key dismissing it.
+    def test_menu_is_intact_after_the_overlay(self):
+        """Each item appears once — the overlay must not leave a second copy."""
+        idx, screen = drive_menu(self.ITEMS, ['?', 'ENTER', 'DOWN', 'ENTER'])
+        self.assertEqual(idx, 1)
+        for item in self.ITEMS:
+            self.assertEqual(screen.text.count(item), 1, screen.text)
+
+    def test_overlay_does_not_change_the_selection(self):
+        idx, _ = drive_menu(self.ITEMS, ['DOWN', '?', 'ENTER', 'ENTER'])
+        self.assertEqual(idx, 1)
 
 
 if __name__ == '__main__':

@@ -25,6 +25,10 @@ DEFAULT_WIDTH = 100
 # stripped before measuring or every coloured string measures too wide.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
+# Kept here rather than imported from adapters.ansi: this module is the one
+# every renderer already depends on, and it must not depend on any of them.
+RESET = "\x1b[0m"
+
 
 def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text or "")
@@ -92,6 +96,15 @@ def shorten(text: str, width: int, ellipsis: str = "…") -> str:
     The old `json.dumps(...)[:120]` cut inside a `\\uXXXX` escape and emitted
     fragments like `3f\\u0440\\u0438`. Slicing by column, on whole
     characters, cannot produce that.
+
+    Colour is carried, not counted. `display_width` strips ANSI before
+    measuring, so the early-exit below is right — but the truncation loop used
+    to walk the raw string and charge a column for each byte of `\\x1b[92m`.
+    A coloured row therefore got cut several columns early and could be cut
+    *inside* an escape, leaving `[9` on screen and the colour stuck on. Escapes
+    are now stepped over at zero width and re-emitted intact, and a reset is
+    appended when one was seen, so a truncated row cannot bleed its colour into
+    the rest of the line.
     """
     text = text or ""
     if width <= 0:
@@ -99,14 +112,24 @@ def shorten(text: str, width: int, ellipsis: str = "…") -> str:
     if display_width(text) <= width:
         return text
     budget = max(0, width - display_width(ellipsis))
-    out, used = [], 0
-    for ch in text:
-        w = char_width(ch)
+    out: list[str] = []
+    used = 0
+    saw_escape = False
+    i = 0
+    while i < len(text):
+        match = _ANSI_RE.match(text, i)
+        if match:
+            out.append(match.group())
+            saw_escape = True
+            i = match.end()
+            continue
+        w = char_width(text[i])
         if used + w > budget:
             break
-        out.append(ch)
+        out.append(text[i])
         used += w
-    return "".join(out) + ellipsis
+        i += 1
+    return "".join(out) + ellipsis + (RESET if saw_escape else "")
 
 
 def rule(char: str = "─", width: int | None = None, indent: int = 2) -> str:

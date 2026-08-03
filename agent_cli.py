@@ -264,6 +264,37 @@ def _matches(item: str, needle: str) -> bool:
     return needle in strip_ansi(item or '').lower()
 
 
+# One footer, so every menu advertises the same keys — and mentions `?`,
+# which is where the rest of them are written down.
+DEFAULT_FOOTER = '↑↓ navigate · Enter select · Esc back · ? keys'
+
+MENU_KEYS = [
+    ("↑ ↓",       "move (blank spacer rows are skipped)"),
+    ("PgUp PgDn", "move a screenful"),
+    ("Home End",  "first / last row"),
+    ("1-9",       "jump to the Nth selectable row"),
+    ("/",         "filter the list · Esc clears the filter"),
+    ("Enter",     "select"),
+    ("Esc ← q",   "back"),
+    ("?",         "this help"),
+]
+
+
+def _show_menu_keys() -> None:
+    """The key overlay. Painted over the menu; the caller repaints after."""
+    clear_screen()
+    budget = max(1, term_columns() - 1)
+    print(f'  {BOLD}Menu keys{RESET}')
+    print(f'  {DIM}{"─" * min(50, budget - 2)}{RESET}')
+    width = max(len(k) for k, _ in MENU_KEYS)
+    for key, desc in MENU_KEYS:
+        print(shorten(f'    {CYAN}{key}{RESET}{" " * (width - len(key) + 2)}{DIM}{desc}{RESET}', budget))
+    print()
+    sys.stdout.write(f'  {DIM}Press any key to go back{RESET}')
+    sys.stdout.flush()
+    get_key()
+
+
 def arrow_menu(title: str, items: list, header_lines: list = None,
                footer: str = None, max_visible: int = 14) -> int:
     """Arrow-key menu with a row-accurate viewport.
@@ -364,7 +395,7 @@ def arrow_menu(title: str, items: list, header_lines: list = None,
         if filtering:
             base = f'/{query}{DIM}  ({len(stops)} match){RESET}'
         else:
-            base = footer if footer else '↑↓ navigate · Enter select · Esc cancel'
+            base = footer if footer else DEFAULT_FOOTER
             if len(view) < len(shown):
                 here = (stops.index(selected) + 1) if selected in stops else 0
                 base += f'  [{here}/{len(stops)}]'
@@ -404,12 +435,23 @@ def arrow_menu(title: str, items: list, header_lines: list = None,
             print(f'{BOLD}{shorten(title, line_budget)}{RESET}')
             print('─' * min(50, line_budget))
 
+    def full_redraw():
+        """Repaint everything, header included, and re-anchor the rewind.
+
+        `redraw` rewinds by `last_rows`, which is only meaningful while the
+        rows below the header are the last thing on screen. Anything that
+        paints over the whole screen — the key overlay — has to come back
+        through here, or the next rewind lands in the middle of it.
+        """
+        nonlocal last_rows
+        clear_screen()
+        draw_header()
+        last_rows = draw_all()
+        sys.stdout.flush()
+
     # ── First draw ──
     sys.stdout.write(HIDE_CURSOR)
-    clear_screen()
-    draw_header()
-    last_rows = draw_all()
-    sys.stdout.flush()
+    full_redraw()
 
     def leave(result: int) -> int:
         sys.stdout.write(SHOW_CURSOR)
@@ -472,6 +514,9 @@ def arrow_menu(title: str, items: list, header_lines: list = None,
             filtering, query = True, ''
             refilter()
             redraw()
+        elif key == '?':
+            _show_menu_keys()
+            full_redraw()
         elif isinstance(key, str) and key.isdigit() and key != '0':
             # Jump to the Nth selectable row — the menus are numbered lists.
             target = int(key) - 1
@@ -708,7 +753,7 @@ def _choose_provider_to_switch() -> bool:
     display.append(f'  {RED}✕{RESET}  Cancel')
 
     idx = arrow_menu('Switch Active Provider', display,
-                     footer='↑↓ navigate · Enter select · Esc cancel')
+                     footer=DEFAULT_FOOTER)
     if idx < 0 or idx >= len(providers):
         return False
 
@@ -1197,7 +1242,7 @@ def _mcp_add_server_interactive():
         '',
     ]
     tidx = arrow_menu('', transport_items, header_lines=transport_header,
-                      footer='↑↓ navigate · Enter select · Esc cancel')
+                      footer=DEFAULT_FOOTER)
     if tidx < 0 or tidx >= 2:
         return
     is_http = (tidx == 0)
@@ -1643,7 +1688,7 @@ def page_configure_provider():
             display.append(f'  {p}{suffix}')
 
     idx = arrow_menu('Connect / Configure Provider', display,
-                     footer='↑↓ navigate · Enter select · Esc cancel')
+                     footer=DEFAULT_FOOTER)
     if idx < 0:
         return
 
@@ -1736,7 +1781,7 @@ def page_configure_provider():
             return
         m_idx = arrow_menu('Ollama — choose a model',
                            [f'  {m}' for m in ollama_models],
-                           footer='↑↓ navigate · Enter select · Esc cancel')
+                           footer=DEFAULT_FOOTER)
         if m_idx < 0:
             return
         model = ollama_models[m_idx]
@@ -2111,7 +2156,7 @@ def _show_filtered_model_menu(model_entries, label, current, initial_query=None)
     f_values = [e[1] for e in filtered]
     idx = arrow_menu(f'Search Results: "{query}"  ({label})',
                      f_display,
-                     footer='↑↓ navigate · Enter select · Esc cancel')
+                     footer=DEFAULT_FOOTER)
     if idx < 0:
         return  # back to main menu
     selected = f_values[idx]
@@ -2189,7 +2234,7 @@ def page_choose_model():
     values = [e[1] for e in model_entries]
     idx = arrow_menu(f'Choose Model  ({label}) — current: {current}',
                      display,
-                     footer='↑↓ navigate · Enter select · Esc cancel')
+                     footer=DEFAULT_FOOTER)
     if idx < 0:
         return
     selected = values[idx]
@@ -2300,7 +2345,7 @@ def _fetch_openrouter_models():
     values = [e[1] for e in entries]
     idx = arrow_menu(f'OpenRouter Models ({len(entries)} available, showing first 150)',
                      display[:150],
-                     footer='↑↓ navigate · Enter select · Esc cancel')
+                     footer=DEFAULT_FOOTER)
     if idx < 0:
         return
     model = values[idx]
