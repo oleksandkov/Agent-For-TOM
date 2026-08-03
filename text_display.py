@@ -25,6 +25,13 @@ DEFAULT_WIDTH = 100
 # stripped before measuring or every coloured string measures too wide.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
+<<<<<<< HEAD
+=======
+# Kept here rather than imported from adapters.ansi: this module is the one
+# every renderer already depends on, and it must not depend on any of them.
+RESET = "\x1b[0m"
+
+>>>>>>> 2d11f2fa9708ae26b06718a847edca04f2e94090
 
 def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text or "")
@@ -64,12 +71,49 @@ def term_width(default: int = DEFAULT_WIDTH) -> int:
     return max(MIN_WIDTH, min(cols, MAX_WIDTH))
 
 
+<<<<<<< HEAD
+=======
+def term_columns(default: int = DEFAULT_WIDTH) -> int:
+    """The terminal's real column count, unclamped.
+
+    `term_width` is a *reading* width — capped at 120 so prose does not sprawl.
+    Cursor arithmetic needs the real number instead: a menu redraw that moves
+    the cursor up by N rows has to know when the terminal will soft-wrap a
+    line into two rows, and that happens at the true edge, not at 120.
+    """
+    try:
+        return max(20, shutil.get_terminal_size((default, 24)).columns)
+    except Exception:
+        return default
+
+
+def term_lines(default: int = 24) -> int:
+    """The terminal's real row count. Used to size a menu viewport."""
+    try:
+        return max(6, shutil.get_terminal_size((80, default)).lines)
+    except Exception:
+        return default
+
+
+>>>>>>> 2d11f2fa9708ae26b06718a847edca04f2e94090
 def shorten(text: str, width: int, ellipsis: str = "…") -> str:
     """Truncate to `width` columns, always on a character boundary.
 
     The old `json.dumps(...)[:120]` cut inside a `\\uXXXX` escape and emitted
     fragments like `3f\\u0440\\u0438`. Slicing by column, on whole
     characters, cannot produce that.
+<<<<<<< HEAD
+=======
+
+    Colour is carried, not counted. `display_width` strips ANSI before
+    measuring, so the early-exit below is right — but the truncation loop used
+    to walk the raw string and charge a column for each byte of `\\x1b[92m`.
+    A coloured row therefore got cut several columns early and could be cut
+    *inside* an escape, leaving `[9` on screen and the colour stuck on. Escapes
+    are now stepped over at zero width and re-emitted intact, and a reset is
+    appended when one was seen, so a truncated row cannot bleed its colour into
+    the rest of the line.
+>>>>>>> 2d11f2fa9708ae26b06718a847edca04f2e94090
     """
     text = text or ""
     if width <= 0:
@@ -77,6 +121,7 @@ def shorten(text: str, width: int, ellipsis: str = "…") -> str:
     if display_width(text) <= width:
         return text
     budget = max(0, width - display_width(ellipsis))
+<<<<<<< HEAD
     out, used = [], 0
     for ch in text:
         w = char_width(ch)
@@ -85,6 +130,26 @@ def shorten(text: str, width: int, ellipsis: str = "…") -> str:
         out.append(ch)
         used += w
     return "".join(out) + ellipsis
+=======
+    out: list[str] = []
+    used = 0
+    saw_escape = False
+    i = 0
+    while i < len(text):
+        match = _ANSI_RE.match(text, i)
+        if match:
+            out.append(match.group())
+            saw_escape = True
+            i = match.end()
+            continue
+        w = char_width(text[i])
+        if used + w > budget:
+            break
+        out.append(text[i])
+        used += w
+        i += 1
+    return "".join(out) + ellipsis + (RESET if saw_escape else "")
+>>>>>>> 2d11f2fa9708ae26b06718a847edca04f2e94090
 
 
 def rule(char: str = "─", width: int | None = None, indent: int = 2) -> str:
@@ -128,6 +193,88 @@ def wrap(text: str, indent: str = "  ", width: int | None = None,
     return "\n".join(out)
 
 
+<<<<<<< HEAD
+=======
+class StreamWrap:
+    """Wraps model output to the terminal *as it streams*.
+
+    The non-streaming path has always run its reply through `wrap`. The
+    streaming path wrote deltas straight to stdout, so the same reply was
+    laid out two different ways depending on whether the provider supported
+    streaming: wrapped and indented when it did not, running off the right
+    edge when it did.
+
+    Wrapping a stream means never looking ahead, so the rule is: hold the word
+    currently being typed, and commit it only once its width is known. A code
+    fence switches the wrapper off, because reflowing code destroys it.
+    """
+
+    def __init__(self, indent: str = "  ", width: int | None = None):
+        self.indent = indent
+        self.limit = max(20, (width or term_width()) - display_width(indent))
+        self._word: list[str] = []
+        self._col = 0
+        self._in_fence = False
+        self._line_start = True
+        self._recent: list[str] = []   # chars of the current line, for fence detection
+
+    def feed(self, chunk: str) -> str:
+        """Consume a delta, return the text that should be written now."""
+        out: list[str] = []
+        for ch in chunk or "":
+            if ch == "\n":
+                out.append(self._commit_word())
+                # A fence toggles on the line that contains it.
+                if "".join(self._recent).strip().startswith("```"):
+                    self._in_fence = not self._in_fence
+                out.append("\n" + self.indent)
+                self._col = 0
+                self._line_start = True
+                self._recent = []
+                continue
+
+            self._recent.append(ch)
+            if self._in_fence:
+                out.append(ch)
+                self._col += char_width(ch)
+                continue
+
+            if ch == " ":
+                out.append(self._commit_word())
+                # A space that would sit past the edge becomes the wrap point.
+                if self._col + 1 > self.limit:
+                    out.append("\n" + self.indent)
+                    self._col = 0
+                elif not self._line_start:
+                    out.append(" ")
+                    self._col += 1
+                continue
+
+            self._word.append(ch)
+        return "".join(out)
+
+    def _commit_word(self) -> str:
+        if not self._word:
+            return ""
+        word = "".join(self._word)
+        self._word = []
+        w = display_width(word)
+        prefix = ""
+        if self._col and self._col + w > self.limit:
+            prefix = "\n" + self.indent
+            self._col = 0
+        self._col += w
+        self._line_start = False
+        return prefix + word
+
+    def flush(self) -> str:
+        """Emit whatever is still held. Call once the stream ends."""
+        tail = self._commit_word()
+        self._recent = []
+        return tail
+
+
+>>>>>>> 2d11f2fa9708ae26b06718a847edca04f2e94090
 def pad(text: str, width: int, align: str = "left") -> str:
     """Pad to `width` display columns (not len), for aligned columns."""
     gap = max(0, width - display_width(text))
