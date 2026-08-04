@@ -1,158 +1,276 @@
 # 🤖 TOMAS — Terminal Operated Modular Agent System
 
-An AI coding agent that runs in your terminal. Built on the same architecture as Claude Code — agent loop, tool calling, MCP integration, and a self-improving skill system.
+ШІ-агент для програмування, який працює у вашому терміналі. Побудований на тій самій архітектурі, що й Claude Code: цикл агента, виклик інструментів, інтеграція MCP і система навичок.
 
-```bash
-# ═══════════════════════════════════════════════════════════
-#  One-line install
-# ═══════════════════════════════════════════════════════════
+Працює майже з будь-яким провайдером — Anthropic, OpenRouter, OpenAI, Google, Ollama, OpenCode Zen. **Є безкоштовний варіант** — див. [Швидкий старт безкоштовно](#-швидкий-старт-безкоштовно-opencode-zen).
 
+---
+
+## 📥 Встановлення
+
+**Потрібно:** Python 3.10+ (інсталятор знайде його сам або підкаже, де взяти).
+
+```powershell
 # Windows (PowerShell)
 powershell -ExecutionPolicy Bypass -c "iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)"
+```
 
+```bash
 # Linux / macOS / WSL
 curl -fsSL https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.sh | bash
 ```
 
-After install, open a **new terminal** and run:
+Інсталятор створює `~/.tomas/`, розгортає віртуальне середовище, ставить залежності й додає лаунчер до `PATH`.
+
+Після встановлення **відкрийте нове вікно терміналу** (щоб підхопився `PATH`) і запустіть:
 
 ```bash
-TOMAS               # Windows — interactive TUI
-tomas               # Linux/macOS
-TOMAS --run         # Launch agent directly
-TOMAS --help        # Show CLI help
-TOMAS mcp list      # List MCP servers
-TOMAS skill list    # List installed skills
+TOMAS        # Windows
+tomas        # Linux / macOS
 ```
 
 ---
 
-## ✨ Features
+## 🆓 Швидкий старт безкоштовно (OpenCode Zen)
 
-| Feature | Description |
+Не маєте API-ключа? **OpenCode Zen** дає безкоштовний рівень — найшвидший спосіб спробувати TOMAS.
+
+Якщо ключ не налаштований, TOMAS сам підключиться до безкоштовного рівня Zen під час першого запуску чату. Щоб зробити це свідомо:
+
+1. Запустіть `TOMAS`
+2. **Add or Configure Provider** → **OpenCode Zen (opencode.ai)**
+3. **Connect to Zen (recommended)** → ключ можна лишити порожнім
+4. **Change Model** → оберіть будь-яку модель із суфіксом `-free`
+
+Безкоштовні моделі:
+
+| Модель | Контекст |
 |---|---|
-| **Agent loop** | LLM-driven tool calling with automatic result feedback |
-| **MCP integration** | Load any MCP server — filesystem, fetch, GitHub, etc. |
-| **Self-improving** | Auto-detects patterns, generates skills from your usage |
-| **4 modes** | `auto` / `default` / `strict` / `yolo` — control permissions |
-| **Skills system** | Load reusable instruction sets via `/skill <name>` |
-| **Token tracking** | Real-time token usage after every response |
-| **Auto-compaction** | Summarizes long conversations before context overflow |
-| **Multi-provider** | Supports Anthropic, OpenRouter, MiniMax, OpenCode Zen, and more |
+| `deepseek-v4-flash-free` | 1 000 000 |
+| `laguna-s-2.1-free` | 128 000 |
+| `ling-3.0-flash-free` | 128 000 |
+| `mimo-v2.5-free` | 128 000 |
+| `nemotron-3-ultra-free` | 128 000 |
+| `north-mini-code-free` | 128 000 |
 
-### 🎮 Modes
+> 💡 Zen потребує динамічних заголовків `x-opencode-*` на кожному запиті. TOMAS додає їх **у своєму процесі** (`openai_adapter.py`) — жодного демона запускати не треба. Локальне проксі (`/zen`) лишилось тільки для випадку, коли на Zen треба спрямувати **інші** інструменти.
 
-| Mode | Behavior | Trigger |
-|---|---|---|
-| `auto` | Auto-approves low-risk tools (read, search) | `F5` / `/mode auto` |
-| `default` | Asks before every tool | `F6` / `/mode default` |
-| `strict` | Asks before every tool + resets overrides | `F7` / `/mode strict` |
-| `yolo` | **Auto-approves ALL tools** — no prompts | `F8` / `/mode yolo` |
-
-Press **Tab** to cycle through modes (or `/mode [auto|default|yolo]`).
-
-### ⌨️ Slash Commands
-
-| Command | Description |
-|---|---|
-| `/help` | Show all commands |
-| `/clear` | Clear conversation history |
-| `/status` | Model, connections, token stats |
-| `/mode` | Switch mode: `/mode auto / default / strict / yolo` |
-| `/compact` | Force conversation compaction |
-| `/skills` | List all installed skills |
-| `/skill <name>` | Load and execute a skill |
-| `/self-improve` | Self-improvement system (`/si` for short) |
-| `/pdf-report` | Generate AI news PDF report |
-| `/exit` | Exit TOMAS |
-
-Type `/` for auto-complete with Tab.
+Платні моделі Zen (Claude, GPT, Gemini) доступні там само за токен-тарифом — деталі в **About OpenCode Zen** у меню.
 
 ---
 
-## 🔧 Configuration
+## 🚀 Базове використання
 
-Edit `~/.tomas/.env` (created during install):
+### Панель керування
+
+`TOMAS` без аргументів відкриває меню зі стрілками:
+
+```
+  Control Panel
+  ──────────────────────────────────────────────
+  Project     Agent-For-TOM
+  Provider    OpenCode Zen (opencode.ai)
+  Model       deepseek-v4-flash-free · 1000K context
+  Extensions  18 MCP · 11 tools · 45 skills
+  Sessions    12 saved
+
+>   ▶  Start Chat
+
+    ⟐  Providers                  показати підключення й можливості
+    ⟐  Add or Configure Provider  підключити нового
+    ⟐  Switch Provider            перемкнути активного
+    ⟐  Change Model               змінити модель
+
+    ⬡  MCP Servers                керування MCP-серверами
+    ⬡  Tools                      вбудовані інструменти та їхній рівень ризику
+    ⬡  Skills                     встановлені навички
+
+    ◈  Sessions & Notes           історія розмов і нотатки
+    ✎  Agent Instructions         глобальні — для всіх проєктів
+    ✎  Project Guidelines         лише для цього репозиторію
+
+    ✕  Exit
+```
+
+### Команди CLI
+
+```bash
+TOMAS                     # інтерактивне меню
+TOMAS --run               # одразу запустити чат
+TOMAS setup               # поставити типові MCP-сервери
+TOMAS --help              # довідка
+
+TOMAS mcp list                                   # список MCP-серверів
+TOMAS mcp add <ім'я> -- <команда> [аргументи]    # додати (stdio)
+TOMAS mcp add --transport http <ім'я> <url>      # додати (HTTP)
+TOMAS mcp remove <ім'я>                          # видалити
+TOMAS mcp disable <ім'я> / enable <ім'я>         # вимкнути / увімкнути
+TOMAS mcp env <сервер> KEY=VALUE                 # задати змінну (напр. токен)
+
+TOMAS skill list          # список навичок
+TOMAS update              # оновити з GitHub (аліас: upgrade)
+TOMAS uninstall           # повністю видалити
+```
+
+### Слеш-команди в чаті
+
+Наберіть `/`, щоб побачити всі. Tab доповнює.
+
+| Команда | Що робить |
+|---|---|
+| `/help` | усі команди й гарячі клавіші |
+| `/status` | модель, контекст, режим, MCP, лічильник токенів |
+| `/model` | активна модель |
+| `/provider` | можливості провайдера; `/provider probe` — переміряти |
+| `/mode` | режим дозволів: `auto` / `default` / `strict` / `yolo` |
+| `/clear` | очистити історію розмови |
+| `/compact` | стиснути розмову просто зараз |
+| `/session` | керування сесіями: list / save / continue (`/sessions` — те саме, що `list`) |
+| `/save`, `/load <id>` | зберегти / завантажити сесію |
+| `/skills`, `/skill <ім'я>` | список навичок / запустити навичку |
+| `/self-improve` (`/si`) | що агент вивчив |
+| `/forget <id>` | забути вивчений факт назавжди |
+| `/private` | інкогніто — нічого не запам'ятовувати |
+| `/note`, `/notes` | створити / переглянути власні нотатки |
+| `/mcp-resources`, `/mcp-prompt` | ресурси та шаблони промптів з MCP |
+| `/zen` | статус локального Zen-проксі |
+| `/pdf-report` | зібрати PDF-звіт про новини ШІ |
+| `/exit` | вихід |
+
+### Гарячі клавіші
+
+| Клавіші | Дія |
+|---|---|
+| `Enter` | надіслати · прийняти підсвічену `/команду` |
+| `Tab` | доповнити `/команду` · інакше — перемкнути режим |
+| `↑` `↓` | історія · вибір у списку команд |
+| `Esc` | очистити рядок · `Esc Esc` — вийти з чату |
+| `Ctrl+W` / `Ctrl+U` | стерти слово / рядок |
+| `Ctrl+L` | очистити екран, збереже набране |
+| `⇧+Space` | увімкнути/вимкнути автопідтвердження |
+| `F5` `F6` `F7` `F8` | `auto` · `default` · `strict` · `yolo` |
+
+---
+
+## 🎮 Режими дозволів
+
+Ризик рахується **для кожного виклику окремо**, а не за назвою інструмента: `run_command` класифікується за самою командою — читання (`low`) чи будь-що змінне (`high`).
+
+| Режим | Поведінка | Виклик |
+|---|---|---|
+| `auto` | автопідтвердження низького ризику (читання, пошук) | `F5` |
+| `default` | питає перед кожним інструментом | `F6` |
+| `strict` | питає завжди + скидає попередні дозволи | `F7` |
+| `yolo` | **підтверджує все** — без запитань | `F8` |
+
+---
+
+## 🧰 Вбудовані інструменти
+
+| Інструмент | Ризик | Призначення |
+|---|---|---|
+| `read_file` | 🟢 low | читання файлу (з нумерацією рядків; розуміє PDF/DOCX/PPTX/XLSX) |
+| `list_files` | 🟢 low | список файлів у каталозі |
+| `search_code` | 🟢 low | пошук за regex по файлах |
+| `search_web` | 🟢 low | пошук в інтернеті |
+| `fetch_url` | 🟢 low | завантажити URL |
+| `save_memory` | 🟢 low | зберегти нотатку в пам'ять |
+| `read_mcp_resource` | 🟢 low | прочитати ресурс з MCP-сервера |
+| `write_file` | 🟡 medium | створити/перезаписати файл |
+| `edit_file` | 🟡 medium | замінити рядок у файлі |
+| `fetch_url_with_browser` | 🟡 medium | завантажити URL через headless-браузер (Playwright) |
+| `run_command` | 🔴 залежить | виконати команду оболонки |
+
+До них додаються всі інструменти підключених MCP-серверів. Які саме надсилаються моделі — вирішується щоходу за релевантністю до вашого повідомлення; ті, що не влізли в ліміт провайдера, **називаються** моделі, щоб пропуск можна було виправити.
+
+---
+
+## ⚙️ Конфігурація
+
+Файл `~/.tomas/.env`:
 
 ```env
-# Required: your API key
-ANTHROPIC_API_KEY=sk-ant-...
-
-# Optional: custom endpoint (MiniMax, OpenRouter, etc.)
-# ANTHROPIC_BASE_URL=https://api.anthropic.com
-
-# Optional: model name
-# AGENT_MODEL=claude-sonnet-4-5
-
-# Optional: auto-approve low-risk tools (1 or 0)
-# AGENT_AUTO_APPROVE=1
+ANTHROPIC_API_KEY=sk-ant-...              # ключ
+ANTHROPIC_BASE_URL=https://...            # ендпоінт (необов'язково)
+AGENT_MODEL=claude-sonnet-5               # модель (необов'язково)
+AGENT_AUTO_APPROVE=1                      # автопідтвердження низького ризику
 ```
 
-### Supported providers
+Зазвичай редагувати вручну не потрібно — меню робить те саме.
 
-| Provider | `ANTHROPIC_BASE_URL` |
+### Провайдери
+
+| Провайдер | Ендпоінт |
 |---|---|
-| **Anthropic** (default) | `https://api.anthropic.com` |
-| **MiniMax** | `https://api.minimax.io/anthropic` |
+| **OpenCode Zen** | `https://opencode.ai/zen/v1` — є безкоштовний рівень |
+| **Anthropic** | `https://api.anthropic.com` |
 | **OpenRouter** | `https://openrouter.ai/api/v1` |
-| **OpenCode Zen** | Auto-detected (127.0.0.1:6446) |
+| **OpenAI** | `https://api.openai.com/v1` |
+| **Google AI** | через меню |
+| **Ollama** | локально, визначається автоматично |
+| **Custom** | будь-який сумісний ендпоінт |
+
+Можливості кожного провайдера (стримінг, вікно контексту, ліміт інструментів) **вимірюються запитом**, а не вгадуються з назви моделі чи URL.
 
 ---
 
-## 📦 What's inside
+## 📂 Структура `~/.tomas/`
 
 ```
 ~/.tomas/
-├── bin/               # Launcher scripts (added to PATH)
-│   ├── TOMAS.ps1      # PowerShell launcher (Windows)
-│   ├── TOMAS.cmd      # CMD launcher (Windows)
-│   ├── tomas          # Bash launcher (Linux/macOS)
-│   └── uninstall*     # Uninstaller
-├── src/               # TOMAS source code
-│   ├── agent.py       # Core agent loop
-│   ├── agent_cli.py   # CLI / TUI interface
-│   ├── self_improve.py # Self-improving system
-│   ├── mcp_manager.py # MCP server management
-│   └── ...
-├── .venv/             # Python virtual environment
-└── .env               # Your configuration
+├── .env                  конфігурація
+├── providers.json        провайдери + активний + виміряні можливості
+├── bin/                  лаунчери (додані до PATH)
+├── src/                  ⚠ код — замінюється цілком при оновленні
+├── .venv/                віртуальне середовище
+│
+├── instructions/         глобальні інструкції → в системний промпт
+│   ├── AGENT.md
+│   └── project/<назва>.md
+│
+├── learned/              що агент вивчив
+│   ├── global/facts.jsonl        факти про КОРИСТУВАЧА
+│   ├── global/skills/*.md        вивчені навички
+│   ├── projects/<sha1>/          факти про КОНКРЕТНИЙ проєкт
+│   └── tombstones.json           забуте — не вивчається повторно
+│
+├── memory/               save_memory
+├── self-notes/           /note, /notes
+├── self-improve/         журнал взаємодій
+└── sessions/             транскрипти розмов
 ```
+
+**Два правила, які варто знати:**
+
+1. `~/.tomas/` доступний файловим інструментам **тільки для читання**. Запис іде через типізовані API (`save_memory`, `self_notes`, `session_manager`), бо кожен володіє схемою свого файлу.
+2. Ваш стан лежить **поза** `src/`, бо `TOMAS update` замінює `src/` повністю.
 
 ---
 
-## 🗑️ Uninstall
+## 🧠 Як працює навчання
+
+Агент не рахує ключові слова. Рефлексія над транскриптами записує **факти з доказами**, і кожен факт має бути підтверджений, перш ніж стати переконанням.
+
+Факти про **вас** («відповідай українською») зберігаються глобально; факти про **код** («тести лежать у `tests/`») — на рівні проєкту, тож знання одного репозиторію не протікає в промпт іншого.
+
+У системний промпт потрапляє не весь архів, а **5 найрелевантніших фактів** до поточного повідомлення — розмір промпту не росте разом із обсягом вивченого.
+
+Подивитись: `/self-improve` · забути: `/forget <id>` · не запам'ятовувати цю сесію: `/private`
+
+---
+
+## 🔄 Оновлення та видалення
 
 ```bash
-# Windows
-uninstall-tomas
-
-# Linux / macOS
-uninstall-tomas
+TOMAS update           # оновити з GitHub
+TOMAS uninstall        # видалити повністю
 ```
 
-Or run the uninstaller script directly: `~/.tomas/bin/uninstall.ps1` (Windows) or `~/.tomas/bin/uninstall-tomas` (Linux/macOS).
+Або повторіть команду встановлення — вона підтягне свіжу версію.
 
 ---
 
-## 🔄 Update
-
-Re-run the same install command — it will download the latest version:
-
-```powershell
-# Windows
-powershell -c "iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)"
-```
-
-```bash
-# Linux/macOS
-curl -fsSL https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.sh | bash
-```
-
----
-
-## 💻 Development
-
-If you want to hack on TOMAS locally:
+## 💻 Розробка
 
 ```bash
 git clone https://github.com/oleksandkov/Agent-For-TOM.git
@@ -164,39 +282,62 @@ pip install -r requirements.txt
 python agent_cli.py
 ```
 
-The project launchers (`TOMAS.ps1` / `TOMAS.bat`) work directly from the cloned directory for development.
+Лаунчери `TOMAS.ps1` / `TOMAS.bat` працюють просто з клонованого каталогу.
 
----
-
-## 🏗️ Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  REPL: read user input                                  │
-└───────────────────────────┬─────────────────────────────┘
-                            ▼
-┌─────────────────────────────────────────────────────────┐
-│  Build system prompt (base + CLAUDE.md + memory + tips)  │
-└───────────────────────────┬─────────────────────────────┘
-                            ▼
-┌─────────────────────────────────────────────────────────┐
-│  Agent loop (while True):                                │
-│   1. call LLM with system + tools + messages             │
-│   2. if stop_reason != "tool_use": return text           │
-│   3. for each tool_use block:                            │
-│        - check permission (risk level)                   │
-│        - execute handler, collect result                 │
-│   4. append tool_results as a user message               │
-│   5. loop back to 1                                      │
-└─────────────────────────────────────────────────────────┘
+```bash
+# Тести
+python -m unittest discover -s tests -p "test_*.py"    # 461 модульний тест
+python test_agent.py                                    # інтеграційний набір
+python -m tests.simulate checks --offline                # перевірка можливостей
+python -m tests.simulate cyrillic                        # українська / російська
 ```
 
 ---
 
-## 📚 Documentation
+## 🏗️ Архітектура
 
-| Document | What it covers |
+```
+┌──────────────────────────────────────────────────────────┐
+│  REPL: читає ввід користувача                            │
+└────────────────────────────┬─────────────────────────────┘
+                             ▼
+┌──────────────────────────────────────────────────────────┐
+│  Системний промпт:                                        │
+│    базовий + instructions/ + AGENTS.md                    │
+│    + вивчене (пошук за релевантністю, не дамп)            │
+│    + навичка, яку тригернуло повідомлення                 │
+└────────────────────────────┬─────────────────────────────┘
+                             ▼
+┌──────────────────────────────────────────────────────────┐
+│  Цикл агента (while True):                                │
+│   1. виклик LLM: system + відібрані інструменти + історія │
+│   2. якщо stop_reason != "tool_use" → повернути текст     │
+│   3. для кожного tool_use:                                │
+│        · risk_for(name, params) → перевірка дозволу       │
+│        · виконати обробник, зібрати результат             │
+│   4. додати tool_results як повідомлення користувача      │
+│   5. назад до 1                                           │
+└──────────────────────────────────────────────────────────┘
+```
+
+Ядро (`core/`) видає **типізовані події** замість друку в консоль, а відображенням займаються адаптери (`adapters/`). Саме тому логіку можна тестувати без терміналу й без живої моделі.
+
+---
+
+## 📌 Особливості, які варто знати
+
+- **REPL лише для Windows** — ввід із клавіатури через `msvcrt` (стрілки, F5–F8, Tab). Кросплатформного TUI поки немає.
+- **Повна підтримка кирилиці** — ввід, вибір інструментів, витяг ключових слів, експорт у PDF.
+- **Пошук в інтернеті** — Playwright (headless Chrome), з відкатом на `duckduckgo_search`/`ddgs`.
+- **MCP-конфіг спільний із Claude Code** (`~/.claude.json`) — сервери видно обом.
+- **Робота з Word** — `word-docs` MCP ставиться за замовчуванням і вміє створювати справжні `.docx`.
+
+---
+
+## 📚 Документація
+
+| Документ | Про що |
 |---|---|
-| `AGENTS.md` | Architectural deep-dive — system prompt load order, tool risk tiers, quirks |
-| `CLAUDE.md` | Day-to-day conventions, injected into every system prompt |
-| `docs/HISTORY.md` | How the codebase got here — the reasoning behind each phase of work |
+| `AGENTS.md` | детальний розбір архітектури — порядок збірки промпту, рівні ризику, нюанси |
+| `CLAUDE.md` | щоденні домовленості; вставляється в кожен системний промпт |
+| `docs/HISTORY.md` | як кодова база дійшла до нинішнього стану — міркування за кожним етапом |
