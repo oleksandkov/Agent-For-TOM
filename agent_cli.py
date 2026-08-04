@@ -3111,7 +3111,7 @@ def cmd_update():
     update_cmd = TOMAS_DIR / "bin" / "TOMAS-upgrade.cmd"
     if not update_cmd.exists():
         print(f"  {RED}✗{RESET} Upgrade script not found at: {update_cmd}")
-        print(f"  To reinstall manually: {CYAN}powershell -c \"iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)\"{RESET}")
+        print(f"  To reinstall manually: {CYAN}powershell -c \"iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/main/install.ps1)\"{RESET}")
         sys.exit(1)
     print(f"  Upgrading TOMAS from GitHub...")
     sys.stdout.flush()

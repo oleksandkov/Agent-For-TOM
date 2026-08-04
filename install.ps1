@@ -4,11 +4,11 @@
 .DESCRIPTION
     Installs the TOMAS coding agent globally. Works both:
       - Locally:   powershell -ExecutionPolicy Bypass -File install.ps1
-      - Remote:    powershell -c "iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)"
+      - Remote:    powershell -c "iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/main/install.ps1)"
 .PARAMETER InstallDir
     Where to install TOMAS (default: ~/.tomas).
 .PARAMETER RepoUrl
-    GitHub archive URL to download (default: https://github.com/oleksandkov/Agent-For-TOM/archive/prototype2-refactoring.zip).
+    GitHub archive URL to download (default: https://github.com/oleksandkov/Agent-For-TOM/archive/main.zip).
     Leave as default to skip remote download (local install mode).
 .PARAMETER NoPrompt
     Skip interactive prompts.
@@ -16,7 +16,7 @@
 
 param(
     [string]$InstallDir = "",
-    [string]$RepoUrl = "https://github.com/oleksandkov/Agent-For-TOM/archive/prototype2-refactoring.zip",
+    [string]$RepoUrl = "https://github.com/oleksandkov/Agent-For-TOM/archive/main.zip",
     [switch]$NoPrompt
 )
 
@@ -428,7 +428,7 @@ $python = Join-Path (Join-Path $venvDir $venvBin) "python.exe"
 $cli = Join-Path (Join-Path $tomasDir "src") "agent_cli.py"
 if (-not (Test-Path $python)) {
     Write-Host "ERROR: TOMAS venv not found at $python" -ForegroundColor Red
-    Write-Host "Reinstall with: powershell -c `"iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)`"" -ForegroundColor Yellow
+    Write-Host "Reinstall with: powershell -c `"iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/main/install.ps1)`"" -ForegroundColor Yellow
     exit 1
 }
 & $python $cli @args
@@ -465,7 +465,7 @@ echo   ==========================================
 echo.
 echo   Upgrading TOMAS from GitHub...
 echo.
-powershell -ExecutionPolicy Bypass -c "iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)"
+powershell -ExecutionPolicy Bypass -c "iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/main/install.ps1)"
 if %ERRORLEVEL% neq 0 (
     echo   Upgrade failed. See messages above.
     pause

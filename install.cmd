@@ -16,7 +16,7 @@ echo.
 
 if /i "%1"=="--remote" (
     echo   Installing from GitHub...
-    powershell -ExecutionPolicy Bypass -c "iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)"
+    powershell -ExecutionPolicy Bypass -c "iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/main/install.ps1)"
 ) else (
     if not exist "%~dp0install.ps1" (
         echo ERROR: install.ps1 not found alongside install.cmd.

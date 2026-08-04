@@ -12,12 +12,12 @@
 
 ```powershell
 # Windows (PowerShell)
-powershell -ExecutionPolicy Bypass -c "iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)"
+powershell -ExecutionPolicy Bypass -c "iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/main/install.ps1)"
 ```
 
 ```bash
 # Linux / macOS / WSL
-curl -fsSL https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/main/install.sh | bash
 ```
 
 Інсталятор створює `~/.tomas/`, розгортає віртуальне середовище, ставить залежності й додає лаунчер до `PATH`.
