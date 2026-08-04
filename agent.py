@@ -28,6 +28,7 @@ import re
 import sys
 import time
 import json
+import base64
 import shutil
 import tempfile
 import subprocess
@@ -79,7 +80,8 @@ except ImportError:
 
 # MCP and skills support
 from mcp_manager import MCPManager
-from skills_manager import build_skills_section, discover_skills, cmd_skill_list, cmd_skill_run
+from skills_manager import (build_skills_section, build_triggered_skills,
+                            discover_skills, cmd_skill_list, cmd_skill_run)
 
 # Self-improving system
 import self_improve
@@ -394,14 +396,68 @@ def tool_relevance(tool: dict, query_keywords: set) -> float:
     return score
 
 
-def select_tools(all_tools: list[dict], context: str,
-                 budget: int) -> tuple[list[dict], list[dict]]:
+def _server_of(name: str) -> Optional[str]:
+    """Which MCP server owns this tool. None for built-ins or when no manager
+    is connected — callers must treat None as "ungrouped", not as an error."""
+    if mcp_manager:
+        try:
+            return mcp_manager.get_server_for_tool(MCP_TOOL_NAME_MAP.get(name, name))
+        except Exception:
+            return None
+    return None
+
+
+def tool_simplicity(name: str) -> float:
+    """How fundamental a tool name looks, from its segment count alone.
+
+    Within one server the building blocks are the plainly-named tools —
+    `add_heading`, `add_table` — while the specialised variants pile on
+    qualifiers: `set_table_cell_shading`, `apply_table_alternating_rows`,
+    `delete_footnote_robust`. A task that engages a server needs the former;
+    it reaches for the latter by name, when it already knows it wants them.
+    Segment count is the only signal here that does not require knowing what
+    any particular server does.
+    """
+    segments = [s for s in re.split(r"[_\-]+", name or "") if s]
+    return 1.0 / max(1, len(segments) - 1)
+
+
+# How many tools the turn's primary server is guaranteed, before everything
+# else competes on score. Sized to cover a working set (create + the handful
+# of verbs that put content into what was created), not a whole server.
+SERVER_CORE_QUOTA = 8
+
+# A quota slot is only worth spending on a tool the turn plausibly needs: one
+# the request actually scored, or one plainly enough named to be a building
+# block (at most three segments). Without this the quota keeps filling from
+# whatever is left — `set_table_cell_alternating_shading` and friends — after
+# the real working set runs out, and spends budget other servers could use.
+CORE_NAME_SIMPLICITY = 0.5
+
+
+def select_tools(all_tools: list[dict], context: str, budget: int,
+                 server_of: Optional[Callable[[str], Optional[str]]] = None,
+                 ) -> tuple[list[dict], list[dict]]:
     """Fit the tool list to the budget by relevance to the current turn.
 
     Built-ins are always kept — they are what the agent is. The rest of the
     budget goes to the MCP tools most relevant to what the user is actually
     doing, rather than to whichever server connected first, which is what
     list-order truncation really selected on.
+
+    Relevance alone is not enough, because it scores every tool in isolation.
+    Asked to write a methodichka as .docx and .pdf, it handed the model
+    `create_document` (3.5) and `convert_to_pdf` (3.0) while every tool that
+    puts content *into* a document — `add_heading`, `add_paragraph`,
+    `add_table` — scored exactly 0.0 and was withheld: nothing in those names
+    or descriptions repeats the user's words. The model could open a document
+    and convert one, but could not fill one, so it fell back to `write_file`
+    and produced a .docx that was not a real .docx at all.
+
+    So the server that best matches the turn is picked first, by summed
+    relevance across its tools, and is guaranteed a `SERVER_CORE_QUOTA`
+    working set — its highest-scoring tools, then its plainest-named ones.
+    The rest of the budget is filled globally by score, as before.
 
     Returns (selected, withheld).
     """
@@ -420,12 +476,42 @@ def select_tools(all_tools: list[dict], context: str,
     if not query_keywords:
         return builtins + mcp[:remaining], mcp[remaining:]
 
-    scored = sorted(
-        ((tool_relevance(t, query_keywords), i, t) for i, t in enumerate(mcp)),
-        key=lambda x: (-x[0], x[1]),          # stable: original order breaks ties
-    )
-    chosen = [t for _, _, t in scored[:remaining]]
-    withheld = [t for _, _, t in scored[remaining:]]
+    resolve = server_of or _server_of
+    scores = [tool_relevance(t, query_keywords) for t in mcp]
+    servers = [resolve(t.get("name", "")) for t in mcp]
+
+    # Rank servers by summed relevance, not by their single best tool: one
+    # incidental keyword hit should not outrank a server the whole request is
+    # about. `memory` matched "create" twice; `word-docs` matched across
+    # create/convert/copy and wins on the total.
+    server_totals: dict[str, float] = {}
+    for srv, score in zip(servers, scores):
+        if srv is not None:
+            server_totals[srv] = server_totals.get(srv, 0.0) + score
+
+    # Sort key shared by both phases: score, then plainest name, then the
+    # original order so ties never depend on dict iteration.
+    def rank(i: int) -> tuple:
+        return (-scores[i], -tool_simplicity(mcp[i].get("name", "")), i)
+
+    taken: set[int] = set()
+    primary = max(server_totals, key=lambda s: (server_totals[s], s), default=None)
+    if primary is not None and server_totals[primary] > 0:
+        core = sorted(
+            (i for i, s in enumerate(servers)
+             if s == primary
+             and (scores[i] > 0
+                  or tool_simplicity(mcp[i].get("name", "")) >= CORE_NAME_SIMPLICITY)),
+            key=rank)
+        taken.update(core[:min(SERVER_CORE_QUOTA, remaining)])
+
+    for i in sorted(range(len(mcp)), key=rank):
+        if len(taken) >= remaining:
+            break
+        taken.add(i)
+
+    chosen = [mcp[i] for i in sorted(taken, key=rank)]
+    withheld = [mcp[i] for i in sorted(set(range(len(mcp))) - taken, key=rank)]
     return builtins + chosen, withheld
 
 
@@ -525,7 +611,7 @@ BOLD_OFF = '\033[22m'
 TOOLS: list[dict] = [
     {
         "name": "read_file",
-        "description": "Read a file from the filesystem. Returns contents with line numbers.",
+        "description": "Read a file from the filesystem. Returns contents with line numbers. Also extracts text from .pdf, .docx, .pptx, and .xlsx files -- no separate tool needed for those.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -538,7 +624,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "write_file",
-        "description": "Write content to a file. Creates the file (and parent dirs) if needed.",
+        "description": "Write text content to a file. Creates the file (and parent dirs) if needed. Text formats only -- it cannot produce .docx/.pdf/.xlsx/.pptx, which are structured containers; build those with the word-docs MCP tools or a library.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -765,6 +851,61 @@ def _outside_project_error(path: Path, write: bool = False) -> str:
 # Tool handlers
 # ---------------------------------------------------------------------------
 
+# Opening these in text mode (the default read_file path) just decodes their
+# raw binary bytes as UTF-8 with replacement characters -- the PDF header and
+# compressed font streams come back as "%PDF-1.5" and garbage, not the
+# document's actual text. Each extractor turns the format into plain text
+# read_file can line-number and paginate like any other file.
+
+def _extract_pdf_text(path: Path) -> str:
+    from pypdf import PdfReader
+    reader = PdfReader(str(path))
+    pages = [f"--- page {i} ---\n{page.extract_text() or ''}"
+             for i, page in enumerate(reader.pages, 1)]
+    return "\n".join(pages)
+
+
+def _extract_docx_text(path: Path) -> str:
+    import docx
+    document = docx.Document(str(path))
+    parts = [p.text for p in document.paragraphs]
+    for table in document.tables:
+        for row in table.rows:
+            parts.append(" | ".join(cell.text for cell in row.cells))
+    return "\n".join(parts)
+
+
+def _extract_pptx_text(path: Path) -> str:
+    from pptx import Presentation
+    prs = Presentation(str(path))
+    parts: list[str] = []
+    for i, slide in enumerate(prs.slides, 1):
+        parts.append(f"--- slide {i} ---")
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                parts.append(shape.text_frame.text)
+    return "\n".join(parts)
+
+
+def _extract_xlsx_text(path: Path) -> str:
+    import openpyxl
+    wb = openpyxl.load_workbook(str(path), data_only=True)
+    parts: list[str] = []
+    for ws in wb.worksheets:
+        parts.append(f"--- sheet: {ws.title} ---")
+        for row in ws.iter_rows(values_only=True):
+            parts.append("\t".join("" if c is None else str(c) for c in row))
+    return "\n".join(parts)
+
+
+_DOCUMENT_EXTRACTORS = {
+    ".pdf": _extract_pdf_text,
+    ".docx": _extract_docx_text,
+    ".pptx": _extract_pptx_text,
+    ".xlsx": _extract_xlsx_text,
+}
+
+
 def handle_read_file(params: dict) -> str:
     path = _resolve(params["file_path"])
     if not _safe(path):
@@ -773,8 +914,19 @@ def handle_read_file(params: dict) -> str:
         return f"Error: file not found: {path}"
     offset = max(0, int(params.get("offset", 1)) - 1)
     limit = int(params.get("limit", 2000))
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        lines = f.readlines()
+    suffix = path.suffix.lower()
+    if suffix in _DOCUMENT_EXTRACTORS:
+        try:
+            text = _DOCUMENT_EXTRACTORS[suffix](path)
+        except ImportError as e:
+            return (f"Error: reading {suffix} files needs an extra package "
+                     f"that isn't installed ({e}). Run: pip install -r requirements.txt")
+        except Exception as e:
+            return f"Error: could not extract text from {path.name}: {e}"
+        lines = [line + "\n" for line in text.split("\n")]
+    else:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
     selected = lines[offset:offset + limit]
     if not selected:
         return "(empty file)"
@@ -794,10 +946,57 @@ def handle_read_file(params: dict) -> str:
         used += len(entry)
     return "".join(out)
 
+# Formats whose files are containers, not text: .docx/.pptx/.xlsx are zip
+# archives of XML parts, .pdf has an object table and xref. Writing a string
+# to one of these paths produces a file that only *looks* right by extension.
+# The read side of this was already fixed (see _DOCUMENT_EXTRACTORS); this is
+# the write half. It reported "Successfully wrote 4933 chars" for a .docx
+# that nothing could open, and the failure only surfaced several tool calls
+# later as "Package not found", by which point the model was debugging its
+# converter instead of its choice of tool.
+_STRUCTURED_WRITE_FORMATS = {
+    ".docx": "a Word document",
+    ".doc": "a Word document",
+    ".pptx": "a PowerPoint presentation",
+    ".ppt": "a PowerPoint presentation",
+    ".xlsx": "an Excel workbook",
+    ".xls": "an Excel workbook",
+    ".pdf": "a PDF file",
+    ".odt": "an OpenDocument text file",
+    ".ods": "an OpenDocument spreadsheet",
+    ".odp": "an OpenDocument presentation",
+    ".rtf": "an RTF document",
+}
+
+
+def _structured_write_error(path: Path, kind: str) -> str:
+    """Say why this cannot work and what to reach for instead."""
+    suffix = path.suffix.lower()
+    if suffix in (".docx", ".doc"):
+        how = ("the word-docs MCP tools (create_document, add_heading, "
+               "add_paragraph, add_table), which build a real document")
+    elif suffix == ".pdf":
+        how = ("build the .docx first with the word-docs MCP tools, then "
+               "convert_to_pdf — that keeps headings and bold. Generating a "
+               "PDF from plain text loses all formatting")
+    elif suffix in (".xlsx", ".xls"):
+        how = "openpyxl through run_command"
+    elif suffix in (".pptx", ".ppt"):
+        how = "python-pptx through run_command"
+    else:
+        how = f"a library that writes {kind}, through run_command"
+    return (f"Error: {path.name} is {kind} — a structured container, not text. "
+            f"write_file would produce a file that has the right extension and "
+            f"cannot be opened. Use {how}.")
+
+
 def handle_write_file(params: dict) -> str:
     path = _resolve(params["file_path"])
     if not _safe(path, write=True):
         return _outside_project_error(path, write=True)
+    kind = _STRUCTURED_WRITE_FORMATS.get(path.suffix.lower())
+    if kind:
+        return _structured_write_error(path, kind)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(params["content"], encoding="utf-8")
     return f"Successfully wrote {len(params['content'])} chars to {path}"
@@ -1311,7 +1510,26 @@ Rules:
 - If a task is done, stop calling tools and summarize.
 - Memory files listed in the memory index can be read with read_file when you need their detail.
 - A denied tool call will stay denied. Do not re-issue it with different wording.
-- Reply in the language the user wrote in."""
+- Reply in the language the user wrote in.
+- Never say a file was created, saved, edited, or a task was completed unless
+  you actually called the tool for it in this conversation and saw a
+  successful result. If you only planned or described an action without
+  calling the tool, say exactly that -- do not describe it as done. The turn
+  ends the moment your reply has no tool call in it, so if you write "let me
+  create..." or "I'll save this as...", call the tool in that same turn
+  instead of stopping after the sentence.
+- After creating or writing a file the user asked for, verify it exists
+  (read_file or list_files) before telling them it is done. State the exact
+  path you verified, not just the path you intended to use.
+- A helper script you write only to carry out a step -- a converter, a
+  generator, glue you will not need again -- is not a deliverable. Put it in
+  a temp directory outside the project, or skip the file and pass the code to
+  `run_command` directly. Only what the user asked for belongs in their repo.
+- .docx, .pdf, .xlsx and .pptx are structured containers, not text.
+  write_file cannot produce them. Build a Word document with the word-docs
+  MCP tools (create_document, then add_heading / add_paragraph / add_table),
+  and get a PDF from convert_to_pdf on that document -- it keeps headings and
+  bold, which re-typesetting the plain text into a new PDF throws away."""
 
 
 def _classify_mcp_failures(failed: dict) -> tuple[list, list]:
@@ -1373,7 +1591,11 @@ def _truncate_section(text: str, max_chars: int, label: str = "") -> str:
 MAX_INSTRUCTIONS_CHARS = 8000       # AGENTS.md + global instructions
 MAX_LEARNED_CHARS = 1500            # retrieved facts (bounded by k, not by store size)
 MAX_SKILLS_CHARS = 4000             # skills section
-MAX_TOTAL_SYSTEM_PROMPT = 20000     # hard cap on the entire system prompt
+MAX_TRIGGERED_SKILL_CHARS = 6000    # full body of a skill this message triggers
+MAX_TOTAL_SYSTEM_PROMPT = 28000     # hard cap on the entire system prompt.
+# ~7k tokens against the 200k context the default models actually have. The
+# old 20000 left so little headroom that adding one bundled skill pushed the
+# prompt to 19245 and the next edit to that skill would have silently cut it.
 
 
 def build_system_prompt(user_message: str = "") -> str:
@@ -1409,6 +1631,18 @@ def build_system_prompt(user_message: str = "") -> str:
             learned = _truncate_section(learned, MAX_LEARNED_CHARS, "learned")
             prompt += ("\n\n# What I've learned about this user and project\n"
                        f"{learned}")
+    except Exception:
+        pass
+    # A skill this message triggers goes in first, in full. The catalogue
+    # below only names skills — enough to pick one, useless for following one
+    # — and nothing ever read `triggers`, so a procedure written for a job
+    # never reached the model while it was doing that job. It precedes the
+    # catalogue because the total cap truncates from the end: instructions the
+    # model is meant to act on now must not be the first thing dropped.
+    try:
+        triggered = build_triggered_skills(user_message, MAX_TRIGGERED_SKILL_CHARS)
+        if triggered:
+            prompt += f"\n\n{triggered}"
     except Exception:
         pass
     # installed skills — budgeted by whole entries, not by slicing the joined
@@ -1761,6 +1995,51 @@ def _last_user_text(messages: list) -> str:
     return ""
 
 
+#: User turns of context tool selection reads, newest first, and how many
+#: times the newest is repeated to keep it outweighing them.
+TOOL_CONTEXT_TURNS = 8
+TOOL_CONTEXT_WEIGHT = 3
+TOOL_CONTEXT_CHARS = 2000
+
+
+def _recent_user_text(messages: list, turns: int = TOOL_CONTEXT_TURNS) -> str:
+    """What the user has been asking about, not just their last keystroke.
+
+    Selecting on the newest message alone loses the task the moment the user
+    answers a question about it. Observed in session 20260804_144250: the
+    request naming "docx" and "pdf" selected the whole word-docs working set,
+    then "зроби новий", "2" and "зроби це, все вірно" each selected none of it
+    — three words carry no keywords, so selection fell back to list order.
+    By the time the user said "yes, do it", the tools to do it were gone, and
+    the model concluded it would have to write a text file named .docx.
+
+    The newest message is repeated because `extract_keywords` ranks by
+    frequency: the current turn should still outweigh what came before it,
+    or a conversation could never change subject.
+    """
+    collected: list[str] = []
+    for m in reversed(messages or []):
+        if m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            # Tool-result turns carry no user intent; keep looking back.
+            text = "\n".join(b.get("text", "") for b in content
+                             if isinstance(b, dict) and b.get("type") == "text")
+        else:
+            text = ""
+        if text.strip():
+            collected.append(text)
+        if len(collected) >= turns:
+            break
+    if not collected:
+        return ""
+    weighted = [collected[0]] * TOOL_CONTEXT_WEIGHT + collected
+    return "\n".join(weighted)[:TOOL_CONTEXT_CHARS]
+
+
 def tools_for_turn(messages: list) -> tuple[list[dict], list[dict]]:
     """Pick this turn's tool payload.
 
@@ -1769,7 +2048,7 @@ def tools_for_turn(messages: list) -> tuple[list[dict], list[dict]]:
     ask for them, not whichever server connected first at startup.
     """
     pool = ALL_TOOLS or COMBINED_TOOLS or TOOLS
-    context = _last_user_text(messages)
+    context = _recent_user_text(messages)
     try:
         context = f"{context}\n{self_improve.get_session_analysis().get('purpose', '')}"
     except Exception:
@@ -2603,6 +2882,126 @@ def _read_input_cross_platform(prompt: str) -> str:
     return result
 
 
+# Past this many characters a paste is shown as a marker instead of its text.
+# Small enough that a stack trace or a config block collapses, large enough
+# that a sentence or a path pasted mid-thought still reads as what it is.
+PASTE_COLLAPSE_CHARS = 400
+
+IMAGE_SUFFIXES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                  ".gif": "image/gif", ".webp": "image/webp"}
+
+# Anthropic's per-image ceiling. Bigger than this is rejected outright, so
+# it is better to say so than to send it and read the 400 back.
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+
+def grab_clipboard_image(dest: Path) -> bool:
+    """Save the clipboard's image to `dest` as PNG. False if there isn't one.
+
+    Clipboard image data never reaches the console's keystroke stream — a
+    paste of an image delivers no characters at all — so it cannot be picked
+    up by reading input, however that reading is done. .NET's clipboard is
+    already on every Windows box, which beats taking a new imaging dependency
+    for one call. It needs a single-threaded apartment, hence -STA.
+    """
+    if sys.platform != "win32":
+        return False
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing;"
+        "$i=[System.Windows.Forms.Clipboard]::GetImage();"
+        "if($i -ne $null){$i.Save('%s',"
+        "[System.Drawing.Imaging.ImageFormat]::Png);'ok'}else{'none'}"
+    ) % str(dest).replace("'", "''")
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command", script],
+            capture_output=True, timeout=20, text=True)
+        return "ok" in (out.stdout or "") and dest.exists()
+    except Exception:
+        return False
+
+
+def _image_paths_in(text: str) -> list[Path]:
+    """Existing image files named anywhere in the message.
+
+    Dragging a file onto a terminal types its path, and the clipboard grab
+    below inserts one, so path-spotting covers both without a second
+    mechanism. Quotes are stripped because that is how a dragged path with a
+    space arrives.
+    """
+    found: list[Path] = []
+    pattern = r'"[^"]+"|\'[^\']+\'|\S+'
+    for token in re.findall(pattern, text or ""):
+        candidate = token.strip('"\'')
+        if Path(candidate).suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        try:
+            path = _resolve(candidate)
+            if path.is_file() and path not in found:
+                found.append(path)
+        except Exception:
+            continue
+    return found
+
+
+def build_user_content(text: str):
+    """The user's turn, with any images they named attached.
+
+    Returns the plain string when there is nothing to attach, so the ordinary
+    path stays exactly as it was. Images are dropped with a printed reason
+    rather than silently, and never sent to a provider whose probe says it
+    cannot read them — that is a 400, not a degraded answer.
+    """
+    paths = _image_paths_in(text)
+    if not paths:
+        return text
+    if not getattr(_active_capabilities(), "vision", False):
+        print(f'  {YELLOW}⚠{RESET}  {_get_model()} cannot read images — '
+              f'sending the message as text only.')
+        return text
+    blocks: list[dict] = []
+    for path in paths:
+        try:
+            data = path.read_bytes()
+            if len(data) > MAX_IMAGE_BYTES:
+                print(f'  {YELLOW}⚠{RESET}  {path.name} is '
+                      f'{len(data) // 1024} KB, over the {MAX_IMAGE_BYTES // 1024} KB '
+                      f'limit — not attached.')
+                continue
+            blocks.append({
+                "type": "image",
+                "source": {"type": "base64",
+                           "media_type": IMAGE_SUFFIXES[path.suffix.lower()],
+                           "data": base64.b64encode(data).decode("ascii")},
+            })
+            print(f'  {DIM}🖼  attached {path.name} ({len(data) // 1024} KB){RESET}')
+        except Exception as e:
+            print(f'  {YELLOW}⚠{RESET}  could not attach {path.name}: {e}')
+    if not blocks:
+        return text
+    return blocks + [{"type": "text", "text": text}]
+
+
+def _shift_down() -> bool:
+    """Is Shift physically held right now?
+
+    `msvcrt.getwch` hands back a decoded character and nothing about
+    modifiers, so Shift+Enter and Enter are the same `\\r` to it. Reading the
+    key state settles which one it was. `GetAsyncKeyState` reports the
+    physical keyboard rather than the message queue, which matters because a
+    console app pumps no messages — `GetKeyState` would answer from a queue
+    that never advances. Cheaper and far less invasive than replacing the
+    read primitive with `ReadConsoleInput`, and it fails to False anywhere
+    that is not Windows, where the caller already falls back.
+    """
+    try:
+        import ctypes
+        VK_SHIFT = 0x10
+        return bool(ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
+    except Exception:
+        return False
+
+
 def read_input_with_suggestions(prompt: str) -> str:
     """Read a line of input with live slash-command suggestions beneath the prompt.
 
@@ -2616,7 +3015,14 @@ def read_input_with_suggestions(prompt: str) -> str:
     * ``↑`` / ``↓``  — navigate through suggestion items (in command mode)
     * ``Tab``        — auto-complete to the current match or common prefix
     * ``Enter``      — accept the highlighted suggestion (if any), or submit as-is
+    * ``Shift+Enter``— insert a newline instead of submitting
     * ``Esc``        — clear the input line
+
+    The buffer is drawn across as many terminal rows as it needs, so a long
+    or multi-line prompt stays readable — and selectable — instead of
+    scrolling out of view. Pasted text is taken in whole rather than replayed
+    as keystrokes, so line breaks inside it do not submit; anything past
+    ``PASTE_COLLAPSE_CHARS`` is shown as a marker and restored on send.
 
     Falls back to a cross-platform input with basic slash-command completion
     when msvcrt is unavailable (Linux/macOS).
@@ -2629,12 +3035,13 @@ def read_input_with_suggestions(prompt: str) -> str:
 
     global AUTO_APPROVE_LOW, YOLO_MODE, _history_index  # allow F-key / YOLO mode switching
     base_prompt = prompt
-    sys.stdout.write(prompt)
-    sys.stdout.flush()
 
     buffer: list[str] = []
     showing = False
     selected: int | None = None  # index of the currently highlighted suggestion
+    drawn_rows = 1               # rows the input block occupied on the last draw
+    pastes: dict[str, str] = {}  # placeholder -> the text it stands in for
+    escape_armed = False         # an Esc on an empty line; a second one exits
 
     # Reset history navigation to past-the-end
     _history_index = len(_input_history)
@@ -2694,31 +3101,38 @@ def read_input_with_suggestions(prompt: str) -> str:
             if not cf or name.startswith(cf)
         )
 
-    def _refresh():
-        """Clear the input line and re-draw prompt + buffer.
+    def _rows() -> list[str]:
+        """The physical rows prompt + buffer will occupy, as drawn.
 
-        Measured in display columns, not `len()`: `\\r\\033[K` only clears the
-        line the cursor is on, so a buffer wide enough to wrap leaves debris
-        behind. Long input scrolls horizontally instead, keeping the tail —
-        the part being typed — visible.
+        One column is left unused so a full row never makes the terminal
+        soft-wrap on its own: every line break here is one we emitted, which
+        is what makes the row count below exact and the cursor arithmetic
+        safe.
         """
-        from text_display import display_width, term_width
-        prompt = _build_prompt()
-        body = _repr()
-        room = term_width() - display_width(prompt) - 1
-        if room > 10 and display_width(body) > room:
-            kept, used = [], 0
-            for ch_ in reversed(body):
-                from text_display import char_width
-                w = char_width(ch_)
-                if used + w > room - 1:
-                    break
-                kept.append(ch_)
-                used += w
-            body = '…' + ''.join(reversed(kept))
-        sys.stdout.write('\r\033[K')
-        sys.stdout.write(prompt)
-        sys.stdout.write(body)
+        from text_display import hard_wrap, term_columns
+        return hard_wrap(_build_prompt() + _repr(), max(1, term_columns() - 1))
+
+    def _refresh():
+        """Redraw prompt + buffer across as many rows as it needs.
+
+        This used to be one row: `\\r\\033[K` clears only the row the cursor is
+        on, so anything longer was scrolled horizontally behind a `…` and the
+        rest was simply not on screen — you could not read back what you had
+        typed, and terminal selection could not copy what it could not show.
+        A buffer now carries real newlines (Shift+Enter, pasted text) as well,
+        which one row cannot represent at all.
+
+        Rewinding to the top of the block and clearing to the end of the
+        screen (`\\033[J`) also wipes the suggestion row below, so the caller
+        redraws it after; clearing per-row would leave that one behind.
+        """
+        nonlocal drawn_rows
+        if drawn_rows > 1:
+            sys.stdout.write(f'\033[{drawn_rows - 1}A')
+        sys.stdout.write('\r\033[J')
+        rows = _rows()
+        sys.stdout.write('\n'.join(rows))
+        drawn_rows = len(rows)
         sys.stdout.flush()
 
     def _show():
@@ -2750,31 +3164,107 @@ def read_input_with_suggestions(prompt: str) -> str:
             text = '  ' + '  '.join(parts) + mode_str
             selected = None
 
-        # Move to the line below, clear it, print, return.
+        # The hint has to fit on exactly one row. With no matches it lists
+        # every slash command, far wider than any terminal; left untruncated
+        # it soft-wrapped onto a second row while the rewind below moved only
+        # one, so the cursor came back a row low and the next redraw drew
+        # *under* the previous one.
         #
-        # The hint has to fit on exactly one row. `_refresh` already keeps the
-        # input line from wrapping, but this line was written untruncated —
-        # and with no matches it lists every slash command, which is far wider
-        # than any terminal. It soft-wrapped onto a second row while the
-        # `\033[1A` below rewound only one, so the cursor came back a row low
-        # and the next redraw drew *under* the previous one: the same
-        # duplication the menus had, in the chat.
+        # The block is drawn first because `_refresh` clears to the end of the
+        # screen — writing the hint before it would erase the hint. Coming
+        # back, the last row is re-emitted rather than just moving up: that
+        # leaves the cursor after the final character, where typing continues,
+        # instead of at column 0.
         from text_display import shorten, term_columns
+        _refresh()
+        last_row = _rows()[-1]
         sys.stdout.write('\033[1B\r\033[2K')
         sys.stdout.write(shorten(text, max(1, term_columns() - 1)))
-        sys.stdout.write('\033[1A\r')
-        _refresh()
+        sys.stdout.write('\033[1A\r' + last_row)
+        sys.stdout.flush()
         showing = True
 
     def _hide():
         nonlocal showing, selected
         if showing:
-            sys.stdout.write('\033[1B\r\033[2K\033[1A\r')
-            _refresh()
             showing = False
             selected = None
+            _refresh()   # clearing to end of screen takes the hint row with it
+
+    # ── paste ────────────────────────────────────────────────────────────
+    #
+    # A paste is not a distinct event here: the terminal replays it as
+    # ordinary keystrokes, already queued. `kbhit()` is what separates it
+    # from typing — a person cannot get the next character into the queue
+    # before this one has been handled, so anything already waiting arrived
+    # together. That is the whole detector, and it needs no bracketed-paste
+    # support from the terminal.
+
+    def _drain() -> str:
+        """Take everything already queued, as one string.
+
+        Newlines are normalised rather than acted on: inside a paste a
+        Return is a line break, not "send". The short idle re-checks cover a
+        paste arriving faster than this loop empties it.
+        """
+        chunk: list[str] = []
+        prev_cr = False
+        idle = 0
+        while idle < 2:
+            if not msvcrt.kbhit():
+                time.sleep(0.012)
+                idle += 1
+                continue
+            idle = 0
+            c = msvcrt.getwch()
+            if c in ('\xe0', '\x00'):     # extended key: consume its second half
+                msvcrt.getwch()
+                prev_cr = False
+            elif c == '\r':
+                chunk.append('\n')
+                prev_cr = True
+            elif c == '\n':
+                if not prev_cr:            # CRLF is one break, LF alone is one
+                    chunk.append('\n')
+                prev_cr = False
+            elif c == '\t':
+                chunk.append('    ')
+                prev_cr = False
+            elif c.isprintable():
+                chunk.append(c)
+                prev_cr = False
+            else:
+                prev_cr = False
+        return ''.join(chunk)
+
+    def _insert(text: str) -> None:
+        """Add pasted text, standing in a marker for anything long.
+
+        A pasted file is worth sending and not worth *looking* at while you
+        finish the sentence around it, so past a threshold the buffer shows
+        its size instead of its content. `_expand` puts the real text back at
+        send time, so the model still receives all of it.
+        """
+        if len(text) >= PASTE_COLLAPSE_CHARS:
+            lines = text.count('\n') + 1
+            marker = (f'[#{len(pastes) + 1} pasted {len(text)} chars'
+                      f'{f", {lines} lines" if lines > 1 else ""}]')
+            pastes[marker] = text
+            buffer.extend(marker)
+        else:
+            buffer.extend(text)
+
+    def _absorb_burst(seed: str = '') -> None:
+        _insert(seed + _drain())
+
+    def _expand(text: str) -> str:
+        for marker, full in pastes.items():
+            text = text.replace(marker, full)
+        return text
 
     # ── main input loop ──────────────────────────────────────────────────
+
+    _refresh()   # draws the prompt and establishes the row count
 
     try:
         while True:
@@ -2783,8 +3273,27 @@ def read_input_with_suggestions(prompt: str) -> str:
             # instead of a high byte that the old ASCII test discarded.
             ch = msvcrt.getwch()
 
+            # Any other key disarms the exit: Esc, second thoughts, typing,
+            # Esc again should not quit on the strength of the first one.
+            if ch != '\x1b':
+                escape_armed = False
+
             # ── Enter ──────────────────────────────────────────────────────
             if ch == '\r':
+                # Three ways a Return can arrive, and only one of them means
+                # "send". Shift+Enter is a deliberate newline. A Return in the
+                # middle of a burst is a line break inside pasted text — that
+                # one used to submit, so pasting three paragraphs sent three
+                # half-written messages.
+                if _shift_down() or msvcrt.kbhit():
+                    if msvcrt.kbhit():
+                        _absorb_burst()
+                    else:
+                        buffer.append('\n')
+                    selected = None
+                    _refresh()
+                    _hide()
+                    continue
                 chosen = selected  # save before _hide() clears it
                 _hide()
                 sys.stdout.write('\n')
@@ -2794,7 +3303,7 @@ def read_input_with_suggestions(prompt: str) -> str:
                     matches = _get_matches()
                     if chosen < len(matches):
                         buffer = ['/', matches[chosen]]
-                result = _repr()
+                result = _expand(_repr())
                 # Save non-empty, non-command input to history (max 100)
                 if result.strip() and not result.startswith('/'):
                     if not _input_history or _input_history[-1] != result:
@@ -2803,12 +3312,20 @@ def read_input_with_suggestions(prompt: str) -> str:
                             _input_history.pop(0)
                 return result
 
-            # ── Ctrl+C ────────────────────────────────────────────────────
+            # ── Ctrl+C — copy, not quit ───────────────────────────────────
+            # The terminal handles Ctrl+C as copy whenever a selection
+            # exists, and only forwards \x03 here when there is none. Ending
+            # the session on it made the ordinary copy reflex a coin flip:
+            # miss the selection and the session was over. Esc Esc quits
+            # instead, and clearing the line is the useful reading of a
+            # keystroke the user meant as "copy".
             if ch == '\x03':
-                _hide()
-                sys.stdout.write('\n')
-                sys.stdout.flush()
-                raise KeyboardInterrupt
+                if buffer:
+                    buffer.clear()
+                    selected = None
+                    _hide()
+                    _refresh()
+                continue
 
             # ── Arrow / function keys ─────────────────────────────────────
             if ch in ('\xe0', '\x00'):
@@ -2931,6 +3448,27 @@ def read_input_with_suggestions(prompt: str) -> str:
                     _refresh()
                 continue
 
+            # ── Ctrl+G — attach the image on the clipboard ─────────────────
+            # Ctrl+V cannot carry this: the terminal owns that key and, with
+            # an image on the clipboard, delivers no characters at all. The
+            # grab writes a file and types its path, so the image travels the
+            # same route as one dragged onto the window.
+            if ch == '\x07':
+                shot = Path(tempfile.gettempdir()) / f'tomas-clip-{int(time.time())}.png'
+                if grab_clipboard_image(shot):
+                    if buffer and not _repr().endswith(' '):
+                        buffer.append(' ')
+                    buffer.extend(str(shot))
+                else:
+                    _hide()
+                    sys.stdout.write('\033[1B\r\033[2K'
+                                     f'  {DIM}no image on the clipboard{RESET}'
+                                     '\033[1A\r')
+                selected = None
+                _refresh()
+                _hide()
+                continue
+
             # ── Ctrl+L — clear the screen, keep what was typed ─────────────
             # Standard everywhere, and the honest way out of a terminal that
             # some other program has left dirty. `\033[3J` drops the scrollback
@@ -2943,13 +3481,29 @@ def read_input_with_suggestions(prompt: str) -> str:
                     _show()
                 continue
 
-            # ── Escape — clear whole input ────────────────────────────────
+            # ── Escape — clear the line, then quit ────────────────────────
+            # Two presses so leaving is deliberate: the first press has
+            # something to do (drop what is typed) whenever the line is not
+            # empty, and only an Esc on an already-empty line arms the exit.
             if ch == '\x1b':
                 if buffer:
                     buffer.clear()
                     selected = None
+                    escape_armed = False
                     _hide()
                     _refresh()
+                    continue
+                if escape_armed:
+                    _hide()
+                    sys.stdout.write('\n')
+                    sys.stdout.flush()
+                    raise KeyboardInterrupt
+                escape_armed = True
+                _hide()
+                _refresh()
+                sys.stdout.write(f'\033[1B\r\033[2K  {DIM}press Esc again to '
+                                 f'exit{RESET}\033[1A\r' + _rows()[-1])
+                sys.stdout.flush()
                 continue
 
             # ── Printable — any script ────────────────────────────────────
@@ -2959,7 +3513,13 @@ def read_input_with_suggestions(prompt: str) -> str:
             # every Cyrillic keystroke — you could not type Ukrainian or
             # Russian into the prompt at all.
             if ch.isprintable():
-                buffer.append(ch)
+                # Anything already queued behind this character arrived with
+                # it. Taking the whole burst at once is also what keeps a big
+                # paste from redrawing the screen once per character.
+                if msvcrt.kbhit():
+                    _absorb_burst(ch)
+                else:
+                    buffer.append(ch)
                 selected = None
                 _refresh()
                 if _is_slash():
@@ -3165,7 +3725,9 @@ def main() -> int:
         pass
     print(f'  {GREEN}✦{RESET}  Self-improving system active — learning from interactions')
 
-    print(f'  {DIM}─── Type {RESET}{BOLD}quit{RESET}{DIM} or {RESET}{BOLD}exit{RESET}{DIM} to leave · {RESET}{BOLD}/help{RESET}{DIM} for commands · Ctrl+C also works ───{RESET}')
+    print(f'  {DIM}─── Type {RESET}{BOLD}quit{RESET}{DIM} or {RESET}{BOLD}exit{RESET}{DIM} to leave · {RESET}{BOLD}/help{RESET}{DIM} for commands · {RESET}{BOLD}Esc Esc{RESET}{DIM} also exits ───{RESET}')
+    print(f'  {DIM}    {RESET}{BOLD}Shift+Enter{RESET}{DIM} newline · paste keeps its line breaks · '
+          f'{RESET}{BOLD}Ctrl+G{RESET}{DIM} attach clipboard image · {RESET}{BOLD}Ctrl+C{RESET}{DIM} copies{RESET}')
     print()
 
     messages: list = []
@@ -3216,8 +3778,9 @@ def main() -> int:
                 # None result: skill was loaded; fall through to agent loop
                 # (skill content already injected by handle_slash_command)
             else:
-                # Regular user message
-                messages.append({"role": "user", "content": user_input})
+                # Regular user message, plus any images it names.
+                messages.append({"role": "user",
+                                 "content": build_user_content(user_input)})
             messages = maybe_compact(messages)
             # Retrieve learned knowledge against what the user just asked.
             system_prompt = build_system_prompt(user_input)  # re-inject every turn

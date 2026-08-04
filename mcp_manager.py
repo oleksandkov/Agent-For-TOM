@@ -339,13 +339,46 @@ class MCPServer:
             self._proc.stdin.write(line.encode("utf-8"))
             self._proc.stdin.flush()
 
-    def _stdio_recv(self) -> Optional[dict]:
+    # A stdio server is supposed to put nothing but JSON-RPC on stdout, and
+    # plenty of them break that: a warning, a progress line, a traceback. One
+    # such line used to end the session for that server — json.loads raised,
+    # the real reply stayed queued, and every later call read the *previous*
+    # call's response, one off forever. Observed with word-docs: after one
+    # failed convert_to_pdf, get_document_text and add_paragraph — both fine
+    # moments earlier — raised the same JSONDecodeError for the rest of the
+    # run, which is why that session never went back to the document tools.
+    _MAX_NOISE_LINES = 200
+
+    def _stdio_recv(self, expect_id: Optional[int] = None) -> Optional[dict]:
         if not self._proc or not self._proc.stdout:
             return None
-        line = self._proc.stdout.readline()
-        if not line:
-            return None
-        return json.loads(line.decode("utf-8"))
+        noise: list[str] = []
+        for _ in range(self._MAX_NOISE_LINES):
+            line = self._proc.stdout.readline()
+            if not line:                      # EOF: the server is gone
+                self.connected = False
+                self._last_error = (f"server exited"
+                                    + (f": {noise[-1][:200]}" if noise else ""))
+                return None
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            try:
+                msg = json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                noise.append(text)            # not protocol — skip, stay in sync
+                continue
+            if not isinstance(msg, dict):
+                continue
+            # Notifications carry no id; a mismatched id is a reply to a call
+            # that already gave up. Neither answers *this* request.
+            msg_id = msg.get("id")
+            if msg_id is None or expect_id is None or msg_id == expect_id:
+                if noise:
+                    self._last_error = f"server wrote non-JSON to stdout: {noise[-1][:200]}"
+                return msg
+        self._last_error = "too many non-protocol lines on stdout"
+        return None
 
     def _result_text(self, resp: Optional[dict]) -> str:
         """Text out of any MCP result shape.
@@ -354,7 +387,8 @@ class MCPServer:
         prompts/get returns `messages`. One extractor rather than three.
         """
         if resp is None:
-            return f"Error: no response from MCP server '{self.name}'"
+            why = f" ({self._last_error})" if self._last_error else ""
+            return f"Error: no response from MCP server '{self.name}'{why}"
         if "error" in resp:
             err = resp["error"]
             return f"Error: MCP [{self.name}] {err.get('message', 'unknown error')}"
@@ -389,8 +423,15 @@ class MCPServer:
         return "\n".join(t for t in texts if t) or "(no output)"
 
     def _stdio_call(self, req: dict) -> str:
-        self._stdio_send(req)
-        return self._result_text(self._stdio_recv())
+        """One request, one reply. Never raises into the agent's turn: a
+        server that dies or babbles costs the caller this tool, not the
+        session."""
+        try:
+            self._stdio_send(req)
+            return self._result_text(self._stdio_recv(expect_id=req.get("id")))
+        except Exception as exc:
+            self._last_error = str(exc)
+            return f"Error: MCP [{self.name}] transport failure: {exc}"
 
     # ── HTTP transport ──────────────────────────────────────────────
 

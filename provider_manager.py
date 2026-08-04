@@ -389,15 +389,29 @@ def _probe_context_window(provider: Provider) -> int:
     return 0
 
 
+# A 1x1 transparent PNG. Small enough to cost nothing, real enough that an
+# endpoint which decodes images accepts it and one which does not rejects it.
+_PIXEL_PNG = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+              "z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+
+
 def _tiny_request(provider: Provider, stream: bool = False,
-                  with_tools: bool = False, with_system: bool = True) -> dict:
+                  with_tools: bool = False, with_system: bool = True,
+                  with_image: bool = False) -> dict:
     """The smallest request that still exercises the feature being probed."""
     if provider.speaks_openai_wire:
+        user_content: Any = "ok"
+        if with_image:
+            user_content = [
+                {"type": "text", "text": "ok"},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/png;base64,{_PIXEL_PNG}"}},
+            ]
         body: dict = {
             "model": provider.model,
             "messages": ([{"role": "system", "content": "reply with ok"}]
                          if with_system else [])
-                        + [{"role": "user", "content": "ok"}],
+                        + [{"role": "user", "content": user_content}],
             "max_tokens": 8,
         }
         if stream:
@@ -409,10 +423,18 @@ def _tiny_request(provider: Provider, stream: bool = False,
                              "parameters": {"type": "object", "properties": {}}},
             }]
     else:
+        content: Any = "ok"
+        if with_image:
+            content = [
+                {"type": "text", "text": "ok"},
+                {"type": "image",
+                 "source": {"type": "base64", "media_type": "image/png",
+                            "data": _PIXEL_PNG}},
+            ]
         body = {
             "model": provider.model,
             "max_tokens": 8,
-            "messages": [{"role": "user", "content": "ok"}],
+            "messages": [{"role": "user", "content": content}],
         }
         if with_system:
             body["system"] = "reply with ok"
@@ -431,12 +453,14 @@ def _completions_url(provider: Provider) -> str:
     return f"{base}/v1/messages"
 
 
-def _probe_feature(provider: Provider, **kw) -> bool:
+def _probe_feature(provider: Provider, optimistic: bool = True, **kw) -> bool:
     """True if a minimal request using this feature is accepted.
 
     A transport failure (no network, endpoint down) is not evidence that the
-    feature is missing, so it returns True — the optimistic default — and the
-    runtime degradation path handles it if we were wrong.
+    feature is missing, so it returns `optimistic` — True for the features
+    whose absence merely degrades the reply, and where the runtime path
+    handles being wrong. Pass False where guessing wrong costs the user a
+    hard rejection instead (vision: a text-only model 400s on an image).
     """
     url = _completions_url(provider)
     body = _tiny_request(provider, **kw)
@@ -458,7 +482,7 @@ def _probe_feature(provider: Provider, **kw) -> bool:
         # 5xx / anything else is the endpoint having a bad day.
         return not (400 <= e.code < 500)
     except Exception:
-        return True
+        return optimistic
 
 
 def probe(provider: Provider, quick: bool = False) -> Capabilities:
@@ -485,6 +509,14 @@ def probe(provider: Provider, quick: bool = False) -> Capabilities:
         if not caps.tool_use:
             caps.parallel_tool_calls = False
         caps.system_prompt = _probe_feature(provider, with_system=True)
+        # Vision is the one capability that was never measured: the field
+        # defaulted to False and no code path ever set it, so anything asking
+        # "can this model read an image?" got the same answer whatever the
+        # model. A 1x1 PNG settles it for the price of one 8-token call.
+        # Note the default here is the opposite of the others — an
+        # unreachable endpoint means "assume not", because sending an image
+        # to a text-only model is a hard 400, not a degraded reply.
+        caps.vision = _probe_feature(provider, with_image=True, optimistic=False)
 
     caps.prompt_caching = provider.type == "anthropic"
     caps.probed_at = time.time()

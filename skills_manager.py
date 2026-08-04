@@ -23,11 +23,20 @@ LEARNED_SKILLS_DIR = Path.home() / ".tomas" / "learned" / "global" / "skills"
 # migration in self_improve.py can find and remove the directory.
 LEGACY_LEARNED_SKILLS_DIR = Path.home() / ".tomas" / "self-improve" / "skills"
 
+# Skills that ship with TOMAS. Lives beside this module, so it resolves the
+# same way in a checkout and in ~/.tomas/src after an install — the installers
+# copy every non-excluded directory, so a bundled skill is present from the
+# first run with no setup step.
+BUNDLED_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
+
+# Order is precedence: the first directory to claim a name wins, so a user's
+# own copy of a bundled skill overrides the shipped one.
 SKILL_DIRS = [
     Path.home() / ".claude" / "skills",
     Path.home() / ".agents" / "skills",
     Path.home() / "AppData" / "Roaming" / "Code" / "User" / "prompts",
     LEARNED_SKILLS_DIR,
+    BUNDLED_SKILLS_DIR,
 ]
 
 
@@ -225,18 +234,80 @@ def discover_skills(warn: bool = False) -> list[Skill]:
                 print(f"  skill {fallback}: {'; '.join(problems)}")
 
             learned = skills_dir == LEARNED_SKILLS_DIR
+            bundled = skills_dir == BUNDLED_SKILLS_DIR
+            default_source = "learned" if learned else "bundled" if bundled else "user"
             skills.append(Skill({
                 "name": meta["name"] or fallback,
                 "file": skill_file,
                 "description": meta["description"] or meta["name"] or name,
                 "triggers": meta["triggers"],
-                "source": meta["source"] or ("learned" if learned else "user"),
+                "source": meta["source"] or default_source,
                 "version": meta["version"],
                 "learned": learned,
                 "problems": problems,
             }))
 
     return skills
+
+
+def match_skills(message: str, skills: Optional[list] = None) -> list:
+    """Skills whose triggers appear in what the user just wrote.
+
+    `triggers` has always been documented as feeding retrieval, but nothing
+    read it: a skill's body only ever loaded when someone typed
+    `/skill <name>`, so a skill describing how to do a job never reached the
+    model *while it was doing that job*. Matching is substring-based on the
+    lowercased message because triggers are phrases, not words — "як у
+    прикладі" and "same style" have to match as written.
+    """
+    text = (message or "").lower()
+    if not text.strip():
+        return []
+    matched = []
+    for skill in (discover_skills() if skills is None else skills):
+        for trigger in skill.get("triggers") or []:
+            if trigger and trigger.lower() in text:
+                matched.append(skill)
+                break
+    return matched
+
+
+def build_triggered_skills(message: str, max_chars: int) -> str:
+    """Bodies of the skills this message triggers, for the system prompt.
+
+    Bodies, not descriptions: a procedure the model is meant to follow is
+    worthless summarised to one line. Budgeted by whole skills — half a
+    procedure is worse than none, because the model cannot tell it is reading
+    half.
+    """
+    matched = match_skills(message)
+    if not matched or max_chars <= 0:
+        return ""
+    out: list[str] = []
+    used = 0
+    for skill in matched:
+        body = (skill.get("content") or "").strip()
+        if not body:
+            continue
+        block = f"## Skill: {skill['name']}\n\n{body}"
+        if used + len(block) > max_chars:
+            # Dropping the skill whole and saying nothing is how a skill
+            # silently stops applying when someone edits it past the budget —
+            # the prompt looks fine and the procedure is simply gone. Keep the
+            # head of it and say where it was cut, so the loss is visible.
+            room = max_chars - used - 120
+            if room > 400:
+                out.append(block[:room].rstrip() +
+                           f"\n\n[... {skill['name']} truncated at {room} of "
+                           f"{len(block)} chars — read the rest with "
+                           f"/skill {skill['name']} ...]")
+            break
+        out.append(block)
+        used += len(block)
+    if not out:
+        return ""
+    return ("# Applicable skill instructions\n\n"
+            "Triggered by this message. Follow them.\n\n" + "\n\n".join(out))
 
 
 def find_skill(name: str) -> Optional[Skill]:

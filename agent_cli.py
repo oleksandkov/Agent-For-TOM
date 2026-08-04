@@ -1351,7 +1351,7 @@ def _launch_agent(session_id: str = ""):
     clear_screen()
     print(f'{BOLD}Starting TOMAS Agent{RESET}')
     print('─' * 50)
-    print("Type 'quit' or 'exit' to leave. Ctrl+C also works.")
+    print("Type 'quit' or 'exit' to leave. Esc Esc also exits.")
     print()
 
     import agent as agent_mod
@@ -2403,7 +2403,7 @@ def page_run_agent():
     clear_screen()
     print(f'{BOLD}Starting TOMAS Agent{RESET}')
     print('─' * 50)
-    print("Type 'quit' or 'exit' to leave. Ctrl+C also works.")
+    print("Type 'quit' or 'exit' to leave. Esc Esc also exits.")
     print()
     from agent import main
     main()
@@ -2630,6 +2630,7 @@ def cmd_setup():
     Installs the default set of MCP servers for TOMAS:
       - playwright: browser automation (npx @playwright/mcp)
       - context7: up-to-date library documentation search (npx)
+      - word-docs: create/edit Microsoft Word (.docx) documents (uvx)
     """
     from mcp_manager import read_mcp_servers, write_mcp_server
     import subprocess, sys
@@ -2668,7 +2669,18 @@ def cmd_setup():
         })
         print(f"  {GREEN}✓{RESET} context7 MCP configured")
 
-    # ── 3. Install Python deps ──
+    # ── 3. word-docs MCP (Microsoft Word document creation/editing) ──
+    if "word-docs" in existing:
+        print(f"  {GREEN}✓{RESET} word-docs MCP already configured")
+    else:
+        write_mcp_server("word-docs", {
+            "type": "stdio",
+            "command": "uvx",
+            "args": ["--from", "office-word-mcp-server", "word_mcp_server"],
+        })
+        print(f"  {GREEN}✓{RESET} word-docs MCP configured")
+
+    # ── 4. Install Python deps ──
     print()
     print(f"  {YELLOW}⚙ Checking Python dependencies...{RESET}")
     try:
