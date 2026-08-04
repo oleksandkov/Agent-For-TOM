@@ -1,117 +1,202 @@
-<div align="center">
+# 🤖 TOMAS — Terminal Operated Modular Agent System
 
-# 🤖 Agent-For-TOM
+An AI coding agent that runs in your terminal. Built on the same architecture as Claude Code — agent loop, tool calling, MCP integration, and a self-improving skill system.
 
-**Your Personal AI Assistant for Ukrainian Academic Documents**
+```bash
+# ═══════════════════════════════════════════════════════════
+#  One-line install
+# ═══════════════════════════════════════════════════════════
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Qt6 / QML](https://img.shields.io/badge/UI-PyQt6%20%7C%20QML-41CD52.svg)](https://www.qt.io/)
-[![HuggingFace](https://img.shields.io/badge/AI-HuggingFace_API-FFD21E.svg)](https://huggingface.co/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -c "iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)"
 
-A fully local, highly optimized desktop application that leverages free HuggingFace LLM models to automatically generate standardized academic documents (lab reports, guides) based on user-selected DOCX/PDF templates. 
+# Linux / macOS / WSL
+curl -fsSL https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.sh | bash
+```
 
-*No logins. No cloud accounts. Zero friction.*
+After install, open a **new terminal** and run:
 
-</div>
-
----
-
-## ✨ Key Features
-
-- 📑 **Template-Driven Generation:** Select a template (e.g. "Lab 1"), fill in a short form, and let the AI do the heavy lifting.
-- 🎨 **Rich UI:** Built with PyQt6 and QML for a native, incredibly smooth user experience with multithreading and beautiful animations.
-- 🖼️ **Multi-Modal AI:** 
-  - **Text:** `meta-llama/Llama-3.3-70B-Instruct`
-  - **Images:** `FLUX.1-schnell` for illustrations and matplotlib for technical diagrams.
-- 🗃️ **Smart Caching Engine:** A custom 3-level SQLite caching system (LLM response ➔ Images ➔ Final Document). Re-runs of identical parameters are absolutely instant.
-- 📄 **Context Attachments:** Easily attach your own PDFs, DOCXs, or PPTXs. The app automatically extracts the text and feeds it to the AI for highly accurate context.
-- 🛠️ **Custom Template Builder:** Upload any PDF or DOCX file, annotate regions visually (Keep Format, AI-Replace, Named Gap), and save it as a brand new reusable template.
-
----
-
-## 🛠 Tech Stack
-
-| Component | Technology | Why we chose it |
-|---|---|---|
-| **Frontend UI** | `PyQt6` + `QML` / Qt Quick | Perfect for native Python integration, hardware acceleration, and dynamic animations. |
-| **Backend** | Native `Python` | Zero web-framework overhead. Extremely fast custom orchestration. |
-| **Database** | `SQLite` | Single-file, local database. Perfect for a fast, single-user desktop app. |
-| **LLM (Text)** | `HuggingFace API` | We default to Llama-3.3-70B-Instruct for high-quality Ukrainian outputs. |
-| **LLM (Images)** | `FLUX.1` / `matplotlib` | High-quality illustrations via API, and cost-free local diagrams via matplotlib. |
-| **Doc Output** | `python-docx` + `reportlab` | Guaranteed identical, reproducible outputs in both DOCX and PDF formats. |
-
----
-
-## ⚙️ Architecture & Pipeline
-
-When you click "Generate", the app orchestrates a fully deterministic 2-pass pipeline:
-
-```mermaid
-graph TD
-    A[User Form & Files] --> B[Text Extractors]
-    B --> C{Context Compiler}
-    
-    subgraph Pass 1: Text Generation
-    C -->|Instructions + Style + Context| D((Llama 3.3 70B))
-    D --> E[Valid Python Scaffold]
-    end
-    
-    subgraph Pass 2: Document Composition
-    E --> F[AST Validation]
-    F -->|Secure Sandboxed Run| G[Generate DOCX & PDF]
-    G --> H{Image Mode?}
-    H -->|Full| I[Generate FLUX / Matplotlib]
-    H -->|None/Refs| J[Final Document]
-    I --> J
-    end
-    
-    J --> K[(Local Cache)]
+```bash
+TOMAS               # Windows — interactive TUI
+tomas               # Linux/macOS
+TOMAS --run         # Launch agent directly
+TOMAS --help        # Show CLI help
+TOMAS mcp list      # List MCP servers
+TOMAS skill list    # List installed skills
 ```
 
 ---
 
-## 🚀 Getting Started
+## ✨ Features
 
-### Prerequisites
-- Python 3.10+
-- A free HuggingFace API Token
+| Feature | Description |
+|---|---|
+| **Agent loop** | LLM-driven tool calling with automatic result feedback |
+| **MCP integration** | Load any MCP server — filesystem, fetch, GitHub, etc. |
+| **Self-improving** | Auto-detects patterns, generates skills from your usage |
+| **4 modes** | `auto` / `default` / `strict` / `yolo` — control permissions |
+| **Skills system** | Load reusable instruction sets via `/skill <name>` |
+| **Token tracking** | Real-time token usage after every response |
+| **Auto-compaction** | Summarizes long conversations before context overflow |
+| **Multi-provider** | Supports Anthropic, OpenRouter, MiniMax, OpenCode Zen, and more |
 
-### Installation
+### 🎮 Modes
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/iberikofer/Agent-For-TOM.git
-   cd Agent-For-TOM
-   ```
+| Mode | Behavior | Trigger |
+|---|---|---|
+| `auto` | Auto-approves low-risk tools (read, search) | `F5` / `/mode auto` |
+| `default` | Asks before every tool | `F6` / `/mode default` |
+| `strict` | Asks before every tool + resets overrides | `F7` / `/mode strict` |
+| `yolo` | **Auto-approves ALL tools** — no prompts | `F8` / `/mode yolo` |
 
-2. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
+Press **Tab** to cycle through modes (or `/mode [auto|default|yolo]`).
 
-3. **Environment Setup**
-   Create a `.env` file in the root directory and add your HuggingFace token:
-   ```env
-   HF_TOKEN=your_token_here
-   ```
+### ⌨️ Slash Commands
 
-4. **Run the App**
-   ```bash
-   python main.py
-   ```
+| Command | Description |
+|---|---|
+| `/help` | Show all commands |
+| `/clear` | Clear conversation history |
+| `/status` | Model, connections, token stats |
+| `/mode` | Switch mode: `/mode auto / default / strict / yolo` |
+| `/compact` | Force conversation compaction |
+| `/skills` | List all installed skills |
+| `/skill <name>` | Load and execute a skill |
+| `/self-improve` | Self-improvement system (`/si` for short) |
+| `/pdf-report` | Generate AI news PDF report |
+| `/exit` | Exit TOMAS |
+
+Type `/` for auto-complete with Tab.
 
 ---
 
-## 📋 Standard Compliance
+## 🔧 Configuration
 
-Our document builder is strictly designed to follow Ukrainian academic formatting standards:
-- **ДСТУ 3008:2015**: Typography, margins, 1.5 line spacing, proper headings, and figure captions.
-- **ДСТУ 8302:2015**: Bibliographic entry formatting.
+Edit `~/.tomas/.env` (created during install):
+
+```env
+# Required: your API key
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Optional: custom endpoint (MiniMax, OpenRouter, etc.)
+# ANTHROPIC_BASE_URL=https://api.anthropic.com
+
+# Optional: model name
+# AGENT_MODEL=claude-sonnet-4-5
+
+# Optional: auto-approve low-risk tools (1 or 0)
+# AGENT_AUTO_APPROVE=1
+```
+
+### Supported providers
+
+| Provider | `ANTHROPIC_BASE_URL` |
+|---|---|
+| **Anthropic** (default) | `https://api.anthropic.com` |
+| **MiniMax** | `https://api.minimax.io/anthropic` |
+| **OpenRouter** | `https://openrouter.ai/api/v1` |
+| **OpenCode Zen** | Auto-detected (127.0.0.1:6446) |
 
 ---
 
-<div align="center">
-  <b>Developed with ❤️ by</b><br>
-  <a href="https://github.com/iberikofer">Yaroslav Sych (Front-end)</a> • <a href="https://github.com/oleksandkov">Oleksandr Koval (Back-end)</a>
-</div>
+## 📦 What's inside
+
+```
+~/.tomas/
+├── bin/               # Launcher scripts (added to PATH)
+│   ├── TOMAS.ps1      # PowerShell launcher (Windows)
+│   ├── TOMAS.cmd      # CMD launcher (Windows)
+│   ├── tomas          # Bash launcher (Linux/macOS)
+│   └── uninstall*     # Uninstaller
+├── src/               # TOMAS source code
+│   ├── agent.py       # Core agent loop
+│   ├── agent_cli.py   # CLI / TUI interface
+│   ├── self_improve.py # Self-improving system
+│   ├── mcp_manager.py # MCP server management
+│   └── ...
+├── .venv/             # Python virtual environment
+└── .env               # Your configuration
+```
+
+---
+
+## 🗑️ Uninstall
+
+```bash
+# Windows
+uninstall-tomas
+
+# Linux / macOS
+uninstall-tomas
+```
+
+Or run the uninstaller script directly: `~/.tomas/bin/uninstall.ps1` (Windows) or `~/.tomas/bin/uninstall-tomas` (Linux/macOS).
+
+---
+
+## 🔄 Update
+
+Re-run the same install command — it will download the latest version:
+
+```powershell
+# Windows
+powershell -c "iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.ps1)"
+```
+
+```bash
+# Linux/macOS
+curl -fsSL https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/prototype2-refactoring/install.sh | bash
+```
+
+---
+
+## 💻 Development
+
+If you want to hack on TOMAS locally:
+
+```bash
+git clone https://github.com/oleksandkov/Agent-For-TOM.git
+cd Agent-For-TOM
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# Linux/macOS: source .venv/bin/activate
+pip install -r requirements.txt
+python agent_cli.py
+```
+
+The project launchers (`TOMAS.ps1` / `TOMAS.bat`) work directly from the cloned directory for development.
+
+---
+
+## 🏗️ Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  REPL: read user input                                  │
+└───────────────────────────┬─────────────────────────────┘
+                            ▼
+┌─────────────────────────────────────────────────────────┐
+│  Build system prompt (base + CLAUDE.md + memory + tips)  │
+└───────────────────────────┬─────────────────────────────┘
+                            ▼
+┌─────────────────────────────────────────────────────────┐
+│  Agent loop (while True):                                │
+│   1. call LLM with system + tools + messages             │
+│   2. if stop_reason != "tool_use": return text           │
+│   3. for each tool_use block:                            │
+│        - check permission (risk level)                   │
+│        - execute handler, collect result                 │
+│   4. append tool_results as a user message               │
+│   5. loop back to 1                                      │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 📚 Documentation
+
+| Document | What it covers |
+|---|---|
+| `AGENTS.md` | Architectural deep-dive — system prompt load order, tool risk tiers, quirks |
+| `CLAUDE.md` | Day-to-day conventions, injected into every system prompt |
+| `docs/HISTORY.md` | How the codebase got here — the reasoning behind each phase of work |
