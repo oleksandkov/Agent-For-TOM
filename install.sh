@@ -285,8 +285,8 @@ if [ ! -f "$ENV_FILE" ]; then
 ANTHROPIC_API_KEY=
 # Optional: API base URL (default: https://api.anthropic.com)
 # ANTHROPIC_BASE_URL=
-# Optional: model name (default: claude-sonnet-4-5)
-# AGENT_MODEL=claude-sonnet-4-5
+# Optional: model name (e.g. claude-sonnet-5)
+# AGENT_MODEL=claude-sonnet-5
 # Optional: "1" to auto-approve low-risk tools
 # AGENT_AUTO_APPROVE=1
 EOF

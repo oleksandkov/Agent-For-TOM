@@ -204,7 +204,7 @@ class TestProbe(ConfigTestCase):
         caps = pm.probe(p)
         self.assertTrue(caps.streaming)
         self.assertTrue(caps.tool_use)
-        self.assertEqual(caps.context_window, 128_000)
+        self.assertEqual(caps.context_window, 200_000)
 
     def test_list_models(self):
         srv, url = stub_provider.serve()

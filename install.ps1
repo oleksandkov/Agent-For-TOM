@@ -398,6 +398,12 @@ Write-Host "  [OK] TOMAS imports cleanly ($($requiredPackages.Count) packages pr
 Write-Host ""
 Write-Host "  [6/9] Creating launcher scripts..." -ForegroundColor Cyan
 
+# [System.Text.Encoding]::UTF8 writes a BOM. cmd.exe treats a leading BOM as
+# literal characters on the first line, so "@echo off" becomes unrecognized
+# and every generated .cmd/.bat launcher fails immediately. Use a BOM-less
+# UTF8 encoding for every generated launcher file instead.
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
 # TOMAS.ps1 --- PowerShell launcher (used by the PATH entry)
 $ps1Content = @'
 #!/usr/bin/env pwsh
@@ -419,7 +425,7 @@ if (-not (Test-Path $python)) {
 exit $LASTEXITCODE
 '@ -replace '{InstallDir}', $InstallDir
 
-[System.IO.File]::WriteAllText($LauncherPs1, $ps1Content, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($LauncherPs1, $ps1Content, $Utf8NoBom)
 Write-Host "  [OK] $LauncherPs1" -ForegroundColor Green
 
 # TOMAS.cmd --- CMD launcher (so `TOMAS` works from cmd.exe)
@@ -431,7 +437,7 @@ set "TOMAS_DIR={InstallDir}"
 "{InstallDir}\.venv\{VenvBin}\python.exe" "{InstallDir}\src\agent_cli.py" %*
 '@ -replace '{InstallDir}', $InstallDir -replace '\{VenvBin\}', $venvBin
 
-[System.IO.File]::WriteAllText($LauncherCmd, $cmdContent, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($LauncherCmd, $cmdContent, $Utf8NoBom)
 Write-Host "  [OK] $LauncherCmd" -ForegroundColor Green
 
 # TOMAS.bat --- also create in bin (some environments prefer .bat)
@@ -461,7 +467,7 @@ set "PATH=%USERPROFILE%\.tomas\bin;%PATH%"
 echo.
 echo   Upgrade complete! You can now run: TOMAS
 '@
-[System.IO.File]::WriteAllText($upgradeBat, $upgradeContent, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($upgradeBat, $upgradeContent, $Utf8NoBom)
 Write-Host "  [OK] $upgradeBat" -ForegroundColor Green
 
 # TOMAS-uninstall.cmd --- call uninstall.ps1
@@ -480,7 +486,7 @@ if %ERRORLEVEL% neq 0 (
     pause
 )
 '@ -replace '{UninstallPs1}', (Join-Path $BinDir "uninstall.ps1")
-[System.IO.File]::WriteAllText($uninstallBat, $uninstallContent, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($uninstallBat, $uninstallContent, $Utf8NoBom)
 Write-Host "  [OK] $uninstallBat" -ForegroundColor Green
 
 # -- Create default instructions and sessions dir --------------------------
@@ -566,8 +572,8 @@ if (-not (Test-Path $EnvFile)) {
 ANTHROPIC_API_KEY=
 # Optional: API base URL (default: https://api.anthropic.com)
 # ANTHROPIC_BASE_URL=
-# Optional: model name (default: claude-sonnet-4-5)
-# AGENT_MODEL=claude-sonnet-4-5
+# Optional: model name (e.g. claude-sonnet-5)
+# AGENT_MODEL=claude-sonnet-5
 # Optional: "1" to auto-approve low-risk tools
 # AGENT_AUTO_APPROVE=1
 "@ | Out-File -FilePath $EnvFile -Encoding utf8
@@ -655,7 +661,7 @@ Write-Host "  TOMAS has been uninstalled." -ForegroundColor Green
 Write-Host "  Close and reopen your terminal for PATH changes to take effect."
 '@ -replace '{InstallDir}', $InstallDir
 
-[System.IO.File]::WriteAllText($uninstallScript, $uninstallContent, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($uninstallScript, $uninstallContent, $Utf8NoBom)
 Write-Host "  [OK] Created uninstaller: $uninstallScript" -ForegroundColor Green
 
 # -- Run setup to install default MCPs --

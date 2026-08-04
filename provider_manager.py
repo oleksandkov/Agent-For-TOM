@@ -100,7 +100,7 @@ class Capabilities:
     system_prompt: bool = True
     prompt_caching: bool = False
     vision: bool = False
-    context_window: int = 128_000
+    context_window: int = 200_000  # standard Claude tier; probing narrows this per-model
     max_tools: int = 128
     max_output_tokens: int = 4096
     probed_at: float = 0.0

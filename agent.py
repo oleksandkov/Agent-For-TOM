@@ -17,7 +17,7 @@ Features:
 Env vars:
   ANTHROPIC_API_KEY   - required API key
   ANTHROPIC_BASE_URL  - optional, point to any Anthropic-compatible endpoint
-  AGENT_MODEL         - optional, model name (default: claude-sonnet-4-5)
+  AGENT_MODEL         - optional, model name (e.g. claude-sonnet-5)
   AGENT_AUTO_APPROVE  - optional, "1" to auto-approve low-risk tools
 """
 
@@ -117,7 +117,7 @@ PROJECT_DIR = Path(os.environ.get("AGENT_PROJECT_DIR", os.getcwd())).resolve()
 MEMORY_DIR = Path.home() / ".tomas" / "memory"
 MAX_TOKENS = 8192
 COMPACTION_THRESHOLD = 0.75  # compact when total budget (msg_tok + TOOL_TOKENS + MAX_TOKENS) exceeds this fraction of CONTEXT_WINDOW
-DEFAULT_CONTEXT_WINDOW = 128_000  # fallback if API doesn't report context window
+DEFAULT_CONTEXT_WINDOW = 200_000  # fallback if API doesn't report context window (standard Claude tier)
 CONTEXT_WINDOW = DEFAULT_CONTEXT_WINDOW  # will be updated dynamically at startup
 
 # Known model context windows (fallback when API is not reachable)
@@ -126,6 +126,10 @@ MODEL_CONTEXT_MAP: dict[str, int] = {
     "deepseek-v4-flash-free": 1_000_000,
     "big-pickle": 128_000,
     # Anthropic
+    "claude-fable-5": 200_000,
+    "claude-opus-5": 200_000,
+    "claude-sonnet-5": 200_000,
+    "claude-haiku-4-5-20251001": 200_000,
     "claude-sonnet-4-5": 200_000,
     "claude-sonnet-4": 200_000,
     "claude-3-5-sonnet-20241022": 200_000,
@@ -1497,21 +1501,18 @@ def init_learning() -> None:
 
 
 def reflect_on_session_end(messages: list) -> None:
-    """Learn from the finished session. Never raises, never blocks the user."""
+    """Learn from the finished session. Never raises, never blocks the user.
+
+    Runs and persists silently — results surface on request via
+    /self-improve facts and /self-improve reflect, not as unprompted
+    chatter at the moment a session ends.
+    """
     if not learning.is_enabled():
         return
     try:
-        outcome = learning.run_session_reflection(
-            messages, call_model=_learning_call_model)
+        learning.run_session_reflection(messages, call_model=_learning_call_model)
         for scope in ("global", "project"):
             learning.decay(scope)
-        if not outcome:
-            return
-        if outcome.get("mode") == "shadow":
-            print(f'  {DIM}🧠 Reflection logged (shadow mode) — '
-                  f'review it with /si reflect{RESET}')
-        for summary in outcome.get("promoted", []):
-            print(f'  {DIM}🧠 Learned: {summary}{RESET}')
     except Exception:
         pass
 
