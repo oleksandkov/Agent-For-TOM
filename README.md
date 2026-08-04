@@ -190,3 +190,13 @@ The project launchers (`TOMAS.ps1` / `TOMAS.bat`) work directly from the cloned 
 │   5. loop back to 1                                      │
 └─────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 📚 Documentation
+
+| Document | What it covers |
+|---|---|
+| `AGENTS.md` | Architectural deep-dive — system prompt load order, tool risk tiers, quirks |
+| `CLAUDE.md` | Day-to-day conventions, injected into every system prompt |
+| `docs/HISTORY.md` | How the codebase got here — the reasoning behind each phase of work |

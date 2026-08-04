@@ -215,5 +215,107 @@ class TestPromptBudget(SkillDirTestCase):
                 self.assertIn("**:", line)
 
 
+class TestTriggeredSkills(SkillDirTestCase):
+    """`triggers` was documented as feeding retrieval and read by nothing, so
+    a skill's body only ever loaded when someone typed `/skill <name>` — a
+    procedure written for a job never reached the model doing that job."""
+
+    def setUp(self):
+        super().setUp()
+        sm.write_skill(self.dir / "docs.md",
+                       {"name": "doc-style", "description": "match a sample",
+                        "triggers": ["same style", "як у прикладі"],
+                        "source": "bundled", "version": 1},
+                       "STEP ONE: read the sample.")
+        sm.write_skill(self.dir / "other.md",
+                       {"name": "gardening", "description": "plants",
+                        "triggers": ["tomato"], "source": "user", "version": 1},
+                       "WATER THEM.")
+
+    def test_a_trigger_phrase_matches(self):
+        self.assertEqual([s["name"] for s in sm.match_skills("make it the same style")],
+                         ["doc-style"])
+
+    def test_a_cyrillic_trigger_matches(self):
+        self.assertEqual([s["name"] for s in sm.match_skills("зроби як у прикладі")],
+                         ["doc-style"])
+
+    def test_matching_is_case_insensitive(self):
+        self.assertTrue(sm.match_skills("SAME STYLE please"))
+
+    def test_an_unrelated_message_matches_nothing(self):
+        self.assertEqual(sm.match_skills("what is 2 + 2"), [])
+
+    def test_an_empty_message_matches_nothing(self):
+        self.assertEqual(sm.match_skills(""), [])
+
+    def test_the_body_is_injected_not_the_description(self):
+        out = sm.build_triggered_skills("keep the same style", 5000)
+        self.assertIn("STEP ONE", out)
+
+    def test_only_the_triggered_skill_is_injected(self):
+        out = sm.build_triggered_skills("keep the same style", 5000)
+        self.assertNotIn("WATER THEM", out)
+
+    def test_nothing_triggered_is_empty(self):
+        self.assertEqual(sm.build_triggered_skills("hello", 5000), "")
+
+    def test_the_budget_is_respected(self):
+        self.assertEqual(sm.build_triggered_skills("same style", 10), "")
+
+    def test_an_oversized_skill_is_truncated_not_silently_dropped(self):
+        """Dropping it whole and saying nothing is how a skill stops applying
+        when someone edits it past the budget: the prompt still looks fine and
+        the procedure is simply gone. That happened — a bundled skill grew to
+        ~7600 chars against a 6000 budget and vanished from every prompt, and
+        four model runs were measured before anyone noticed."""
+        sm.write_skill(self.dir / "big.md",
+                       {"name": "huge", "description": "d",
+                        "triggers": ["bigtrigger"], "source": "user",
+                        "version": 1},
+                       "STEP ONE: do the thing.\n" + "padding. " * 900)
+        out = sm.build_triggered_skills("bigtrigger please", 2000)
+        self.assertTrue(out, "the skill vanished entirely")
+        self.assertIn("STEP ONE", out, "the head of the skill must survive")
+        self.assertIn("truncated", out, "the cut must be visible")
+        self.assertLessEqual(len(out), 2400)
+
+    def test_a_skill_that_fits_is_not_marked_truncated(self):
+        out = sm.build_triggered_skills("keep the same style", 5000)
+        self.assertNotIn("truncated", out)
+
+
+class TestBundledSkillsShip(unittest.TestCase):
+    """A bundled skill must be present from the first run, with no setup."""
+
+    def test_the_bundled_directory_is_on_the_search_path(self):
+        self.assertIn(sm.BUNDLED_SKILLS_DIR, sm.SKILL_DIRS)
+
+    def test_it_resolves_next_to_the_module(self):
+        """So a checkout and ~/.tomas/src after an install behave the same."""
+        self.assertEqual(sm.BUNDLED_SKILLS_DIR.parent,
+                         Path(sm.__file__).resolve().parent)
+
+    def test_the_document_style_skill_is_discovered(self):
+        names = {s["name"] for s in sm.discover_skills()}
+        self.assertIn("document-style-match", names)
+
+    def test_it_is_marked_bundled_and_parses_cleanly(self):
+        skill = sm.find_skill("document-style-match")
+        self.assertIsNotNone(skill)
+        self.assertEqual(skill["source"], "bundled")
+        self.assertEqual(skill["problems"], [])
+        self.assertTrue(skill["triggers"])
+
+    def test_it_triggers_on_a_real_request(self):
+        matched = sm.match_skills(
+            "створи нові методичні вказівки по типу до цих, в пдф та докс форматах")
+        self.assertIn("document-style-match", [s["name"] for s in matched])
+
+    def test_a_user_copy_overrides_the_bundled_one(self):
+        """First directory to claim a name wins, and bundled is last."""
+        self.assertGreater(sm.SKILL_DIRS.index(sm.BUNDLED_SKILLS_DIR), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

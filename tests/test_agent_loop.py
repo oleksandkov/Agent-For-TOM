@@ -3,8 +3,8 @@
 Terminal-facing regression tests (Phase 0).
 
 The agent-loop tests that used to live here were rewritten against the core's
-event stream in test_core_loop.py when the loop moved to core/loop.py — see
-docs/plan/PHASE-2-core-ui-split.md. What remains here is the part that is
+event stream in test_core_loop.py when the loop moved to core/loop.py in the
+core/UI split (see docs/HISTORY.md). What remains here is the part that is
 genuinely about the terminal front end and has no core equivalent.
 
 Run: python -m unittest discover -s tests -p "test_*.py"

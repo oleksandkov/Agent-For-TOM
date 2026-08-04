@@ -3,8 +3,8 @@
 Regression tests for the tool layer (Phase 6).
 
 Every test here corresponds to a defect observed in a real session under
-~/.tomas/sessions/ and catalogued in docs/plan/PHASE-6-hardening-from-simulation.md.
-The bug numbers refer to the three TOMAS_SIMULATION_REPORT files.
+~/.tomas/sessions/ and catalogued during the Phase 6 hardening pass
+(see docs/HISTORY.md). Bug numbers refer to the simulation sweeps described there.
 
 Run: python -m unittest tests.test_tool_layer -v
 """
@@ -85,6 +85,50 @@ class TestSandbox(unittest.TestCase):
         outside = "C:/Windows/System32/drivers/etc/hosts" if WINDOWS else "/etc/hosts"
         out = agent.handle_read_file({"file_path": outside})
         self.assertTrue(out.startswith("Error:"), out)
+
+    def test_structured_formats_are_refused_not_written(self):
+        """A .docx is a zip of XML parts, not text.
+
+        Session 20260804_111107 wrote a methodichka to LMV_LabRob_AI.docx with
+        write_file and got "Successfully wrote 4933 chars". Nothing could open
+        it; the failure surfaced eight tool calls later as "Package not found",
+        by which point the model was debugging its PDF converter instead of
+        its choice of tool.
+        """
+        for suffix in (".docx", ".pdf", ".xlsx", ".pptx"):
+            target = PROJECT_DIR / f"_test_structured_{id(self)}{suffix}"
+            out = agent.handle_write_file({"file_path": str(target),
+                                           "content": "plain text"})
+            try:
+                self.assertTrue(out.startswith("Error:"), f"{suffix}: {out}")
+                self.assertFalse(target.exists(),
+                                 f"{suffix} was written anyway")
+            finally:
+                target.unlink(missing_ok=True)
+
+    def test_structured_refusal_names_the_alternative(self):
+        target = PROJECT_DIR / f"_test_alt_{id(self)}.docx"
+        out = agent.handle_write_file({"file_path": str(target), "content": "x"})
+        target.unlink(missing_ok=True)
+        self.assertIn("add_heading", out)
+
+    def test_pdf_refusal_points_at_the_formatting_preserving_route(self):
+        """Generating a PDF from plain text is what lost the bold headings."""
+        target = PROJECT_DIR / f"_test_alt_{id(self)}.pdf"
+        out = agent.handle_write_file({"file_path": str(target), "content": "x"})
+        target.unlink(missing_ok=True)
+        self.assertIn("convert_to_pdf", out)
+
+    def test_text_formats_still_write(self):
+        """The guard must not touch ordinary files."""
+        target = PROJECT_DIR / f"_test_plain_{id(self)}.txt"
+        try:
+            out = agent.handle_write_file({"file_path": str(target),
+                                           "content": "hello"})
+            self.assertFalse(out.startswith("Error:"), out)
+            self.assertEqual(target.read_text(encoding="utf-8"), "hello")
+        finally:
+            target.unlink(missing_ok=True)
 
     def test_safe_predicate(self):
         self.assertTrue(agent._safe(PROJECT_DIR / "agent.py"))

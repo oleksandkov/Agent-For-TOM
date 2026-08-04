@@ -2,8 +2,8 @@
 """
 Phase 3 — real learning.
 
-These are the acceptance criteria from docs/plan/PHASE-3-real-learning.md,
-written as tests. The two that matter most:
+These are the Phase 3 acceptance criteria written as tests
+(see docs/HISTORY.md). The two that matter most:
 
   * a preference must be *reinforced* before it becomes a belief, and
   * the prompt must stay flat in size as the store grows.

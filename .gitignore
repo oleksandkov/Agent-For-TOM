@@ -13,6 +13,9 @@ venv/
 # Agent memory (generated)
 .agent/
 
+# Third-party tool workspaces
+.kilo/
+
 # Install location (if someone installs from repo)
 .tomas/
 
@@ -23,5 +26,17 @@ simulation_results.json
 latest_ai_news_report.txt
 latest_ai_news_report.pdf
 
-# Personal Claude Code settings
+# Ad-hoc analysis notes and plans — summarize into docs/HISTORY.md instead
+/*_PLAN.md
+/*_REPORT.md
+/*_ANALYSIS*.md
+/*_FIXES.md
+
+# Generated documents (lab work, exports, scratch output)
+*.docx
+*.pdf
+!docs/**/*.pdf
+
+# Personal Claude Code settings and scratch worktrees
 .claude/settings.local.json
+.claude/worktrees/

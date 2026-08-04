@@ -226,5 +226,328 @@ class TestRendererWidth(unittest.TestCase):
         self.assertIn("print(wrap(event.text))", source)
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  The input line: multi-row, Shift+Enter, paste
+# ══════════════════════════════════════════════════════════════════════
+
+class FakeKeyboard:
+    """Stands in for msvcrt.
+
+    Each queued key records whether more input is waiting behind it, which is
+    the signal the prompt uses to tell a paste from typing: characters the
+    user types arrive one at a time, a paste is already sitting in the queue.
+    """
+
+    def __init__(self):
+        self.keys: list[list] = []          # [char, more_queued, shift_held]
+        self._last: list | None = None
+
+    def type(self, text):
+        for c in text:
+            self.keys.append([c, False, False])
+        return self
+
+    def paste(self, text):
+        chars = list(text)
+        for i, c in enumerate(chars):
+            self.keys.append([c, i < len(chars) - 1, False])
+        return self
+
+    def enter(self):
+        self.keys.append(['\r', False, False])
+        return self
+
+    def key(self, ch):
+        self.keys.append([ch, False, False])
+        return self
+
+    def shift_enter(self):
+        self.keys.append(['\r', False, True])
+        return self
+
+    # ── the msvcrt surface ────────────────────────────────────────────
+    def getwch(self):
+        if not self.keys:
+            raise AssertionError("prompt read past the scripted input")
+        self._last = self.keys.pop(0)
+        return self._last[0]
+
+    def kbhit(self):
+        return bool(self._last and self._last[1])
+
+    @property
+    def shift(self) -> bool:
+        return bool(self._last and self._last[2])
+
+
+def drive_prompt(keyboard):
+    """Run the real prompt against scripted keys. Returns (result, screen).
+
+    `screen.written` keeps every byte emitted, not just what survives on the
+    final screen — a transient hint is erased by the next redraw, which is
+    correct behaviour and invisible to `screen.text`.
+    """
+    from tests.test_menu_ui import VirtualTerminal
+
+    class Recording(VirtualTerminal):
+        def __init__(self):
+            super().__init__()
+            self.written = ""
+
+        def write(self, data):
+            self.written += data
+            super().write(data)
+
+    screen = Recording()
+    real_stdout, real_shift = sys.stdout, agent._shift_down
+    real_msvcrt = sys.modules.get("msvcrt")
+    sys.modules["msvcrt"] = keyboard
+    sys.stdout = screen
+    agent._shift_down = lambda: keyboard.shift
+    try:
+        result = agent.read_input_with_suggestions("  TOMAS » ")
+    finally:
+        sys.stdout = real_stdout
+        agent._shift_down = real_shift
+        if real_msvcrt is not None:
+            sys.modules["msvcrt"] = real_msvcrt
+        else:                                   # pragma: no cover - non-Windows
+            sys.modules.pop("msvcrt", None)
+    return result, screen
+
+
+class TestPromptSubmitsAndEdits(unittest.TestCase):
+
+    def test_plain_enter_submits(self):
+        result, _ = drive_prompt(FakeKeyboard().type("hello").enter())
+        self.assertEqual(result, "hello")
+
+    def test_backspace_deletes(self):
+        result, _ = drive_prompt(FakeKeyboard().type("abc\x08").enter())
+        self.assertEqual(result, "ab")
+
+    def test_cyrillic_still_types(self):
+        result, _ = drive_prompt(FakeKeyboard().type("Привіт").enter())
+        self.assertEqual(result, "Привіт")
+
+
+class TestQuitKeys(unittest.TestCase):
+    """Ctrl+C is copy; leaving takes a deliberate Esc Esc.
+
+    The terminal only forwards \\x03 when there is no selection to copy, so
+    quitting on it turned the ordinary copy reflex into a coin flip: miss the
+    selection and the session ended.
+    """
+
+    ESC, CTRL_C = '\x1b', '\x03'
+
+    def test_ctrl_c_does_not_quit(self):
+        kb = FakeKeyboard().type("kept").key(self.CTRL_C).type("typing on").enter()
+        result, _ = drive_prompt(kb)
+        self.assertEqual(result, "typing on")
+
+    def test_ctrl_c_clears_the_line(self):
+        kb = FakeKeyboard().type("scratch").key(self.CTRL_C).enter()
+        result, _ = drive_prompt(kb)
+        self.assertEqual(result, "")
+
+    def test_two_escapes_on_an_empty_line_quit(self):
+        kb = FakeKeyboard().key(self.ESC).key(self.ESC)
+        with self.assertRaises(KeyboardInterrupt):
+            drive_prompt(kb)
+
+    def test_one_escape_does_not_quit(self):
+        kb = FakeKeyboard().key(self.ESC).type("still here").enter()
+        result, _ = drive_prompt(kb)
+        self.assertEqual(result, "still here")
+
+    def test_the_first_escape_clears_instead_of_arming(self):
+        """With text on the line the first Esc has something to do, so it
+        does that and leaves the exit unarmed."""
+        kb = FakeKeyboard().type("draft").key(self.ESC).key(self.ESC).type("ok").enter()
+        result, _ = drive_prompt(kb)
+        self.assertEqual(result, "ok")
+
+    def test_typing_between_escapes_disarms(self):
+        kb = (FakeKeyboard().key(self.ESC).type("x").key(self.ESC)
+              .key(self.ESC).key(self.ESC))
+        with self.assertRaises(KeyboardInterrupt):
+            drive_prompt(kb)          # only the final adjacent pair quits
+
+    def test_the_second_escape_is_announced(self):
+        kb = FakeKeyboard().key(self.ESC).type("no").enter()
+        _, screen = drive_prompt(kb)
+        self.assertIn("Esc again", screen.written)
+
+
+class TestShiftEnterMakesANewline(unittest.TestCase):
+    """`getwch` reports a decoded character and nothing about modifiers, so
+    Shift+Enter and Enter were the same `\\r` and both submitted."""
+
+    def test_shift_enter_does_not_submit(self):
+        kb = FakeKeyboard().type("line one").shift_enter().type("line two").enter()
+        result, _ = drive_prompt(kb)
+        self.assertEqual(result, "line one\nline two")
+
+    def test_several_newlines(self):
+        kb = (FakeKeyboard().type("a").shift_enter().shift_enter()
+              .type("b").enter())
+        result, _ = drive_prompt(kb)
+        self.assertEqual(result, "a\n\nb")
+
+    def test_the_whole_buffer_is_on_screen(self):
+        """A multi-row buffer must be readable — and so selectable — in full,
+        not scrolled behind an ellipsis the way one row forced."""
+        kb = FakeKeyboard().type("first").shift_enter().type("second").enter()
+        _, screen = drive_prompt(kb)
+        self.assertIn("first", screen.text)
+        self.assertIn("second", screen.text)
+
+
+class TestPasteIsTakenWhole(unittest.TestCase):
+    """A paste replays as ordinary keystrokes, so every newline inside it hit
+    the submit branch: pasting three paragraphs sent three half messages."""
+
+    def test_newlines_inside_a_paste_do_not_submit(self):
+        kb = FakeKeyboard().paste("alpha\nbeta\ngamma").enter()
+        result, _ = drive_prompt(kb)
+        self.assertEqual(result, "alpha\nbeta\ngamma")
+
+    def test_crlf_is_one_break(self):
+        kb = FakeKeyboard().paste("a\r\nb").enter()
+        result, _ = drive_prompt(kb)
+        self.assertEqual(result, "a\nb")
+
+    def test_a_blank_line_survives(self):
+        kb = FakeKeyboard().paste("a\r\n\r\nb").enter()
+        result, _ = drive_prompt(kb)
+        self.assertEqual(result, "a\n\nb")
+
+    def test_paste_then_keep_typing(self):
+        kb = FakeKeyboard().paste("pasted\ntext").type("!").enter()
+        result, _ = drive_prompt(kb)
+        self.assertEqual(result, "pasted\ntext!")
+
+    def test_a_large_paste_collapses_on_screen_but_sends_in_full(self):
+        big = "x" * (agent.PASTE_COLLAPSE_CHARS + 50)
+        result, screen = drive_prompt(FakeKeyboard().paste(big).enter())
+        self.assertEqual(result, big, "the model must still receive all of it")
+        self.assertNotIn("x" * 80, screen.text, "the raw paste was drawn")
+        self.assertIn("pasted", screen.text)
+
+    def test_a_small_paste_is_shown_as_itself(self):
+        result, screen = drive_prompt(FakeKeyboard().paste("short note").enter())
+        self.assertEqual(result, "short note")
+        self.assertIn("short note", screen.text)
+
+
+class TestInputRowLayout(unittest.TestCase):
+    """`hard_wrap` is the row arithmetic the redraw depends on."""
+
+    def test_short_text_is_one_row(self):
+        self.assertEqual(td.hard_wrap("hello", 80), ["hello"])
+
+    def test_empty_still_occupies_a_row(self):
+        self.assertEqual(td.hard_wrap("", 80), [""])
+
+    def test_newlines_start_rows(self):
+        self.assertEqual(td.hard_wrap("a\nb", 80), ["a", "b"])
+
+    def test_overlong_text_wraps_by_column(self):
+        self.assertEqual(td.hard_wrap("abcdef", 2), ["ab", "cd", "ef"])
+
+    def test_no_row_exceeds_the_width(self):
+        rows = td.hard_wrap("z" * 500 + "\n" + "y" * 90, 40)
+        for row in rows:
+            self.assertLessEqual(td.display_width(row), 40)
+
+    def test_colour_is_not_charged_as_width(self):
+        rows = td.hard_wrap(f"{td.RESET}abc", 3)
+        self.assertEqual(len(rows), 1)
+
+    def test_wide_characters_are_measured(self):
+        rows = td.hard_wrap("日本語", 4)
+        self.assertEqual(len(rows), 2)     # two columns each
+
+
+class TestImageAttachment(unittest.TestCase):
+    """Images named in a message become image blocks — but only where the
+    provider's probe says they can be read. `Capabilities.vision` used to be
+    a hardcoded False nothing ever set."""
+
+    PIXEL = bytes.fromhex(
+        "89504e470d0a1a0a0000000d494844520000000100000001080600000"
+        "01f15c4890000000d4944415478da63fccf00000302010133c4d9d100000000"
+        "49454e44ae426082")
+
+    def setUp(self):
+        self.img = PROJECT_DIR / f"_test_img_{id(self)}.png"
+        self.img.write_bytes(self.PIXEL)
+        self._caps = agent._active_capabilities
+
+    def tearDown(self):
+        self.img.unlink(missing_ok=True)
+        agent._active_capabilities = self._caps
+
+    def vision(self, supported: bool):
+        from types import SimpleNamespace
+        agent._active_capabilities = lambda: SimpleNamespace(vision=supported)
+
+    def test_plain_text_is_unchanged(self):
+        self.vision(True)
+        self.assertEqual(agent.build_user_content("no pictures here"),
+                         "no pictures here")
+
+    def test_a_named_image_becomes_a_block(self):
+        self.vision(True)
+        content = agent.build_user_content(f"look at {self.img}")
+        self.assertIsInstance(content, list)
+        self.assertEqual(content[0]["type"], "image")
+        self.assertEqual(content[0]["source"]["media_type"], "image/png")
+        self.assertEqual(content[-1]["type"], "text")
+
+    def test_the_text_still_travels_with_it(self):
+        self.vision(True)
+        content = agent.build_user_content(f"describe {self.img} please")
+        self.assertIn("please", content[-1]["text"])
+
+    def test_a_quoted_path_with_spaces_is_found(self):
+        self.vision(True)
+        spaced = PROJECT_DIR / f"_test img {id(self)}.png"
+        spaced.write_bytes(self.PIXEL)
+        try:
+            content = agent.build_user_content(f'see "{spaced}"')
+            self.assertIsInstance(content, list)
+        finally:
+            spaced.unlink(missing_ok=True)
+
+    def test_a_text_only_model_gets_text(self):
+        """Sending an image to a model without vision is a 400, not a
+        degraded reply — so it must not be sent at all."""
+        self.vision(False)
+        content = agent.build_user_content(f"look at {self.img}")
+        self.assertIsInstance(content, str)
+
+    def test_a_missing_file_is_not_attached(self):
+        self.vision(True)
+        content = agent.build_user_content("see C:/nope/missing.png")
+        self.assertIsInstance(content, str)
+
+    def test_an_oversized_image_is_refused_not_sent(self):
+        self.vision(True)
+        big = PROJECT_DIR / f"_test_big_{id(self)}.png"
+        big.write_bytes(b"\x89PNG" + b"\0" * (agent.MAX_IMAGE_BYTES + 1))
+        try:
+            content = agent.build_user_content(f"see {big}")
+            self.assertIsInstance(content, str)
+        finally:
+            big.unlink(missing_ok=True)
+
+    def test_non_image_paths_are_ignored(self):
+        self.vision(True)
+        content = agent.build_user_content("read agent.py and README.md")
+        self.assertIsInstance(content, str)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

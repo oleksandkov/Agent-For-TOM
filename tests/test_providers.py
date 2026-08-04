@@ -630,6 +630,154 @@ class TestToolSelection(unittest.TestCase):
         self.assertEqual(agent._last_user_text(messages), "screenshot the page")
 
 
+class TestServerWorkingSet(unittest.TestCase):
+    """A server the turn is about must arrive as a usable set.
+
+    Scoring each tool alone gave the model `create_document` and
+    `convert_to_pdf` while `add_heading`/`add_paragraph`/`add_table` scored
+    0.0 and were withheld — nothing in those names repeats the user's words.
+    It could open a document and convert one but not fill one, so it wrote a
+    .docx with `write_file` that was not a real .docx.
+    """
+
+    #: Shaped like the real word-docs server: a couple of tools whose names
+    #: echo the request, a working set that does not, and a long tail of
+    #: specialised variants that should lose to all of it.
+    DOCS = ([_tool("create_document", "Create a new Word document"),
+             _tool("convert_to_pdf", "Convert a Word document to PDF format"),
+             _tool("add_heading", "Add a heading to a Word document"),
+             _tool("add_paragraph", "Add a paragraph to a Word document"),
+             _tool("add_table", "Add a table to a Word document")]
+            + [_tool(f"set_table_cell_variant_{i}", "specialised table tweak")
+               for i in range(20)])
+
+    OTHER = ([_tool("create_entities", "create entities in the knowledge graph"),
+              _tool("create_relations", "create relations in the knowledge graph")]
+             + [_tool(f"browser_{v}", "browser automation")
+                for v in ("click", "type", "close", "resize", "drop", "evaluate")])
+
+    def setUp(self):
+        self.pool = agent.TOOLS + self.DOCS + self.OTHER
+        owner = {t["name"]: "word-docs" for t in self.DOCS}
+        owner.update({t["name"]: "other" for t in self.OTHER})
+        self.server_of = lambda n: owner.get(n)
+
+    def select(self, context, budget):
+        selected, _ = agent.select_tools(self.pool, context, budget,
+                                         server_of=self.server_of)
+        return {t["name"] for t in selected}
+
+    def test_the_working_set_survives_a_tight_budget(self):
+        names = self.select("create a document and convert it to pdf",
+                            len(agent.TOOLS) + 8)
+        for needed in ("create_document", "convert_to_pdf",
+                       "add_heading", "add_paragraph", "add_table"):
+            self.assertIn(needed, names, f"{needed} was withheld")
+
+    def test_specialised_variants_lose_to_the_working_set(self):
+        names = self.select("create a document and convert it to pdf",
+                            len(agent.TOOLS) + 8)
+        self.assertFalse([n for n in names if n.startswith("set_table_cell_variant")])
+
+    def test_a_server_is_ranked_by_its_total_not_its_best_tool(self):
+        """`create_entities` ties `create_document` on score alone. The
+        request is about documents, and summed relevance says so."""
+        names = self.select("create a document and convert it to pdf",
+                            len(agent.TOOLS) + 6)
+        self.assertIn("add_heading", names)
+
+    def test_an_unrelated_request_does_not_drag_in_the_document_set(self):
+        names = self.select("click the button in the browser",
+                            len(agent.TOOLS) + 4)
+        self.assertNotIn("add_heading", names)
+
+    def test_quota_never_exceeds_the_budget(self):
+        selected, withheld = agent.select_tools(
+            self.pool, "create a document", len(agent.TOOLS) + 3,
+            server_of=self.server_of)
+        self.assertEqual(len(selected), len(agent.TOOLS) + 3)
+        self.assertEqual(len(selected) + len(withheld), len(self.pool))
+
+    def test_selection_is_stable_across_calls(self):
+        a = self.select("create a document and convert it to pdf", len(agent.TOOLS) + 8)
+        b = self.select("create a document and convert it to pdf", len(agent.TOOLS) + 8)
+        self.assertEqual(a, b)
+
+    def test_plain_names_outrank_qualified_ones(self):
+        self.assertGreater(agent.tool_simplicity("add_heading"),
+                           agent.tool_simplicity("add_footnote_robust"))
+        self.assertGreater(agent.tool_simplicity("add_footnote_robust"),
+                           agent.tool_simplicity("set_table_cell_shading"))
+
+    def test_ungrouped_tools_still_select_by_relevance(self):
+        """No MCP manager (or all built-ins) must not break selection."""
+        selected, _ = agent.select_tools(
+            agent.TOOLS + self.DOCS, "convert to pdf", len(agent.TOOLS) + 1,
+            server_of=lambda n: None)
+        self.assertIn("convert_to_pdf", {t["name"] for t in selected})
+
+    def test_a_confirmation_keeps_the_tools_it_confirms(self):
+        """Session 20260804_144250: the request naming docx/pdf selected the
+        whole working set, then "зроби новий", "2" and "зроби це" each
+        selected none of it — three words carry no keywords. By the time the
+        user said "yes, do it", the tools to do it were gone."""
+        messages = [{"role": "user",
+                     "content": "create a document and convert it to pdf"}]
+        for follow in ("do it", "2", "yes correct", "no,"):
+            messages.append({"role": "assistant", "content": "which number?"})
+            messages.append({"role": "user", "content": follow})
+            selected, _ = agent.select_tools(
+                self.pool, agent._recent_user_text(messages),
+                len(agent.TOOLS) + 8, server_of=self.server_of)
+            names = {t["name"] for t in selected}
+            self.assertIn("add_heading", names,
+                          f"working set lost after {follow!r}")
+
+
+class TestToolContextWindow(unittest.TestCase):
+    """What tool selection reads as "what the user is doing"."""
+
+    def ctx(self, *user_texts):
+        messages = []
+        for t in user_texts:
+            messages.append({"role": "user", "content": t})
+            messages.append({"role": "assistant", "content": "ok"})
+        return agent._recent_user_text(messages)
+
+    def test_the_newest_message_is_included(self):
+        self.assertIn("newest", self.ctx("oldest", "newest"))
+
+    def test_earlier_turns_are_included(self):
+        self.assertIn("oldest", self.ctx("oldest", "newest"))
+
+    def test_the_newest_message_outweighs_the_rest(self):
+        """Frequency ranks the keywords, so a conversation must still be able
+        to change subject."""
+        ctx = self.ctx("alpha", "beta")
+        self.assertGreater(ctx.count("beta"), ctx.count("alpha"))
+
+    def test_tool_results_are_not_user_intent(self):
+        messages = [
+            {"role": "user", "content": "the real request"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "1", "name": "x", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "1", "content": "junk"}]},
+        ]
+        self.assertIn("the real request", agent._recent_user_text(messages))
+        self.assertNotIn("junk", agent._recent_user_text(messages))
+
+    def test_the_window_is_bounded(self):
+        ctx = self.ctx(*[f"turn{i}" for i in range(40)])
+        self.assertNotIn("turn0 ", ctx)
+        self.assertLessEqual(len(ctx), agent.TOOL_CONTEXT_CHARS)
+
+    def test_no_user_turns_is_empty(self):
+        self.assertEqual(agent._recent_user_text([]), "")
+        self.assertEqual(
+            agent._recent_user_text([{"role": "assistant", "content": "hi"}]), "")
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  P4-6 — the real-provider matrix
 # ══════════════════════════════════════════════════════════════════════

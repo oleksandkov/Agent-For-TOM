@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Regression tests for Phase 1 (docs/plan/PHASE-1-close-the-loop.md).
+Regression tests for Phase 1 — closing the learning loop (see docs/HISTORY.md).
 
 Each test corresponds to something the self-improvement pipeline wrote but
 never read back: generated skills, self-notes, and (separately) an honest

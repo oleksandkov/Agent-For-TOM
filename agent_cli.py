@@ -325,7 +325,15 @@ def arrow_menu(title: str, items: list, header_lines: list = None,
 
     columns = term_columns()
     line_budget = max(1, columns - 1)   # never touch the last column
-    rows_available = max(4, term_lines() - len(header_lines or (1, 2)) - 3)
+    # Budget against the rows the header actually *draws*, not the number of
+    # entries in the list. A single entry can be many rows -- TOMAS_ART is one
+    # string holding 11 lines -- so counting entries overestimated the space
+    # left by ~10 rows and let the list run off the bottom of the window.
+    if header_lines:
+        header_rows = sum(menu_row_count(line, line_budget) for line in header_lines)
+    else:
+        header_rows = 2                 # title + rule, drawn by draw_header()
+    rows_available = max(4, term_lines() - header_rows - 3)
     if max_visible:
         rows_available = min(rows_available, max(4, max_visible))
 
@@ -648,6 +656,31 @@ def _migrate_providers_config() -> None:
         pass
 
 
+def _migrate_decorated_provider_names() -> None:
+    """Strip menu decoration that leaked into saved provider *names*.
+
+    The configure page used one list for both the labels it drew and the key it
+    saved under, and the OpenCode Zen entry carried a trailing `◈` marker. Any
+    config written before that was fixed has the glyph baked into the name, so
+    it shows up wherever the provider is displayed. The label no longer carries
+    it; this renames what is already on disk.
+    """
+    try:
+        config = _load_providers_config()
+        providers = config.get("providers") or {}
+        renames = {name: name.rstrip(" ◈") for name in providers
+                   if name.rstrip(" ◈") != name}
+        if not renames:
+            return
+        for old, new in renames.items():
+            providers[new] = providers.pop(old)
+            if config.get("active") == old:
+                config["active"] = new
+        _save_providers_config(config)
+    except Exception:
+        pass
+
+
 _migrate_providers_config()
 
 
@@ -669,6 +702,10 @@ def _save_providers_config(config: dict):
         json.dumps(config, indent=2, ensure_ascii=False),
         encoding="utf-8"
     )
+
+
+# Runs here rather than beside the other migration: it needs both accessors above.
+_migrate_decorated_provider_names()
 
 
 def _get_configured_providers(config: dict = None) -> list[str]:
@@ -784,88 +821,83 @@ def _choose_provider_to_switch() -> bool:
 #  MENU PAGES
 # ═══════════════════════════════════════════════════════════
 
-def page_model():
-    """Show current model info."""
-    lines = [
-        f'  AGENT_MODEL:       {get_env_value("AGENT_MODEL")}',
-        f'  ANTHROPIC_BASE_URL: {get_env_value("ANTHROPIC_BASE_URL")}',
-        f'  API Key:           ***{get_env_value("ANTHROPIC_API_KEY")[-4:]}',
-        '',
-    ]
-    # Check if Zen proxy is active
-    try:
-        from zen_proxy import check_status
-        if check_status():
-            lines.append(f'  {GREEN}◈{RESET} OpenCode Zen proxy: {GREEN}running{RESET}')
-            lines.append(f'  {DIM}  Available models:{RESET}')
-            from zen_proxy import ZEN_MODELS, MODEL_CONTEXT_WINDOWS
-            for m in ZEN_MODELS:
-                cw = MODEL_CONTEXT_WINDOWS.get(m, '?')
-                cw_str = f'{cw:,}' if isinstance(cw, int) else str(cw)
-                lines.append(f'  {DIM}    • {m} ({cw_str} ctx){RESET}')
-        else:
-            lines.append(f'  OpenCode Zen proxy: {DIM}not running{RESET}')
-    except Exception:
-        pass
-    show_info_page('Current LLM Model', lines)
-
-
 def page_providers():
-    """Show connected providers."""
+    """Show configured providers and what the active one can do."""
+    from provider_manager import capabilities_for_active
+
     base_url = get_env_value('ANTHROPIC_BASE_URL')
     api_key = get_env_value('ANTHROPIC_API_KEY')
-    lines = []
-    if base_url != "Not set" and api_key != "Not set":
-        lines.append(f'  ✓ Active: {base_url}')
-        lines.append(f'    Key: ***{api_key[-4:]}')
-    else:
-        lines.append('  ✗ No active provider')
-    lines.append('')
-
-    # Show configured providers from multi-provider config
     config = _load_providers_config()
     providers = _get_configured_providers(config)
     active = config.get("active")
+
+    lines = []
+    if base_url != "Not set" and api_key != "Not set":
+        lines.append(f'  {GREEN}✓{RESET} Connected  {active or base_url}')
+        lines.append(f'    {DIM}Endpoint{RESET}  {base_url}')
+        lines.append(f'    {DIM}Key{RESET}       ***{api_key[-4:]}')
+        lines.append(f'    {DIM}Model{RESET}     {get_env_value("AGENT_MODEL")}')
+
+        # Capabilities come from the stored probe — this never hits the network.
+        caps = capabilities_for_active()
+        state = 'probed' if caps.probed else 'assumed (not probed yet)'
+        lines.append('')
+        lines.append(f'  {BOLD}Capabilities{RESET} {DIM}({state}){RESET}')
+        lines.append(f'    Context     {caps.context_window:,} tokens')
+        lines.append(f'    Tool limit  {caps.max_tools}')
+        lines.append(f'    Streaming   {"yes" if caps.streaming else "no"}')
+    else:
+        lines.append(f'  {RED}✗{RESET} No active provider')
+        lines.append(f'    {DIM}Use "Add or Configure Provider" to connect one.{RESET}')
+    lines.append('')
+
     if providers:
-        lines.append(f'  Saved providers ({len(providers)}):')
+        lines.append(f'  {BOLD}Saved{RESET} {DIM}({len(providers)}){RESET}')
         for p in providers:
             mark = f'{GREEN}◈{RESET}' if p == active else ' '
-            lines.append(f'    {mark} {p}')
+            suffix = f' {DIM}· active{RESET}' if p == active else ''
+            lines.append(f'    {mark} {p}{suffix}')
     else:
-        lines.append('  (No saved provider configurations)')
+        lines.append(f'  {DIM}No saved provider configurations.{RESET}')
 
-    lines.append('')
-    lines.append('  Env-detected providers:')
-    for var in ['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'GOOGLE_API_KEY', 'GROQ_API_KEY']:
-        val = get_env_value(var)
-        status = '✓' if val != "Not set" else '✗'
-        lines.append(f'    {status} {var}')
-    # OpenCode Zen status
-    try:
-        from zen_proxy import check_status
-        zen_running = check_status()
-    except Exception:
-        zen_running = False
-    zen_icon = '✓' if zen_running else '✗'
-    zen_model = get_env_value('AGENT_MODEL')
-    lines.append(f'    {zen_icon} OpenCode Zen proxy{" (" + zen_model + ")" if zen_running else ""}')
-    show_info_page('Connected Providers', lines)
+    # Keys picked up from the environment that a provider could be built from.
+    env_found = [var for var in
+                 ('OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'GOOGLE_API_KEY', 'GROQ_API_KEY')
+                 if get_env_value(var) != "Not set"]
+    if env_found:
+        lines.append('')
+        lines.append(f'  {BOLD}Detected in environment{RESET}')
+        for var in env_found:
+            lines.append(f'    {GREEN}✓{RESET} {var}')
+
+    show_info_page('Providers', lines)
 
 
 def page_tools():
-    """Show available tools."""
-    lines = [f'  Total tools: {len(TOOLS)}', '']
+    """Show the built-in tools and the risk tier each one is approved under."""
+    icons = {'low': '🟢', 'medium': '🟡', 'high': '🔴'}
+    lines = [
+        f'  {len(TOOLS)} built-in tools.  {DIM}MCP tools are listed under MCP Servers.{RESET}',
+        f'  {DIM}Risk decides what each permission mode auto-approves.{RESET}',
+        '',
+    ]
     for tool in TOOLS:
-        risk = RISK_LEVELS.get(tool['name'], 'unknown')
-        icons = {'low': '🟢', 'medium': '🟡', 'high': '🔴'}
-        icon = icons.get(risk, '⚪')
-        lines.append(f'  {icon} {tool["name"]} ({risk})')
+        name = tool['name']
+        # run_command is the one tool whose tier is decided per call, from the
+        # command itself -- a table lookup here would print a tier that never
+        # actually applies. Everything else falls back to the table, whose
+        # default is "high", not "unknown".
+        if name == 'run_command':
+            risk, note = 'varies', ' 🟢 read-only · 🔴 anything mutating'
+        else:
+            risk, note = RISK_LEVELS.get(name, 'high'), ''
+        lines.append(f'  {icons.get(risk, "⚪")} {BOLD}{name}{RESET} {DIM}({risk}){RESET}{DIM}{note}{RESET}')
         lines.append(f'     {tool["description"]}')
         props = tool['input_schema'].get('properties', {})
         if props:
-            lines.append(f'     Params: {", ".join(props.keys())}')
+            lines.append(f'     {DIM}Params: {", ".join(props.keys())}{RESET}')
         lines.append('')
-    show_info_page('Available Tools', lines)
+    show_info_page('Tools', lines)
 
 
 def page_mcps():
@@ -1618,40 +1650,53 @@ def page_sessions():
             continue
 
 
-def page_edit_instructions():
-    """View/edit ~/.tomas/instructions/AGENT.md (global agent instructions)."""
-    inst_file = TOMAS_DIR / "instructions" / "AGENT.md"
+def _page_view_instructions(title: str, subtitle: str, path):
+    """Show an instructions file, with [e] to open it in the system editor.
+
+    Both instruction pages differ only in which file they point at. The titles
+    say what the file *governs* -- the filenames AGENT.md and AGENTS.md differ
+    by one character and told the reader nothing about the difference.
+    """
     clear_screen()
-    print(f'{BOLD}Agent Instructions (AGENT.md ~ global){RESET}')
+    print(f'{BOLD}{title}{RESET}')
+    print(f'{DIM}{subtitle}{RESET}')
+    print(f'{DIM}{path}{RESET}')
     print('─' * 50)
-    if inst_file.exists():
-        print(inst_file.read_text(encoding="utf-8"))
+    if path.exists():
+        body = path.read_text(encoding="utf-8").strip()
+        print(body if body else f'  {DIM}(file is empty){RESET}')
     else:
-        print('  (file does not exist yet)')
+        print(f'  {DIM}(not created yet — press [e] to start it){RESET}')
     print()
-    sys.stdout.write(DIM + 'Press any key to go back, or [e] to edit in Notepad...' + RESET)
+    sys.stdout.write(DIM + 'Press any key to go back, or [e] to edit...' + RESET)
     sys.stdout.flush()
     key = msvcrt.getch()
     if key in (b'e', b'E'):
-        os.startfile(inst_file) if inst_file.exists() else None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                path.write_text('', encoding="utf-8")
+            os.startfile(path)
+        except Exception as e:
+            show_info_page('Could Not Open Editor', [f'  {RED}✗{RESET} {e}'])
+
+
+def page_edit_instructions():
+    """View/edit the global agent instructions."""
+    _page_view_instructions(
+        'Agent Instructions',
+        'Applies to every project on this machine.',
+        TOMAS_DIR / "instructions" / "AGENT.md",
+    )
 
 
 def page_edit_project_agent():
-    """View/edit AGENTS.md in the project root (project-level guidelines)."""
-    agent_file = AGENT_PROJECT_DIR / "AGENTS.md"
-    clear_screen()
-    print(f'{BOLD}Project Guidelines (AGENTS.md ~ project level){RESET}')
-    print('─' * 50)
-    if agent_file.exists():
-        print(agent_file.read_text(encoding="utf-8"))
-    else:
-        print('  (file does not exist yet)')
-    print()
-    sys.stdout.write(DIM + 'Press any key to go back, or [e] to edit in Notepad...' + RESET)
-    sys.stdout.flush()
-    key = msvcrt.getch()
-    if key in (b'e', b'E'):
-        os.startfile(agent_file) if agent_file.exists() else None
+    """View/edit the project-level guidelines."""
+    _page_view_instructions(
+        'Project Guidelines',
+        f'Applies only to {AGENT_PROJECT_DIR.name}.',
+        AGENT_PROJECT_DIR / "AGENTS.md",
+    )
 
 
 def page_configure_provider():
@@ -1663,7 +1708,7 @@ def page_configure_provider():
         'Anthropic Direct (api.anthropic.com)',
         'OpenAI (api.openai.com)',
         'Google AI',
-        'OpenCode Zen (opencode.ai)  ◈',
+        'OpenCode Zen (opencode.ai)',
         'Ollama (local)',
         'Custom / Other',
     ]
@@ -1833,24 +1878,27 @@ def page_configure_provider():
 
 
 def page_configure_zen():
-    """Sub-menu for OpenCode Zen configuration."""
+    """Sub-menu for OpenCode Zen configuration.
+
+    Connecting directly is the recommended path: `openai_adapter` builds the
+    dynamic `x-opencode-*` headers in-process, so the standalone proxy buys
+    nothing here. It is kept only for pointing *other* tools at Zen.
+    """
     opts = [
-        '  🚀  Start Zen proxy (local, built-in)',
-        '  🔑  Manual — Direct Zen API',
-        '  ℹ️   About OpenCode Zen',
+        f'  🔑  Connect to Zen  {DIM}(recommended){RESET}',
+        f'  ℹ️   About OpenCode Zen',
+        '',
+        f'  🚀  Start local proxy  {DIM}(only needed by other tools){RESET}',
         '  ◀   Back to providers',
     ]
-    idx = arrow_menu('OpenCode Zen Configuration', opts,
+    actions = [_zen_setup_direct, _zen_show_info, None, _zen_setup_proxy, None]
+    idx = arrow_menu('OpenCode Zen', opts,
                      footer='↑↓ navigate · Enter select · Esc back')
-    if idx < 0 or idx == 3:
+    if idx < 0:
         return
-
-    if idx == 0:  # Start proxy
-        _zen_setup_proxy()
-    elif idx == 1:  # Direct API
-        _zen_setup_direct()
-    elif idx == 2:  # About
-        _zen_show_info()
+    action = actions[idx]
+    if action:
+        action()
 
 
 def _zen_setup_proxy():
@@ -1910,25 +1958,30 @@ def _zen_setup_proxy():
 
 
 def _zen_setup_direct():
-    """Configure direct Zen API access without local proxy."""
+    """Connect straight to Zen — no local proxy involved.
+
+    Zen needs dynamic `x-opencode-*` headers on every request. Those used to be
+    the proxy's whole reason to exist; `openai_adapter._headers_for` now adds
+    them in-process (see `openai_adapter.py`, `provider.type == "zen"`), so a
+    direct connection is the normal, supported path.
+    """
     from zen_proxy import ZEN_MODELS, MODEL_CONTEXT_WINDOWS
     key = prompt_text('Enter Zen API key (or leave blank for free tier)', 'public')
     if not key:
         key = 'public'
     update_dotenv("ANTHROPIC_API_KEY", key)
-    # For direct API, point to opencode.ai with extra headers
     update_dotenv("ANTHROPIC_BASE_URL", "https://opencode.ai/zen/v1")
-    # The proxy is recommended because Zen requires dynamic x-opencode-* headers.
-    # Direct access may not work without the proxy.
     update_dotenv("AGENT_MODEL", ZEN_MODELS[0])
     reinit_client()
-    show_info_page('Zen Direct Configured', [
-        '  ✓ API key set',
-        '  ✓ Base URL: https://opencode.ai/zen/v1',
-        f'  ✓ Default model: {ZEN_MODELS[0]} ({MODEL_CONTEXT_WINDOWS.get(ZEN_MODELS[0], "?"):,} ctx)',
+    cw = MODEL_CONTEXT_WINDOWS.get(ZEN_MODELS[0], "?")
+    show_info_page('Connected to Zen', [
+        f'  {GREEN}✓{RESET} API key set',
+        f'  {GREEN}✓{RESET} Endpoint: https://opencode.ai/zen/v1',
+        f'  {GREEN}✓{RESET} Model: {ZEN_MODELS[0]}'
+        + (f' ({cw:,} ctx)' if isinstance(cw, int) else ''),
         '',
-        f'  {YELLOW}⚠ Note: Direct Zen API requires custom headers.{RESET}',
-        f'  {YELLOW}  For reliable access, use "Start Zen proxy" instead.{RESET}',
+        f'  {DIM}Authentication headers are added in-process — no proxy to run.{RESET}',
+        f'  {DIM}Pick a different model from "Change Model".{RESET}',
     ])
 
 
@@ -1945,8 +1998,9 @@ def _zen_show_info():
         '  A curated API gateway from the OpenCode team.',
         '  Pay per token, no subscription needed.',
         '',
-        f'  {BOLD}Proxy status:{RESET}',
-        f'    {r_icon} on http://127.0.0.1:{port}',
+        f'  {BOLD}Connection:{RESET}',
+        f'    {GREEN}✓{RESET} Direct — headers added in-process, no proxy needed',
+        f'    {r_icon} Optional local proxy on http://127.0.0.1:{port}',
         '',
         f'  {BOLD}Free-tier models:{RESET}',
         *(f'    {DIM}•{RESET} {m} ({MODEL_CONTEXT_WINDOWS.get(m, "?"):,} ctx)' for m in ZEN_MODELS),
@@ -1961,7 +2015,8 @@ def _zen_show_info():
         f'  {CYAN}https://opencode.ai/docs/zen{RESET}',
         f'  {CYAN}https://github.com/anomalyco/opencode{RESET}',
         '',
-        f'  {DIM}Use "Start Zen proxy" in the menu to begin.{RESET}',
+        f'  {DIM}Choose "Connect to Zen" to begin. The local proxy is only for{RESET}',
+        f'  {DIM}pointing other tools at Zen (TOMAS_ZEN_PROXY=1).{RESET}',
     ]
     show_info_page('About OpenCode Zen', lines)
 
@@ -2077,7 +2132,7 @@ def _provider_model_entries(provider: str) -> list[tuple[str, str | None]]:
     elif provider == "zen":
         from zen_proxy import ZEN_MODELS, MODEL_CONTEXT_WINDOWS
         entries = [
-            ('── Zen models (proxy-supported) ──', None),
+            ('── Zen free-tier models ──', None),
         ]
         for m in ZEN_MODELS:
             cw = MODEL_CONTEXT_WINDOWS.get(m, '?')
@@ -2363,35 +2418,38 @@ def _fetch_openrouter_models():
 
 
 def _ensure_api_configured() -> bool:
-    """Ensure ANTHROPIC_API_KEY is set. If not, try to use the Zen proxy.
-    Returns True if API is ready, False if user should go back to menu."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if api_key:
+    """Make sure there is something to talk to before the chat opens.
+
+    With no key configured this falls back to the OpenCode Zen free tier.
+    It used to do that by spawning the proxy daemon in the background, which
+    contradicts `provider_manager._use_standalone_proxy` -- the daemon is
+    opt-in now that `openai_adapter` translates in-process. Configuring the
+    direct endpoint gets the same result without a stray background process.
+    """
+    if os.environ.get("ANTHROPIC_API_KEY", "").strip():
         return True
 
-    # No API key configured — try to start/use the Zen proxy
     try:
-        from zen_proxy import check_status, start_proxy
-        if check_status():
-            print(f"  {GREEN}◈{RESET} Using OpenCode Zen proxy (already running)")
-        else:
-            print(f"  {CYAN}◈{RESET} Starting OpenCode Zen proxy...")
-            try:
-                start_proxy(6446, daemon=True)
-            except Exception as e:
-                print(f"  {YELLOW}⚠{RESET} Could not start Zen proxy: {e}")
-                print(f"  {YELLOW}⚠{RESET} Set ANTHROPIC_API_KEY in {TOMAS_DIR / '.env'} or start Zen manually.")
-                return False
-        update_dotenv("ANTHROPIC_API_KEY", "zen-proxy-key")
-        update_dotenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:6446")
-        update_dotenv("ANTHROPIC_EXTRA_HEADERS", "")
-        from agent import reinit_client
-        reinit_client()
-        return True
+        from zen_proxy import ZEN_MODELS
     except ImportError:
-        print(f"  {RED}✗{RESET} No API key configured and Zen proxy not available.")
+        print(f"  {RED}✗{RESET} No API key configured.")
         print(f"  {RED}✗{RESET} Set ANTHROPIC_API_KEY in {TOMAS_DIR / '.env'} to use TOMAS.")
         return False
+
+    print(f"  {CYAN}◈{RESET} No provider configured — using the OpenCode Zen free tier.")
+    update_dotenv("ANTHROPIC_API_KEY", "public")
+    update_dotenv("ANTHROPIC_BASE_URL", "https://opencode.ai/zen/v1")
+    update_dotenv("ANTHROPIC_EXTRA_HEADERS", "")
+    if os.environ.get("AGENT_MODEL", "").strip() == "":
+        update_dotenv("AGENT_MODEL", ZEN_MODELS[0])
+    print(f"  {DIM}Connect your own provider any time from the menu.{RESET}")
+    try:
+        from agent import reinit_client
+        reinit_client()
+    except Exception as e:
+        print(f"  {YELLOW}⚠{RESET} Could not initialise the client: {e}")
+        return False
+    return True
 
 
 def page_run_agent():
@@ -2401,9 +2459,9 @@ def page_run_agent():
         input(f"{DIM}Press Enter to return to menu...{RESET}")
         return
     clear_screen()
-    print(f'{BOLD}Starting TOMAS Agent{RESET}')
+    print(f'{BOLD}TOMAS{RESET}  {DIM}· {get_model()}{RESET}')
     print('─' * 50)
-    print("Type 'quit' or 'exit' to leave. Esc Esc also exits.")
+    print(f"{DIM}Esc Esc to leave, or type 'exit'.  /help for commands.{RESET}")
     print()
     from agent import main
     main()
@@ -2426,61 +2484,119 @@ TOMAS_ART = fr'''
 {BLUE}╚══════════════════════════════════════════════╝{RESET}
 '''
 
+# The banner is 11 rows. On a short window those rows come out of the menu's
+# budget and the list starts paginating, so below a threshold the title
+# collapses to one line and every entry stays visible.
+TOMAS_TITLE = (f'\n  {CYAN}{BOLD}TOMAS{RESET}  '
+               f'{DIM}{MAGENTA}An AI Coding Agent — from the Terminal{RESET}\n')
+
+# Labels name what the user gets, not how it is implemented. Blank strings are
+# spacers — `arrow_menu` draws them but the cursor skips over them, so they group
+# the list without costing a keypress. MENU_ACTIONS is index-aligned with this.
 MENU_ITEMS = [
-    f'  {GREEN}⟐{RESET}  Check default LLM model',
-    f'  {GREEN}⟐{RESET}  Check connected providers',
-    f'  {GREEN}⟐{RESET}  Connect / configure provider',
-    f'  {GREEN}⟐{RESET}  Switch active provider',
-    f'  {GREEN}⟐{RESET}  Choose model to use',
-    f'  {YELLOW}⬡{RESET}  Check available MCPs',
-    f'  {YELLOW}⬡{RESET}  Check available tools',
-    f'  {YELLOW}⬡{RESET}  Check installed skills',
+    f'  {MAGENTA}▶{RESET}  {BOLD}Start Chat{RESET}',
+    '',
+    f'  {GREEN}⟐{RESET}  Providers',
+    f'  {GREEN}⟐{RESET}  Add or Configure Provider',
+    f'  {GREEN}⟐{RESET}  Switch Provider',
+    f'  {GREEN}⟐{RESET}  Change Model',
+    '',
+    f'  {YELLOW}⬡{RESET}  MCP Servers',
+    f'  {YELLOW}⬡{RESET}  Tools',
+    f'  {YELLOW}⬡{RESET}  Skills',
+    '',
     f'  {CYAN}◈{RESET}  Sessions & Notes',
-    f'  {BLUE}✎{RESET}  View/Edit global agent instructions (AGENT.md)',
-    f'  {BLUE}✎{RESET}  View/Edit project-level guidelines (AGENTS.md)',
-    f'  {MAGENTA}▶{RESET}  {BOLD}Run agent (interactive){RESET}',
+    f'  {BLUE}✎{RESET}  Agent Instructions',
+    f'  {BLUE}✎{RESET}  Project Guidelines',
+    '',
     f'  {RED}✕{RESET}  Exit',
 ]
 
 MENU_ACTIONS = [
-    page_model,
+    page_run_agent,
+    None,  # spacer
     page_providers,
     page_configure_provider,
     _choose_provider_to_switch,
     page_choose_model,
+    None,  # spacer
     page_mcps,
     page_tools,
     page_skills,
+    None,  # spacer
     page_sessions,
     page_edit_instructions,
     page_edit_project_agent,
-    page_run_agent,
+    None,  # spacer
     None,  # exit
 ]
 
-EXIT_INDEX = len(MENU_ITEMS) - 1  # 12
+assert len(MENU_ACTIONS) == len(MENU_ITEMS), "menu labels and actions must stay aligned"
+
+EXIT_INDEX = len(MENU_ITEMS) - 1
+
+
+def _control_panel_lines() -> list:
+    """The status block above the menu.
+
+    Every number here is read from disk or memory — nothing probes the network,
+    because this redraws each time the user returns from a page.
+    """
+    def count(fn, default='—'):
+        try:
+            return fn()
+        except Exception:
+            return default
+
+    provider = _get_active_provider_name()
+    provider_status = (f'{GREEN}{provider}{RESET}' if provider
+                       else f'{YELLOW}not configured{RESET}')
+
+    def model_line():
+        from provider_manager import capabilities_for_active
+        caps = capabilities_for_active()
+        window = f'{caps.context_window // 1000}K context'
+        return f'{CYAN}{get_model()}{RESET}  {DIM}· {window}{RESET}'
+
+    def extensions_line():
+        from mcp_manager import read_mcp_servers, is_server_disabled
+        from skills_manager import discover_skills
+        servers = read_mcp_servers()
+        live = sum(1 for name in servers if not is_server_disabled(name))
+        skills = len(discover_skills())
+        parts = [f'{live} MCP', f'{len(TOOLS)} tools', f'{skills} skills']
+        off = len(servers) - live
+        if off:
+            parts.append(f'{DIM}{off} disabled{RESET}')
+        return f'{DIM} · {RESET}'.join(parts)
+
+    def sessions_line():
+        n = get_session_count()
+        return f'{n} saved' if n else f'{DIM}none yet{RESET}'
+
+    # Banner (11 rows) + panel (7) + menu + footer. Drop to the one-line title
+    # rather than let the menu scroll.
+    banner = TOMAS_ART if term_lines() >= len(MENU_ITEMS) + 21 else TOMAS_TITLE
+
+    return [
+        banner,
+        f'  {BOLD}Control Panel{RESET}',
+        f'  {DIM}{"─" * 46}{RESET}',
+        f'  {DIM}Project{RESET}     {AGENT_PROJECT_DIR.name}',
+        f'  {DIM}Provider{RESET}    {provider_status}',
+        f'  {DIM}Model{RESET}       {count(model_line)}',
+        f'  {DIM}Extensions{RESET}  {count(extensions_line)}',
+        f'  {DIM}Sessions{RESET}    {count(sessions_line)}',
+        '',
+    ]
 
 
 def run_menu():
     """Run the main interactive menu."""
     while True:
-        model_status = f'{CYAN}{get_model()}{RESET}'
-        active_provider = _get_active_provider_name()
-        if active_provider:
-            provider_status = f'{GREEN}{active_provider}{RESET}'
-        else:
-            provider_status = f'{DIM}None configured{RESET}'
-        header = [
-            TOMAS_ART,
-            f'  {BOLD}Control Panel{RESET}',
-            f'  {DIM}{"─" * 46}{RESET}',
-            f'  {BLUE}Project{RESET}  {AGENT_PROJECT_DIR.name}',
-            f'  {GREEN}Provider{RESET} {provider_status}',
-            f'  {CYAN}Model{RESET}    {model_status}',
-            '',
-        ]
         idx = arrow_menu('', MENU_ITEMS,
-                         header_lines=header,
+                         header_lines=_control_panel_lines(),
+                         max_visible=len(MENU_ITEMS),
                          footer=f'{DIM}↑↓ navigate  ·  Enter select  ·  Esc/q to quit{RESET}')
         if idx < 0 or idx == EXIT_INDEX:
             clear_screen()

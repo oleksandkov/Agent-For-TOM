@@ -132,6 +132,42 @@ def shorten(text: str, width: int, ellipsis: str = "…") -> str:
     return "".join(out) + ellipsis + (RESET if saw_escape else "")
 
 
+def hard_wrap(text: str, width: int) -> list[str]:
+    """Split into physical terminal rows at exactly `width` columns.
+
+    Character wrapping, not word wrapping: this is for input the user is
+    still editing, where dropping or reflowing a space would move the text
+    out from under their cursor. Embedded newlines start a new row, so a
+    multi-line buffer lays out the way it will be drawn.
+
+    Escapes are stepped over at zero width and never split, the same walk
+    `shorten` does — a row cut inside `\\x1b[92m` leaves `[9` on screen and
+    the colour stuck on. Returns at least one row, so an empty buffer still
+    occupies the line it is drawn on.
+    """
+    width = max(1, width)
+    rows: list[str] = []
+    for logical in (text or "").split("\n"):
+        current: list[str] = []
+        used = 0
+        i = 0
+        while i < len(logical):
+            match = _ANSI_RE.match(logical, i)
+            if match:
+                current.append(match.group())
+                i = match.end()
+                continue
+            w = char_width(logical[i])
+            if used + w > width and current:
+                rows.append("".join(current))
+                current, used = [], 0
+            current.append(logical[i])
+            used += w
+            i += 1
+        rows.append("".join(current))
+    return rows
+
+
 def rule(char: str = "─", width: int | None = None, indent: int = 2) -> str:
     """A horizontal rule that matches the terminal instead of a fixed 46."""
     return char * max(1, (width or term_width()) - indent)

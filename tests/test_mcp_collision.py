@@ -365,5 +365,76 @@ class TestAnthropicConversion(unittest.TestCase):
         self.assertEqual(result["input_schema"], {"type": "object"})
 
 
+class _FakePipe:
+    """Stands in for the server's stdout: hands back queued lines."""
+
+    def __init__(self, lines):
+        self._lines = [l.encode("utf-8") if isinstance(l, str) else l
+                       for l in lines]
+
+    def readline(self):
+        return self._lines.pop(0) if self._lines else b""
+
+
+class _FakeProc:
+    def __init__(self, lines):
+        self.stdout = _FakePipe(lines)
+        self.stdin = None
+
+
+class TestStdioNoiseDoesNotDesync(unittest.TestCase):
+    """Non-JSON on stdout must cost one line, not the whole connection.
+
+    The MCP spec says a stdio server writes only JSON-RPC to stdout; real
+    servers break that. `_stdio_recv` used to json.loads exactly one line, so
+    one warning raised JSONDecodeError *and* left the real reply queued —
+    every later call then read the previous call's response, one off forever.
+    Session 20260804_111107 hit this: after a single failed convert_to_pdf,
+    get_document_text and add_paragraph — both working moments earlier — kept
+    raising the same error, so the model abandoned the document tools and
+    hand-rolled scripts instead. The conversion had actually succeeded.
+    """
+
+    def server(self, lines):
+        from mcp_manager import MCPServer
+        srv = MCPServer("noisy", {"type": "stdio", "command": "x"})
+        srv._proc = _FakeProc(lines)
+        srv.connected = True
+        return srv
+
+    def test_a_warning_line_is_skipped(self):
+        srv = self.server(['UserWarning: deprecated\n',
+                           '{"jsonrpc":"2.0","id":1,"result":{"content":'
+                           '[{"type":"text","text":"converted"}]}}\n'])
+        self.assertEqual(srv._stdio_call({"id": 1}), "converted")
+
+    def test_the_connection_survives_for_the_next_call(self):
+        srv = self.server(['noise\n',
+                           '{"jsonrpc":"2.0","id":1,"result":{"content":'
+                           '[{"type":"text","text":"first"}]}}\n',
+                           '{"jsonrpc":"2.0","id":2,"result":{"content":'
+                           '[{"type":"text","text":"second"}]}}\n'])
+        self.assertEqual(srv._stdio_call({"id": 1}), "first")
+        self.assertEqual(srv._stdio_call({"id": 2}), "second")
+
+    def test_a_stale_reply_is_not_returned_for_this_request(self):
+        srv = self.server(['{"jsonrpc":"2.0","id":1,"result":{"content":'
+                           '[{"type":"text","text":"stale"}]}}\n',
+                           '{"jsonrpc":"2.0","id":2,"result":{"content":'
+                           '[{"type":"text","text":"mine"}]}}\n'])
+        self.assertEqual(srv._stdio_call({"id": 2}), "mine")
+
+    def test_a_dead_server_reports_instead_of_raising(self):
+        srv = self.server([])          # EOF immediately
+        out = srv._stdio_call({"id": 1})
+        self.assertTrue(out.startswith("Error:"), out)
+        self.assertFalse(srv.connected)
+
+    def test_endless_noise_terminates(self):
+        srv = self.server(['garbage\n'] * 5000)
+        out = srv._stdio_call({"id": 1})
+        self.assertTrue(out.startswith("Error:"), out)
+
+
 if __name__ == "__main__":
     unittest.main()
