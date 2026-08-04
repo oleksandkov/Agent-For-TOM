@@ -1,5 +1,5 @@
 #!/usr/bin/env pwsh
-# TOMAS.ps1 — Launch the TOMAS agent CLI
+# TOMAS.ps1 -- Launch the TOMAS agent CLI
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 

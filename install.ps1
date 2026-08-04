@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    TOMAS Agent Installer вЂ” install from GitHub or local source.
+    TOMAS Agent Installer --- install from GitHub or local source.
 .DESCRIPTION
     Installs the TOMAS coding agent globally. Works both:
       - Locally:   powershell -ExecutionPolicy Bypass -File install.ps1
@@ -20,7 +20,7 @@ param(
     [switch]$NoPrompt
 )
 
-# в”Ђв”Ђ Config в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+# -- Config ------------------------------------------------------------------
 if (-not $InstallDir) {
     $InstallDir = Join-Path $HOME ".tomas"
 }
@@ -60,7 +60,7 @@ $script:PipExe    = Join-Path (Join-Path $VenvDir "Scripts") "pip.exe"
 $LauncherCmd = Join-Path $BinDir "TOMAS.cmd"
 $LauncherBat = Join-Path $BinDir "TOMAS.bat"
 
-# в”Ђв”Ђ Detect mode в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+# -- Detect mode -------------------------------------------------------------
 $isPiped = $MyInvocation.MyCommand.Name -eq "__remote_exec__" -or
            $MyInvocation.MyCommand.Path -eq "" -or
            [Console]::IsInputRedirected
@@ -71,7 +71,7 @@ Write-Host "       TOMAS Agent Installer v2.0" -ForegroundColor Cyan
 Write-Host "  ==========================================" -ForegroundColor Cyan
 Write-Host ""
 
-# в”Ђв”Ђ Prerequisites в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+# -- Prerequisites -----------------------------------------------------------
 $pythonPath = ""
 
 # Helper: test a Python executable and return its path if >= 3.10
@@ -85,7 +85,7 @@ function Test-PythonExe {
     return $null
 }
 
-# Strategy 1: Use the Python launcher (py) вЂ” always points to python.org Python on Windows
+# Strategy 1: Use the Python launcher (py) --- always points to python.org Python on Windows
 try {
     $pyExe = (Get-Command "py" -ErrorAction SilentlyContinue).Source
     if ($pyExe) {
@@ -175,7 +175,7 @@ if (-not $pythonPath) {
 $pyDisplayVer = & $pythonPath -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" 2>$null
 Write-Host "  [OK] Python $pyDisplayVer found at: $pythonPath" -ForegroundColor Green
 
-# в”Ђв”Ђ Create directory structure в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+# -- Create directory structure ---------------------------------------------
 Write-Host ""
 Write-Host "  [2/9] Setting up directories..." -ForegroundColor Cyan
 $null = New-Item -ItemType Directory -Path $BinDir -Force
@@ -188,7 +188,7 @@ $null = New-Item -ItemType Directory -Path (Join-Path $InstallDir "instructions"
 $null = New-Item -ItemType Directory -Path (Join-Path (Join-Path $InstallDir "instructions") "project") -Force
 Write-Host "  [OK] Install directory: $InstallDir" -ForegroundColor Green
 
-# в”Ђв”Ђ Get source code в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+# -- Get source code --------------------------------------------------------
 $localSource = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { $null }
 $hasLocalSource = $localSource -and (Test-Path (Join-Path $localSource "agent.py"))
 
@@ -196,7 +196,7 @@ if ($hasLocalSource) {
     Write-Host ""
     Write-Host "  [3/9] Copying local source..." -ForegroundColor Cyan
     # Copy project files AND package directories. This used to be -File only,
-    # which silently left out core/, adapters/ and learning/ — the install
+    # which silently left out core/, adapters/ and learning/ - the install
     # completed "successfully" and then died on first run with
     # ModuleNotFoundError: No module named 'learning'.
     $exclude = @('.venv', '__pycache__', '.git', '.agent', '.claude', '.kilo',
@@ -262,7 +262,7 @@ else {
     }
 }
 
-# в”Ђв”Ђ Create virtual environment в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+# -- Create virtual environment ---------------------------------------------
 Write-Host ""
 Write-Host "  [4/9] Creating virtual environment..." -ForegroundColor Cyan
 
@@ -304,7 +304,7 @@ if (-not $script:PipExe) {
     Write-Host "  [WARN] Could not detect pip.exe in venv" -ForegroundColor Yellow
 }
 
-# в”Ђв”Ђ Install dependencies в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+# -- Install dependencies ---------------------------------------------------
 Write-Host ""
 Write-Host "  [5/9] Installing Python dependencies..." -ForegroundColor Cyan
 
@@ -363,7 +363,7 @@ if (Test-Path $reqFile) {
     Write-Host "  [WARN] No requirements.txt found" -ForegroundColor Yellow
 }
 
-# в”Ђв”Ђ Verify the install can actually start в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+# -- Verify the install can actually start -----------------------------
 # An installer that reports success and then dies on first run with
 # ModuleNotFoundError has not installed anything. Import the entry point here,
 # where the failure can still be explained and acted on.
@@ -376,7 +376,7 @@ foreach ($pkg in $requiredPackages) {
 }
 if ($missingPackages.Count -gt 0) {
     Write-Host "  [FAIL] Missing package directories: $($missingPackages -join ', ')" -ForegroundColor Red
-    Write-Host "         The source copy is incomplete — TOMAS cannot start." -ForegroundColor Yellow
+    Write-Host "         The source copy is incomplete - TOMAS cannot start." -ForegroundColor Yellow
     Write-Host "         If you installed from GitHub, these directories may be" -ForegroundColor Yellow
     Write-Host "         missing from the repository (untracked). Commit them, or" -ForegroundColor Yellow
     Write-Host "         re-run this installer from a complete local checkout." -ForegroundColor Yellow
@@ -394,14 +394,14 @@ if ($LASTEXITCODE -ne 0 -or "$importCheck" -notmatch 'ok') {
 }
 Write-Host "  [OK] TOMAS imports cleanly ($($requiredPackages.Count) packages present)" -ForegroundColor Green
 
-# в”Ђв”Ђ Create launcher scripts в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+# -- Create launcher scripts ------------------------------------------------
 Write-Host ""
 Write-Host "  [6/9] Creating launcher scripts..." -ForegroundColor Cyan
 
-# TOMAS.ps1 вЂ” PowerShell launcher (used by the PATH entry)
+# TOMAS.ps1 --- PowerShell launcher (used by the PATH entry)
 $ps1Content = @'
 #!/usr/bin/env pwsh
-# TOMAS.ps1 вЂ” TOMAS Agent Launcher (installed)
+# TOMAS.ps1 --- TOMAS Agent Launcher (installed)
 $ErrorActionPreference = "Stop"
 $tomasDir = "{InstallDir}"
 $venvDir = Join-Path $tomasDir ".venv"
@@ -422,7 +422,7 @@ exit $LASTEXITCODE
 [System.IO.File]::WriteAllText($LauncherPs1, $ps1Content, [System.Text.Encoding]::UTF8)
 Write-Host "  [OK] $LauncherPs1" -ForegroundColor Green
 
-# TOMAS.cmd вЂ” CMD launcher (so `TOMAS` works from cmd.exe)
+# TOMAS.cmd --- CMD launcher (so `TOMAS` works from cmd.exe)
 # Detect Scripts vs bin directory (Windows vs MSYS2/MinGW venvs)
 $venvBin = "Scripts"; if (Test-Path (Join-Path $VenvDir "bin")) { $venvBin = "bin" }
 $cmdContent = @'
@@ -434,12 +434,12 @@ set "TOMAS_DIR={InstallDir}"
 [System.IO.File]::WriteAllText($LauncherCmd, $cmdContent, [System.Text.Encoding]::UTF8)
 Write-Host "  [OK] $LauncherCmd" -ForegroundColor Green
 
-# TOMAS.bat вЂ” also create in bin (some environments prefer .bat)
+# TOMAS.bat --- also create in bin (some environments prefer .bat)
 Copy-Item $LauncherCmd $LauncherBat -Force
 Write-Host "  [OK] $LauncherBat" -ForegroundColor Green
 
-# в”Ђв”Ђ Create upgrade & uninstall commands в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
-# TOMAS-upgrade.cmd вЂ” re-run remote install
+# -- Create upgrade & uninstall commands ----------------------------------
+# TOMAS-upgrade.cmd --- re-run remote install
 $upgradeBat = Join-Path $BinDir "TOMAS-upgrade.cmd"
 $upgradeContent = @'
 @echo off
@@ -456,7 +456,7 @@ if %ERRORLEVEL% neq 0 (
     exit /b %ERRORLEVEL%
 )
 
-rem в”Ђв”Ђ Refresh PATH so `tomas` works immediately in this session в”Ђв”Ђ
+rem -- Refresh PATH so `tomas` works immediately in this session --
 set "PATH=%USERPROFILE%\.tomas\bin;%PATH%"
 echo.
 echo   Upgrade complete! You can now run: TOMAS
@@ -464,7 +464,7 @@ echo   Upgrade complete! You can now run: TOMAS
 [System.IO.File]::WriteAllText($upgradeBat, $upgradeContent, [System.Text.Encoding]::UTF8)
 Write-Host "  [OK] $upgradeBat" -ForegroundColor Green
 
-# TOMAS-uninstall.cmd вЂ” call uninstall.ps1
+# TOMAS-uninstall.cmd --- call uninstall.ps1
 $uninstallBat = Join-Path $BinDir "TOMAS-uninstall.cmd"
 $uninstallContent = @'
 @echo off
@@ -483,7 +483,7 @@ if %ERRORLEVEL% neq 0 (
 [System.IO.File]::WriteAllText($uninstallBat, $uninstallContent, [System.Text.Encoding]::UTF8)
 Write-Host "  [OK] $uninstallBat" -ForegroundColor Green
 
-# в”Ђв”Ђ Create default instructions and sessions dir в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+# -- Create default instructions and sessions dir --------------------------
 Write-Host ""
 Write-Host "  [7/9] Setting up agent instructions..." -ForegroundColor Cyan
 
@@ -541,8 +541,8 @@ Project-level instructions are loaded on top of global instructions.
 
 ## Example files
 
-- `AGENT.md` вЂ” local agent identity (safe to edit or delete)
-- `project/` вЂ” per-project instruction files
+- `AGENT.md` --- local agent identity (safe to edit or delete)
+- `project/` --- per-project instruction files
 "@ | Out-File -FilePath $readmeFile -Encoding utf8
     Write-Host "  [OK] Created instructions README: $readmeFile" -ForegroundColor Green
 }
@@ -555,7 +555,7 @@ if (-not (Test-Path $gitkeep)) {
 
 Write-Host "  [OK] Sessions directory: $SessionsDir" -ForegroundColor Green
 
-# в”Ђв”Ђ Set up .env в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+# -- Set up .env -------------------------------------------------------------
 Write-Host ""
 Write-Host "  [8/9] Configuring environment..." -ForegroundColor Cyan
 
@@ -576,7 +576,7 @@ ANTHROPIC_API_KEY=
     Write-Host "  [OK] .env already exists (keeping existing)" -ForegroundColor Green
 }
 
-# ─── Configure API key (if running interactively) ─────────────────────────────
+# --- Configure API key (if running interactively) -----------------------------
 if (-not $NoPrompt -and $host.Name -ne 'Default Host' -and -not $isPiped) {
     $currentKey = (Select-String -Path $EnvFile -Pattern "^ANTHROPIC_API_KEY=(.*)$" | ForEach-Object { $_.Matches.Groups[1].Value }) -replace '"',''
     if (-not $currentKey) {
@@ -597,7 +597,7 @@ if (-not $NoPrompt -and $host.Name -ne 'Default Host' -and -not $isPiped) {
     }
 }
 
-# ─── Add to PATH ──────────────────────────────────────────────────────────────
+# --- Add to PATH --------------------------------------------------------------
 Write-Host ""
 Write-Host "  [9/9] Finalizing setup..." -ForegroundColor Cyan
 Write-Host "       Adding to system PATH..." -ForegroundColor DarkGray
@@ -617,7 +617,7 @@ if ($paths -notcontains $BinDir) {
 $cleanSessionPaths = $env:Path -split ';' | Where-Object { $_ -and $_ -ne $BinDir -and $_ -notlike "*Agent_for_TOM*" }
 $env:Path = "$BinDir;" + ($cleanSessionPaths -join ';')
 
-# ─── Create uninstaller ───────────────────────────────────────────────────────
+# --- Create uninstaller -------------------------------------------------------
 $uninstallScript = Join-Path $BinDir "uninstall.ps1"
 $uninstallContent = @'
 <#
@@ -658,7 +658,7 @@ Write-Host "  Close and reopen your terminal for PATH changes to take effect."
 [System.IO.File]::WriteAllText($uninstallScript, $uninstallContent, [System.Text.Encoding]::UTF8)
 Write-Host "  [OK] Created uninstaller: $uninstallScript" -ForegroundColor Green
 
-# в”Ђв”Ђ Run setup to install default MCPs в”Ђв”Ђ
+# -- Run setup to install default MCPs --
 Write-Host ""
 Write-Host "  [10/10] Running TOMAS setup (default MCPs)..." -ForegroundColor Cyan
 try {
@@ -669,7 +669,7 @@ try {
     Write-Host "         Run 'TOMAS setup' later to configure default MCPs." -ForegroundColor Yellow
 }
 
-# в”Ђв”Ђ Done в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+# -- Done --------------------------------------------------------------------
 Write-Host ""
 Write-Host "  ==========================================" -ForegroundColor Cyan
 Write-Host "         Installation Complete!" -ForegroundColor Cyan
