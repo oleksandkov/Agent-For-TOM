@@ -352,6 +352,25 @@ _PROBE_TIMEOUT = 8
 
 def _headers_for(provider: Provider) -> dict:
     headers = {"Content-Type": "application/json"}
+
+    # Zen sits behind Cloudflare, which rejects a bare Authorization header
+    # with 403 (error 1010) — it wants the opencode User-Agent and x-opencode-*
+    # set. Probing without them answered every feature question with "no", so a
+    # provider that streams, calls tools and takes a system prompt was recorded
+    # as capable of none of the three, and the agent silently degraded to the
+    # text tool protocol with the system prompt stuffed into a user message.
+    # `openai_adapter.build_from_active` already carries these on the runtime
+    # path; the probe has to agree with it or the two disagree about the same
+    # endpoint.
+    if provider.type == "zen":
+        try:
+            from zen_proxy import _oc_id, _zen_headers
+            headers.update(_zen_headers(_oc_id("ses"), _oc_id("req")))
+        except Exception:
+            pass
+        headers.update(provider.extra_headers or {})
+        return headers
+
     key = provider.api_key
     if not key:
         return headers
@@ -400,7 +419,7 @@ def _post_json(url: str, headers: dict, body: dict,
 
 def list_models(provider: Provider) -> list[str]:
     """Model ids the endpoint advertises. Empty list if it does not say."""
-    base = (provider.base_url or "").rstrip("/")
+    base = probe_base_url(provider)
     if not base:
         return []
     headers = _headers_for(provider)
@@ -428,7 +447,7 @@ def list_models(provider: Provider) -> list[str]:
 
 def _probe_context_window(provider: Provider) -> int:
     """Ask the endpoint for the model's real context window."""
-    base = (provider.base_url or "").rstrip("/")
+    base = probe_base_url(provider)
     if not base or not provider.model:
         return 0
     headers = _headers_for(provider)
@@ -508,8 +527,29 @@ def _tiny_request(provider: Provider, stream: bool = False,
     return body
 
 
-def _completions_url(provider: Provider) -> str:
+def probe_base_url(provider: Provider) -> str:
+    """Where a probe should actually go for this provider.
+
+    Only zen differs from `provider.base_url`, and it differs for a historical
+    reason: a zen provider is conventionally configured against the local proxy
+    port, which has only ever meant "reach Zen". `openai_adapter` resolves that
+    to the real host at runtime; the probe has to resolve it the same way or it
+    measures a port with nothing listening on it and reports the endpoint as
+    incapable of everything.
+    """
     base = (provider.base_url or "").rstrip("/")
+    if provider.type == "zen" and (not base or ":6446" in base):
+        try:
+            from zen_proxy import ZEN_API_HOST
+        except Exception:
+            ZEN_API_HOST = "opencode.ai"
+        return os.environ.get("ZEN_UPSTREAM_URL",
+                              f"https://{ZEN_API_HOST}/zen/v1").rstrip("/")
+    return base
+
+
+def _completions_url(provider: Provider) -> str:
+    base = probe_base_url(provider)
     if provider.speaks_openai_wire:
         return f"{base}/chat/completions" if base.endswith("/v1") else f"{base}/v1/chat/completions"
     return f"{base}/v1/messages"

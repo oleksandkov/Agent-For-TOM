@@ -298,7 +298,7 @@ def test_agent_loop():
     msgs = [{"role": "user", "content": "Reply with exactly: PONG"}]
     try:
         agent.COMBINED_TOOLS = agent.TOOLS  # built-ins only
-        agent.TOOL_TOKENS = sum(len(json.dumps(t)) for t in agent.TOOLS) // 6
+        agent.TOOL_TOKENS = agent.estimate_tool_tokens(agent.TOOLS)
         agent.mcp_manager = None
         agent.MCP_TOOL_NAME_MAP = {}
         result = agent.agent_loop("You are a test assistant. Reply briefly.", msgs)

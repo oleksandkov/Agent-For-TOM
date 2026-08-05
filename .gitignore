@@ -42,3 +42,7 @@ latest_ai_news_report.pdf
 # Personal Claude Code settings and scratch worktrees
 .claude/settings.local.json
 .claude/worktrees/
+
+# Throwaway helper scripts the agent writes to carry out a step (agent.SCRATCH_DIR).
+# Inside the project because that is the only writable root the sandbox allows.
+_scratch/

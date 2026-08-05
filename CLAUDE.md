@@ -25,6 +25,66 @@ TOMAS (Terminal Operated Modular Agent System) — a self-hosted AI coding agent
 - Keep code simple and readable; prefer functions over classes for small scripts
 - Always read a file before editing it
 - Prefer `edit_file` over `write_file` for existing files
+- **Turn behaviour must be changed on both model paths, or on neither.**
+  `core/loop.run_turn` calls the model streamed and non-streamed, and a change
+  made in one branch silently does nothing on the other — an output-limit retry
+  was added to the non-streamed branch, shipped, and had no effect at all for
+  streaming providers, which is most of them. Two rules keep them together:
+  `_stream_call` **reports** (it records `state.last_stop_reason`) and
+  `run_turn` **decides**; and anything a turn does regardless of path gets a
+  test in `tests/test_core_loop.py::PathParity`, which runs each assertion
+  against both and names the failing path. Tool handling is the deliberate
+  exception — a streamed call wanting tools falls through to the non-streamed
+  one, so permissions, loop detection and continuation live in a single place.
+- **Permission and continuation are two questions; a mode must answer both.**
+  `yolo` only ever answered "may this tool run?". The budget checkpoint asks a
+  second question — "may the turn keep going?" — which yolo left in place, so a
+  session that auto-approved all 56 of its tool calls still halted at 40 and
+  saved with `complete: false`. `bypass` mode sets `AgentState.auto_continue`
+  as well, and the core decides via `needs_continuation_approval()` rather than
+  a responder that always says yes: policy the core owns is testable without a
+  front end, and cannot be got wrong per-adapter. It is bounded by
+  `max_auto_continuations` (9 → 400 tool calls at the default budget) because
+  an unbounded "never stop" is a way to bill an unattended runaway, and loop
+  detection still applies. Add a mode by extending `MODE_CYCLE`/`ALL_MODES` and
+  `set_mode()` — the badge, status line, banner and help all derive from
+  `current_mode_name()`, so nothing else needs teaching.
+- **A truncated turn escalates once, and never returns less than it had.**
+  `_can_escalate` fires for a *partial* reply as well as an empty one — the
+  retry runs with 4x the budget, so it does not reproduce the cut-off. Two
+  invariants come with it: the discarded text is announced via
+  `TruncatedOutputDiscarded` (on the streamed path it is already on screen, so
+  silence reads as the agent repeating itself), and it is stashed so a retry
+  that then fails outright hands it back rather than losing it — escalation
+  must never leave the user worse off than not escalating. Note also that
+  `Capabilities.max_output_tokens` is **never probed**: `effective_max_tokens`
+  therefore lets an explicit `AGENT_MAX_TOKENS` win over it, because the old
+  `min(...)` silently clamped every provider to 8192 while the truncation
+  message advised raising that very variable.
+- **Nothing that varies with the message may be emitted before something that
+  does not.** `build_system_prompt` is built in two halves: a `stable` half
+  (BASE_PROMPT, environment, instructions, skills catalogue) and a volatile
+  `tail` (standing rules, retrieved facts, triggered skill body). Prefix caching
+  matches on an exact byte prefix and the system prompt is serialised *before*
+  the messages, so the first byte that differs from last turn ends the cache hit
+  for the prompt **and the whole conversation behind it**. The skills catalogue
+  used to sit last: measured on Zen/DeepSeek over five turns, 52% of prompt
+  tokens came from cache; with the halves ordered, a settled cache serves 99.8%
+  and bills 73 tokens instead of 14,864. The stable half is memoised on a
+  `(path, mtime, size)` fingerprint — call `invalidate_prompt_cache()` if you
+  change instructions in-process. Tests live in
+  `tests/test_context_economy.py::StablePrefix`.
+- **Count JSON as JSON and prose as prose.** `CHARS_PER_TOKEN_JSON` (3.5) for
+  tool schemas, `CHARS_PER_TOKEN_PROSE` (4) for messages and the system prompt.
+  These decide when compaction fires. Tool schemas were counted at `// 6` and
+  messages at `// 3`, so the two errors pulled in opposite directions and the
+  total looked plausible while neither half was.
+- **The tool block is the largest single line item in a turn, not the prompt.**
+  Measured across 64 real MCP tools: 503 chars (~125 tokens) each, so a 128-tool
+  ceiling costs ~16,100 tokens *per turn* — four times the whole system prompt.
+  `compact_tool_schemas` clips prose and drops documentation-only keys on the
+  way out of `build_state`; it is pure, and must stay pure, because `ALL_TOOLS`
+  is re-selected every turn and clipping in place would compound.
 
 ## Architecture essentials
 

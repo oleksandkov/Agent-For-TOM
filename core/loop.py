@@ -29,6 +29,7 @@ from .events import (
     ToolFinished,
     ToolResultTruncated,
     ToolStarted,
+    TruncatedOutputDiscarded,
     TurnFinished,
     TurnStarted,
 )
@@ -300,8 +301,13 @@ def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
                 usage_info = getattr(final_msg, "usage", None)
 
     wants_tools = has_tool_use or stop_reason == "tool_use"
-    if stop_reason == "max_tokens" and not wants_tools:
-        yield from _report_truncation(state, "".join(text_parts))
+    # Recorded rather than reported here: truncation is handled identically for
+    # the streamed and non-streamed paths, and `run_turn` owns that decision.
+    # Reporting it inside this function meant the streaming path announced the
+    # failure and returned, so the escalation retry — which lived only in the
+    # non-streamed branch — never ran for any provider that streams. Which is
+    # most of them.
+    state.last_stop_reason = stop_reason
     # When tools were requested the caller immediately re-issues the request
     # non-streamed to get complete tool_use blocks. Counting the streamed call
     # too would bill the same turn twice.
@@ -439,6 +445,54 @@ def _report_truncation(state: AgentState, text: str) -> Iterator[AgentEvent]:
     yield ErrorOccurred(message, detail=state.last_error, recoverable=True)
 
 
+def _can_escalate(state: AgentState, text: str, escalated: bool) -> bool:
+    """Is this a truncation worth one more attempt with a bigger budget?
+
+    Both an empty reply and a partial one qualify. This used to require the
+    reply to be empty, reasoning that "a partial answer means it was writing,
+    and re-running would re-bill the same work to get the same cut-off" — but
+    the retry runs with *four times* the budget, so it does not get the same
+    cut-off, which is the whole point. What that rule actually did was leave
+    the one case users hit most with no recovery at all: a long document cut
+    off mid-sentence is not a partial success, it is an unusable artifact, and
+    the turn ended by advising an env var that was itself clamped and inert.
+
+    The re-billing concern is real but bounded: `escalated` allows this once
+    per turn, and MAX_OUTPUT_CEILING bounds where it can go.
+    """
+    return not escalated and state.max_tokens < MAX_OUTPUT_CEILING
+
+
+def _escalate(state: AgentState, discarded: str = "") -> Iterator[AgentEvent]:
+    """Quadruple the output budget for one retry, and say so.
+
+    When a partial reply is being thrown away, that is announced separately
+    and first: on the streamed path those characters have already been printed,
+    and restarting the answer without a word looks like the agent repeating
+    itself.
+    """
+    previous = state.max_tokens
+    state.max_tokens = min(state.max_tokens * 4, MAX_OUTPUT_CEILING)
+    if discarded.strip():
+        yield TruncatedOutputDiscarded(len(discarded), previous, state.max_tokens)
+        # "Retrying once with N" is the canonical phrase for an escalation and
+        # is asserted on by both paths' tests — keep it identical in both
+        # branches, or a message change silently stops meaning "we escalated".
+        yield ErrorOccurred(
+            f"The reply was cut off at the {previous}-token output limit after "
+            f"{len(discarded)} characters, and that partial answer is being "
+            f"discarded. Retrying once with {state.max_tokens}.",
+            detail=f"escalating max_tokens {previous} -> {state.max_tokens} "
+                   f"(discarded {len(discarded)} chars)",
+            recoverable=True)
+        return
+    yield ErrorOccurred(
+        f"No reply within {previous} output tokens — the model spent them "
+        f"reasoning. Retrying once with {state.max_tokens}.",
+        detail=f"escalating max_tokens {previous} -> {state.max_tokens}",
+        recoverable=True)
+
+
 def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[AgentEvent]:
     """Drive one user turn to completion, yielding events as it goes."""
     started = time.perf_counter()
@@ -448,9 +502,14 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
 
     calls_used = 0
     denials = 0          # per-turn, so the message can escalate
+    extensions = 0       # budget extensions granted, asked-for or automatic
     budget = state.tool_budget
     signatures: list[str] = []
     escalated = False    # max_tokens has been raised once for this turn
+    # A partial reply thrown away to retry with more room. Kept so that a
+    # retry which then fails outright (quota, 5xx) does not leave the user with
+    # less than they had before it — half a document beats nothing.
+    discarded = ""
 
     while True:
         yield ThinkingStarted(state.get_model())
@@ -460,6 +519,14 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
             try:
                 text, wants_tools = yield from _stream_call(state)
                 if not wants_tools:
+                    if state.last_stop_reason == "max_tokens":
+                        if _can_escalate(state, text, escalated):
+                            escalated = True
+                            discarded = text
+                            yield from _escalate(state, text)
+                            continue
+                        text = text or discarded
+                        yield from _report_truncation(state, text)
                     # Record the reply — without this the streaming path
                     # silently reintroduces the no-memory bug.
                     if text:
@@ -477,7 +544,14 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                     event = _quota_error(e)
                     state.last_error = event.detail or event.message
                     yield event
-                    yield TurnFinished(reply="", usage=dict(state.usage),
+                    # Same rule as the failed-retry path below: a discarded
+                    # partial answer is returned rather than lost when the
+                    # attempt that was to supersede it cannot run.
+                    if discarded:
+                        state.messages.append(
+                            {"role": "assistant", "content": discarded})
+                        yield AssistantMessage(discarded)
+                    yield TurnFinished(reply=discarded, usage=dict(state.usage),
                                        seconds=time.perf_counter() - started)
                     return
                 # Any other streaming failure is recoverable the same way: a
@@ -492,30 +566,26 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
 
         response = yield from _model_call(state)
         if response is None:
-            yield TurnFinished(reply="", usage=dict(state.usage),
+            # The retry that was meant to replace a discarded partial answer
+            # never landed. Hand back what was thrown away rather than nothing:
+            # escalation must not be able to leave the user worse off than not
+            # escalating would have.
+            if discarded:
+                state.messages.append({"role": "assistant", "content": discarded})
+                yield AssistantMessage(discarded)
+            yield TurnFinished(reply=discarded, usage=dict(state.usage),
                                seconds=time.perf_counter() - started)
             return
 
         if response.stop_reason != "tool_use":
             text = "".join(b.text for b in response.content if hasattr(b, "text"))
-            # A reasoning model that produced *nothing* spent the entire budget
-            # thinking. That is recoverable exactly once, by giving it more
-            # room — reporting the failure and stopping leaves the user to
-            # discover an env var. Only when the reply is empty: a partial
-            # answer means the model was writing, and re-running would just
-            # re-bill the same work.
-            if (response.stop_reason == "max_tokens" and not text.strip()
-                    and not escalated and state.max_tokens < MAX_OUTPUT_CEILING):
-                escalated = True
-                previous = state.max_tokens
-                state.max_tokens = min(state.max_tokens * 4, MAX_OUTPUT_CEILING)
-                yield ErrorOccurred(
-                    f"No reply within {previous} output tokens — the model spent "
-                    f"them reasoning. Retrying once with {state.max_tokens}.",
-                    detail=f"escalating max_tokens {previous} -> {state.max_tokens}",
-                    recoverable=True)
-                continue
             if response.stop_reason == "max_tokens":
+                if _can_escalate(state, text, escalated):
+                    escalated = True
+                    discarded = text
+                    yield from _escalate(state, text)
+                    continue
+                text = text or discarded
                 yield from _report_truncation(state, text)
             if text:
                 state.messages.append({"role": "assistant", "content": text})
@@ -539,7 +609,16 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
         # ── The budget is a checkpoint, not a ceiling ──
         if calls_used > budget:
             yield ContinuationNeeded(calls_used, budget)
-            if state.responder.ask_continue(ContinuationNeeded(calls_used, budget)):
+            if state.needs_continuation_approval(extensions):
+                granted = state.responder.ask_continue(
+                    ContinuationNeeded(calls_used, budget))
+            else:
+                # Bypass mode: extend without asking, but still announce it —
+                # a turn quietly running to 400 tool calls with no trace of why
+                # is indistinguishable from a runaway.
+                granted = True
+            if granted:
+                extensions += 1
                 budget += state.tool_budget
                 yield ContinuationGranted(calls_used, budget)
             else:

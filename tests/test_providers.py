@@ -585,14 +585,87 @@ class TestToolSelection(unittest.TestCase):
             self.pool, "run a sql query against the postgres database", self.budget)
         self.assertIn("sql_query", self.names(selected))
 
-    def test_selection_changes_between_turns(self):
+    def test_selection_follows_the_user_across_a_pivot(self):
         """A user who moves from file edits to browser automation should get
         browser tools when they ask for them."""
+        agent.reset_session_state()
         first, _ = agent.select_tools(self.pool, "commit this to git", self.budget)
         second, _ = agent.select_tools(self.pool, "screenshot the browser", self.budget)
         self.assertIn("git_commit", self.names(first))
         self.assertIn("take_screenshot", self.names(second))
-        self.assertNotEqual(self.names(first), self.names(second))
+
+    def test_a_real_pivot_reselects(self):
+        # One MCP slot, so the set cannot cover both capabilities at once and
+        # the pivot has to actually displace something.
+        agent.reset_session_state()
+        budget = len(agent.TOOLS) + 1
+        first, _ = agent.select_tools(self.pool, "commit this to git", budget)
+        second, _ = agent.select_tools(self.pool, "screenshot the browser", budget)
+        self.assertEqual(self.names(first), ["git_commit"])
+        self.assertEqual(self.names(second), ["take_screenshot"])
+
+    def test_the_set_is_held_byte_stable_while_it_still_covers_the_turn(self):
+        """Prefix caching is binary: one changed byte in the tool block and the
+        system prompt, the tools and the whole conversation are re-processed.
+        Selecting purely by score swapped 38 of 64 slots between consecutive
+        turns, so nothing was ever cached."""
+        agent.reset_session_state()
+        first, _ = agent.select_tools(self.pool, "screenshot the browser", self.budget)
+        # A follow-up needing nothing new must produce the identical payload.
+        second, _ = agent.select_tools(self.pool, "now screenshot it again", self.budget)
+        self.assertEqual(json.dumps(first), json.dumps(second))
+
+    def test_a_selected_set_is_serialised_in_a_stable_order(self):
+        # Ordering the chosen tools by score meant an unchanged set still
+        # produced different bytes each turn, missing the cache for nothing.
+        # (When everything fits there is no selection, and the caller's pool
+        # order is already stable, so only the constrained path sorts.)
+        agent.reset_session_state()
+        selected, _ = agent.select_tools(
+            self.pool, "screenshot the browser page", len(agent.TOOLS) + 3)
+        names = self.names(selected)
+        self.assertEqual(names, sorted(names))
+        self.assertLess(len(names), len(self.extra), "budget must actually bind")
+
+    def test_cache_control_marks_the_prefix_when_supported(self):
+        # ~6,300 identical tokens ship every turn (system prompt + tools). One
+        # breakpoint at the end of the system block covers both, because the
+        # cache hierarchy is tools -> system -> messages.
+        caps = pm.Capabilities(
+            prompt_caching=True, system_prompt=True, tool_use=True)
+        real = agent._active_capabilities
+        agent._active_capabilities = lambda: caps
+        try:
+            state = agent.build_state("SYSTEM", [{"role": "user", "content": "hi"}],
+                                      _Responder())
+        finally:
+            agent._active_capabilities = real
+        self.assertIsInstance(state.system_prompt, list)
+        self.assertEqual(state.system_prompt[0]["cache_control"]["type"], "ephemeral")
+        self.assertIn("SYSTEM", state.system_prompt[0]["text"])
+
+    def test_no_cache_control_on_openai_wire(self):
+        # Those providers cache server-side and have no cache_control field.
+        caps = pm.Capabilities(
+            prompt_caching=False, system_prompt=True, tool_use=True)
+        real = agent._active_capabilities
+        agent._active_capabilities = lambda: caps
+        try:
+            state = agent.build_state("SYSTEM", [{"role": "user", "content": "hi"}],
+                                      _Responder())
+        finally:
+            agent._active_capabilities = real
+        self.assertIsInstance(state.system_prompt, str)
+
+    def test_a_block_system_prompt_flattens_for_the_openai_wire(self):
+        # Defensive: if one ever reaches that path it must not leak the field.
+        from zen_proxy import anthropic_to_openai
+        body = anthropic_to_openai({
+            "system": [{"type": "text", "text": "SYS",
+                        "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(body["messages"][0], {"role": "system", "content": "SYS"})
+        self.assertNotIn("cache_control", json.dumps(body))
 
     def test_withheld_tools_are_reported(self):
         selected, withheld = agent.select_tools(self.pool, "screenshot", self.budget)

@@ -71,16 +71,26 @@ def get_global_instructions() -> str:
 #  Project-level instructions
 # ═══════════════════════════════════════════════════════════════════════
 
+#: Project instruction files, in priority order. Every one that exists is
+#: loaded — they are not alternatives.
+#:
+#: CLAUDE.md is on this list because both CLAUDE.md and AGENTS.md documented it
+#: as injected into every system prompt, and it never was: this function
+#: returned on the first match, AGENTS.md always matched first, and 7,199 bytes
+#: of project conventions reached the model in no session ever. Conventions
+#: written for the agent that the agent cannot read are worse than none —
+#: they read as followed.
+PROJECT_INSTRUCTION_FILES = ("AGENTS.md", "agent.md", "CLAUDE.md")
+
+
 def get_project_instructions(project_dir: Path | None = None) -> str:
     """Load project-level instructions from the project directory.
 
-    Checks, in order of priority (first match wins):
-    1. <project_dir>/AGENTS.md
-    2. <project_dir>/agent.md
-    3. ~/.tomas/instructions/project/AGENTS.md
-       (if a matching file for the project exists there)
+    Loads every file in `PROJECT_INSTRUCTION_FILES` that exists, in order,
+    plus `~/.tomas/instructions/project/<project_name>.md`. Each is labelled
+    with its source so the model can tell which document a rule came from.
 
-    Returns the content string, or empty string if nothing found.
+    Returns the merged content, or empty string if nothing was found.
     """
     if project_dir is None:
         try:
@@ -89,30 +99,34 @@ def get_project_instructions(project_dir: Path | None = None) -> str:
         except (ImportError, Exception):
             project_dir = Path.cwd()
 
-    candidates = [
-        project_dir / "AGENTS.md",
-        project_dir / "agent.md",
-    ]
-
+    candidates = [project_dir / name for name in PROJECT_INSTRUCTION_FILES]
     # Also check ~/.tomas/instructions/project/<project_name>.md
-    project_name = project_dir.name
-    per_project_file = PROJECT_INSTRUCTIONS_DIR / f"{project_name}.md"
-    candidates.append(per_project_file)
+    candidates.append(PROJECT_INSTRUCTIONS_DIR / f"{project_dir.name}.md")
 
+    seen: set[str] = set()
+    parts: list[str] = []
     for path in candidates:
-        if path.exists() and path.is_file():
-            try:
-                content = path.read_text(encoding="utf-8")
-                if content.strip():
-                    return (
-                        f"# Project Instructions ({path.name})\n\n"
-                        f"Source: {path}\n\n"
-                        f"{content.strip()}\n"
-                    )
-            except OSError:
-                continue
+        try:
+            resolved = str(path.resolve()).lower()
+        except OSError:
+            resolved = str(path).lower()
+        # A case-insensitive filesystem makes AGENTS.md and agents.md the same
+        # file; loading it twice would double its weight in the prompt.
+        if resolved in seen or not (path.exists() and path.is_file()):
+            continue
+        seen.add(resolved)
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if content.strip():
+            parts.append(
+                f"# Project Instructions ({path.name})\n\n"
+                f"Source: {path}\n\n"
+                f"{content.strip()}\n"
+            )
 
-    return ""
+    return "\n\n---\n\n".join(parts)
 
 
 # ═══════════════════════════════════════════════════════════════════════

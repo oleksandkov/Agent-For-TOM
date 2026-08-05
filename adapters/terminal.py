@@ -36,6 +36,7 @@ from core.events import (
     ToolFinished,
     ToolResultTruncated,
     ToolStarted,
+    TruncatedOutputDiscarded,
     TurnFinished,
 )
 from core.permissions import Decision
@@ -257,6 +258,18 @@ class TerminalAdapter:
         elif isinstance(event, StreamingDisabled):
             print(f'\n  {YELLOW}⚠{RESET} {DIM}streaming unavailable on this provider '
                   f'— continuing without it{RESET}')
+
+        elif isinstance(event, TruncatedOutputDiscarded):
+            # The discarded text is already on screen when streaming, so the
+            # rule is drawn under it: everything above is superseded, and the
+            # answer is about to start again rather than continue.
+            self._end_stream_line()
+            print(f'\n  {YELLOW}⚠{RESET}  {BOLD}The answer above was cut off at '
+                  f'{event.previous_limit} output tokens and is being '
+                  f'discarded.{RESET}')
+            print(f'     {DIM}Retrying from the start with {event.new_limit} '
+                  f'tokens — ignore the {event.discarded_chars} characters '
+                  f'above.{RESET}')
 
         elif isinstance(event, ErrorOccurred):
             self._end_stream_line()

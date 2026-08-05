@@ -28,7 +28,10 @@ CYCLE_WINDOW = 6
 class AgentState:
     """A single turn's execution context."""
 
-    system_prompt: str
+    # Either plain text, or Anthropic content blocks when the host marks the
+    # prefix with cache_control. The core passes it straight through to the
+    # client and never inspects it, so both forms are equally fine here.
+    system_prompt: "str | list"
     messages: list
 
     # Model access — callables so the caller can re-resolve per call
@@ -59,15 +62,38 @@ class AgentState:
     auto_approve_low: bool = True
     yolo: bool = False
 
+    # Continuation policy. `yolo` answers "may this tool run?"; this answers
+    # "may the turn keep going?" — a separate question the budget checkpoint
+    # asks, and one yolo never silenced. A 56-tool-call session on
+    # deepseek-v4-flash-free stopped at the 40-call checkpoint and was saved
+    # with complete=False, because approving every tool does nothing about
+    # being asked whether to carry on.
+    auto_continue: bool = False
+    # How many times the budget may be extended without asking. Unbounded
+    # "never stop" is not a mode, it is a way to bill an unattended runaway:
+    # the same session spent 3.3M input tokens in two turns. At the default
+    # tool_budget of 40 this still allows 400 tool calls in one turn, which is
+    # past what any real task needs, and the loop detector remains in force.
+    max_auto_continuations: int = 9
+
     # Budgets and limits
     tool_budget: int = DEFAULT_TOOL_BUDGET
-    max_result_chars: int = 100_000
+    # One tool result's share of the window. At the old 100,000 a single
+    # `run_command` or MCP call could add ~25,000 tokens to the transcript —
+    # and unlike a long reply it stays there, re-sent on every later turn until
+    # compaction. `read_file` already caps itself near 20,000 chars with a
+    # resumable footer; this is the backstop for everything that does not.
+    max_result_chars: int = 30_000
     streaming_enabled: bool = True
     # Why streaming was turned off, when it was. A transient failure (429,
     # 5xx, timeout) is not evidence that the provider cannot stream, so the
     # host must be able to tell the two apart before persisting anything.
     streaming_error: Optional[str] = None
     streaming_error_retryable: bool = False
+    # Why the last model call ended ("end_turn", "tool_use", "max_tokens").
+    # Set by the streaming path so the caller can treat truncation the same
+    # way it does on the non-streamed one.
+    last_stop_reason: Optional[str] = None
     # What ended the turn, when something did. Without this a turn that died
     # on a 429 was saved as "empty_reply" with no reason attached, which is
     # exactly the unreadable record P6-11 exists to prevent.
@@ -93,3 +119,16 @@ class AgentState:
         if self.risk_of(name, args) == "low" and self.auto_approve_low:
             return False
         return True
+
+    def needs_continuation_approval(self, extensions_used: int) -> bool:
+        """True if the user must be asked before the turn keeps going.
+
+        Kept here rather than in the responder for the same reason
+        `needs_permission` is: it is policy, and policy the core owns can be
+        tested without a front end. A responder that silently always said yes
+        would make every adapter — including DenyAll — a place where this
+        decision could be got wrong.
+        """
+        if not self.auto_continue:
+            return True
+        return extensions_used >= self.max_auto_continuations

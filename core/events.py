@@ -120,6 +120,20 @@ class StreamingDisabled(AgentEvent):
 
 
 @dataclass
+class TruncatedOutputDiscarded(AgentEvent):
+    """A partial reply is being thrown away and re-requested with more room.
+
+    Adapters MUST render this. On the streamed path the discarded text has
+    already gone to the screen token by token, so without a notice the user
+    watches the answer restart and sees the first half of a document twice
+    with no explanation of which copy to trust.
+    """
+    discarded_chars: int
+    previous_limit: int
+    new_limit: int
+
+
+@dataclass
 class ContextCompacted(AgentEvent):
     before_tokens: int
     after_tokens: int

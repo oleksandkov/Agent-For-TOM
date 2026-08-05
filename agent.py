@@ -96,6 +96,7 @@ from session_manager import (
 )
 
 # Instructions management
+import instructions_manager
 from instructions_manager import (
     build_instructions_section, get_global_instructions,
 )
@@ -117,6 +118,14 @@ from adapters.terminal import TerminalAdapter
 MODEL = os.environ.get("AGENT_MODEL")
 PROJECT_DIR = Path(os.environ.get("AGENT_PROJECT_DIR", os.getcwd())).resolve()
 MEMORY_DIR = Path.home() / ".tomas" / "memory"
+
+# Where throwaway helper scripts belong. The sandbox allows writes only under
+# PROJECT_DIR, so "put it in a temp directory outside the project" — which
+# BASE_PROMPT used to say — asked for something that could not work: the model
+# tried ~/.tomas/tmp, was refused, tried %TEMP%, was refused again, and only
+# then wrote into the repo root it was being told to keep clean. One named
+# location inside the sandbox resolves the contradiction.
+SCRATCH_DIR = PROJECT_DIR / "_scratch"
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
     """An int from the environment, ignoring anything unusable."""
     try:
@@ -132,8 +141,28 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
 # nothing. Raise it when a long document or a reasoning model gets cut off.
 MAX_TOKENS = _env_int("AGENT_MAX_TOKENS", 8192, minimum=256)
 COMPACTION_THRESHOLD = 0.75  # compact when total budget (msg_tok + TOOL_TOKENS + MAX_TOKENS) exceeds this fraction of CONTEXT_WINDOW
+# Absolute ceiling, whatever the window. Past roughly this much conversation the
+# cost of re-reading it every turn outweighs what the extra history is worth,
+# and the model has usually stopped referring to the early part anyway.
+COMPACTION_CEILING = _env_int("AGENT_COMPACT_AT", 120_000, minimum=8_000)
 DEFAULT_CONTEXT_WINDOW = 200_000  # fallback if API doesn't report context window (standard Claude tier)
 CONTEXT_WINDOW = DEFAULT_CONTEXT_WINDOW  # will be updated dynamically at startup
+
+# ── Characters per token, by what is being counted ──
+# These decide when compaction fires, so being wrong in either direction costs
+# something real: too low and a long session overflows the window before the
+# summariser runs, too high and it compacts history that still fitted.
+#
+# Prose runs about 4 chars/token. JSON runs far denser — punctuation, quotes
+# and short keys all tokenise separately — measured at ~3.5 across the 64 tools
+# of three real MCP servers (32,226 chars, ~9,200 tokens).
+#
+# Both were wrong before: messages used //3 (over-counting prose by ~30%) while
+# tool schemas used //6 (under-counting JSON by ~40%, or ~5,400 tokens at a
+# 128-tool ceiling). The two errors pulled in opposite directions, so the total
+# looked plausible while neither half was.
+CHARS_PER_TOKEN_PROSE = 4
+CHARS_PER_TOKEN_JSON = 3.5
 
 # Known model context windows (fallback when API is not reachable)
 MODEL_CONTEXT_MAP: dict[str, int] = {
@@ -165,6 +194,73 @@ MODEL_CONTEXT_MAP: dict[str, int] = {
 _current_context_window: int = DEFAULT_CONTEXT_WINDOW
 AUTO_APPROVE_LOW = os.environ.get("AGENT_AUTO_APPROVE", "1") == "1"
 YOLO_MODE = False  # when True, all tools are auto-approved without any prompt
+# Bypass mode: yolo, plus the turn is never stopped to ask whether to keep
+# going. The two are separate questions and yolo only ever answered the first.
+# Observed: a session that approved every tool still halted at the 40-call
+# checkpoint and was saved incomplete, mid-task, after 56 calls. Bounded by
+# AgentState.max_auto_continuations so "do not ask me" cannot become "bill me
+# without limit".
+BYPASS_MODE = False
+
+#: Mode order used by Tab cycling and by every place that names the modes.
+#: One list, so a new mode cannot be added to the switcher and forgotten in the
+#: badge, the status line and the help.
+MODE_CYCLE = ("auto", "default", "yolo", "bypass")
+ALL_MODES = ("auto", "default", "strict", "yolo", "bypass")
+
+
+def current_mode_name() -> str:
+    """The single answer to "what mode am I in?".
+
+    Derived from the flags rather than stored beside them: several call sites
+    used to recompute this inline, so a new mode has to be taught to each of
+    them or the banner and the status line start disagreeing.
+    """
+    if BYPASS_MODE:
+        return "bypass"
+    if YOLO_MODE:
+        return "yolo"
+    return "auto" if AUTO_APPROVE_LOW else "default"
+
+
+def mode_color(mode: Optional[str] = None) -> str:
+    """The colour a mode is always shown in. Red means "nothing will stop"."""
+    mode = mode or current_mode_name()
+    if mode in ("yolo", "bypass"):
+        return RED
+    if mode == "auto":
+        return GREEN
+    return YELLOW
+
+
+#: One line naming every key that switches modes, so the four places that
+#: print it cannot drift apart when a mode is added.
+MODE_KEYS_HINT = ("F5 auto · F6 default · F7 strict · F8 yolo · F9 bypass "
+                  "· Tab cycles")
+
+
+def set_mode(name: str) -> None:
+    """Apply a mode by name. The one place the flags are written together."""
+    global AUTO_APPROVE_LOW, YOLO_MODE, BYPASS_MODE
+    YOLO_MODE = False
+    BYPASS_MODE = False
+    if name == "auto":
+        AUTO_APPROVE_LOW = True
+    elif name == "default":
+        AUTO_APPROVE_LOW = False
+    elif name == "strict":
+        AUTO_APPROVE_LOW = False
+        APPROVALS.clear()
+        for key in list(RISK_LEVELS.keys()):
+            if key not in BUILTIN_TOOL_NAMES:
+                RISK_LEVELS[key] = "high"
+    elif name == "yolo":
+        AUTO_APPROVE_LOW = True
+        YOLO_MODE = True
+    elif name == "bypass":
+        AUTO_APPROVE_LOW = True
+        YOLO_MODE = True
+        BYPASS_MODE = True
 
 # ── Session token tracking ──
 # Per-session, not per-process. These used to accumulate for the life of the
@@ -192,6 +288,7 @@ def reset_session_state() -> None:
     _turn_timings.clear()
     _tool_log.clear()
     _failed_turns.clear()
+    _LAST_TOOL_SELECTION.clear()   # a new session starts with no sticky set
     _session_started_at = time.time()
 
 
@@ -448,6 +545,16 @@ SERVER_CORE_QUOTA = 8
 CORE_NAME_SIMPLICITY = 0.5
 
 
+# The MCP tools sent last turn. Used only as a tie-breaker, so it can never
+# override relevance — see `rank` inside select_tools.
+_LAST_TOOL_SELECTION: set[str] = set()
+
+
+def _remember_tool_selection(names) -> None:
+    _LAST_TOOL_SELECTION.clear()
+    _LAST_TOOL_SELECTION.update(names)
+
+
 def select_tools(all_tools: list[dict], context: str, budget: int,
                  server_of: Optional[Callable[[str], Optional[str]]] = None,
                  ) -> tuple[list[dict], list[dict]]:
@@ -493,6 +600,27 @@ def select_tools(all_tools: list[dict], context: str, budget: int,
     scores = [tool_relevance(t, query_keywords) for t in mcp]
     servers = [resolve(t.get("name", "")) for t in mcp]
 
+    # Reuse last turn's set verbatim when it still covers this turn.
+    #
+    # Prefix caching is binary: one changed byte anywhere in the tool block and
+    # the whole cached prefix is gone, so a set that is *mostly* stable is
+    # worth almost nothing. Holding it byte-identical is what turns the system
+    # prompt, the tools and the entire history into a cache hit.
+    #
+    # "Still covers this turn" means the single most relevant tool for the
+    # message is already loaded. If the user pivots to a capability that is not
+    # in hand, that tool outranks everything present and the set is re-picked —
+    # which is the case adaptivity actually exists for.
+    if _LAST_TOOL_SELECTION and any(s > 0 for s in scores):
+        best = max(range(len(mcp)), key=lambda i: (scores[i], -i))
+        if mcp[best].get("name", "") in _LAST_TOOL_SELECTION:
+            held = [t for t in mcp if t.get("name", "") in _LAST_TOOL_SELECTION]
+            if len(held) == min(remaining, len(_LAST_TOOL_SELECTION)):
+                kept = sorted(held, key=lambda t: t.get("name", ""))
+                names = {t.get("name", "") for t in kept}
+                return (builtins + kept,
+                        [t for t in mcp if t.get("name", "") not in names])
+
     # Rank servers by summed relevance, not by their single best tool: one
     # incidental keyword hit should not outrank a server the whole request is
     # about. `memory` matched "create" twice; `word-docs` matched across
@@ -502,10 +630,27 @@ def select_tools(all_tools: list[dict], context: str, budget: int,
         if srv is not None:
             server_totals[srv] = server_totals.get(srv, 0.0) + score
 
-    # Sort key shared by both phases: score, then plainest name, then the
-    # original order so ties never depend on dict iteration.
+    # Sort key shared by both phases: score, then whether the tool was already
+    # loaded last turn, then plainest name, then the original order so ties
+    # never depend on dict iteration.
+    #
+    # The stickiness term is what makes this affordable to send. Tools are
+    # serialised *before* the messages, and every provider that caches a prompt
+    # — DeepSeek's automatic caching, Anthropic's cache_control, OpenAI's
+    # prefix cache — matches on an exact byte prefix. Selecting purely by score
+    # swapped 38 of 64 tool slots between consecutive turns, so the cached
+    # prefix was invalidated at the first block and the system prompt, the
+    # tools and the whole conversation were re-processed every single message.
+    #
+    # It is only a tie-breaker, so relevance is unaffected: a tool the turn
+    # actually scores still beats a stale one. What it stabilises is the long
+    # tail of zero-scoring filler, which is where all the churn was.
+    sticky = _LAST_TOOL_SELECTION
+
     def rank(i: int) -> tuple:
-        return (-scores[i], -tool_simplicity(mcp[i].get("name", "")), i)
+        name = mcp[i].get("name", "")
+        return (-scores[i], 0 if name in sticky else 1,
+                -tool_simplicity(name), i)
 
     taken: set[int] = set()
     primary = max(server_totals, key=lambda s: (server_totals[s], s), default=None)
@@ -523,8 +668,13 @@ def select_tools(all_tools: list[dict], context: str, budget: int,
             break
         taken.add(i)
 
-    chosen = [mcp[i] for i in sorted(taken, key=rank)]
+    # Serialise by name, not by score. Selection is already decided by this
+    # point and the model does not care about the order — but the byte stream
+    # does: an unchanged set ordered by a score that shifts every turn produces
+    # different bytes each time, and misses the prefix cache for no reason.
+    chosen = sorted((mcp[i] for i in taken), key=lambda t: t.get("name", ""))
     withheld = [mcp[i] for i in sorted(set(range(len(mcp))) - taken, key=rank)]
+    _remember_tool_selection(t.get("name", "") for t in chosen)
     return builtins + chosen, withheld
 
 
@@ -547,6 +697,113 @@ def withheld_tools_notice(withheld: list[dict]) -> str:
     return (f"\n\n{len(withheld)} additional tool(s){where} are connected but not "
             f"loaded for this turn. If you need one, say which capability you "
             f"need and the user can re-ask; do not assume it is unavailable.")
+
+
+# How much of a tool's prose survives into the payload. Measured across the
+# 64 tools of three real MCP servers: the mean schema is 503 chars (~125
+# tokens), but the distribution has a long tail — `sequentialthinking` alone is
+# 4,056 chars. At a 128-tool ceiling the block costs ~16,100 tokens a turn,
+# four times the entire system prompt, and it is re-sent every single turn.
+#
+# These ceilings are set above the mean on purpose: the point is to clip the
+# outliers, not to compress every tool. A description short enough to be
+# ambiguous costs a wrong tool call, which is far dearer than the tokens saved.
+MAX_TOOL_DESC_CHARS = _env_int("TOMAS_MAX_TOOL_DESC", 600, minimum=120)
+MAX_TOOL_PARAM_DESC_CHARS = _env_int("TOMAS_MAX_PARAM_DESC", 220, minimum=40)
+
+# Schema keys that describe the document rather than the call. Models do not
+# read them and validators upstream do not require them.
+_DROPPABLE_SCHEMA_KEYS = ("$schema", "title", "examples", "additionalProperties",
+                          "$id", "definitions", "$defs")
+
+
+def _clip(text: str, limit: int) -> str:
+    """Trim prose to `limit`, preferring a sentence then a word boundary."""
+    if not isinstance(text, str) or len(text) <= limit:
+        return text
+    cut = text[:limit]
+    stop = max(cut.rfind(". "), cut.rfind("\n"))
+    if stop > limit * 0.6:
+        return cut[:stop + 1].rstrip()
+    space = cut.rfind(" ")
+    return (cut[:space] if space > limit * 0.6 else cut).rstrip() + "…"
+
+
+def _compact_schema(node, depth: int = 0):
+    """Recursively drop documentation-only keys and clip property prose.
+
+    Everything that decides whether a call is well-formed — `type`,
+    `properties`, `required`, `enum`, `items`, `default` — is preserved
+    untouched. Only prose and metadata are reduced.
+    """
+    if isinstance(node, list):
+        return [_compact_schema(v, depth + 1) for v in node]
+    if not isinstance(node, dict):
+        return node
+    out = {}
+    for key, value in node.items():
+        if key in _DROPPABLE_SCHEMA_KEYS:
+            continue
+        if key == "description":
+            # The top level of the schema is the tool's own blurb and is
+            # clipped by the caller; nested ones are per-property.
+            out[key] = _clip(value, MAX_TOOL_PARAM_DESC_CHARS) if depth else value
+        else:
+            out[key] = _compact_schema(value, depth + 1)
+    return out
+
+
+def compact_tool_schemas(tools: list[dict]) -> list[dict]:
+    """Shrink the tool payload without changing what any tool accepts.
+
+    Pure: returns new dicts and never mutates `ALL_TOOLS`, because the same
+    tool objects are re-selected every turn and clipping them in place would
+    compound turn after turn until the descriptions were gone.
+    """
+    compacted = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            compacted.append(tool)
+            continue
+        new = dict(tool)
+        if isinstance(new.get("description"), str):
+            new["description"] = _clip(new["description"], MAX_TOOL_DESC_CHARS)
+        schema = new.get("input_schema")
+        if isinstance(schema, dict):
+            new["input_schema"] = _compact_schema(schema)
+        compacted.append(new)
+    return compacted
+
+
+def _max_tokens_was_set() -> bool:
+    """True when the user named an output budget rather than taking the default."""
+    return bool(os.environ.get("AGENT_MAX_TOKENS", "").strip())
+
+
+def effective_max_tokens(caps) -> int:
+    """This turn's output budget, honouring an explicit setting.
+
+    `Capabilities.max_output_tokens` is documented as "the optimistic case;
+    probing only ever narrows them" — but *nothing probes this field*, so its
+    8192 default was being applied as a hard ceiling that no measurement ever
+    justified. `min(MAX_TOKENS, caps.max_output_tokens)` therefore silently
+    discarded AGENT_MAX_TOKENS: setting it to 32000 still ran at 8192, and the
+    truncation message told the user to raise a variable that could not work.
+
+    Measured against the endpoint that hit this: deepseek-v4-flash-free accepts
+    max_tokens up to at least 65,536. The cap cost that provider 8x its real
+    budget, which is what truncated a lab-manual build mid-write.
+
+    So an explicit setting always wins here. Note this turns on the *field*
+    never being probed, not on `caps.probed` — that flag goes true once any
+    probe has run, while `max_output_tokens` stays untouched, so testing it
+    would reinstate exactly the clamp this removes. If real probing is ever
+    added for this field, make a measured value win instead.
+    """
+    if _max_tokens_was_set():
+        return MAX_TOKENS
+    ceiling = getattr(caps, "max_output_tokens", 0) or MAX_TOKENS
+    return min(MAX_TOKENS, ceiling) or MAX_TOKENS
 
 
 def _active_capabilities():
@@ -787,6 +1044,12 @@ RISK_LEVELS: dict[str, str] = {
     "read_mcp_resource": "low",
 }
 
+#: The tools whose risk tier strict mode leaves alone — they are this agent's
+#: own, and their tiers are deliberate. Everything else (i.e. MCP) is reset to
+#: "high". Previously spelled out as a literal set in two places, which drifted:
+#: `read_mcp_resource` was in RISK_LEVELS but in neither copy.
+BUILTIN_TOOL_NAMES = frozenset(RISK_LEVELS)
+
 # Commands that only read. `run_command` is the most-used tool in the corpus
 # (72 of 209 calls) and every one of them blocked on a prompt, because
 # `git status` and `rm -rf` shared a single tier.
@@ -853,10 +1116,22 @@ def _safe(p: Path, write: bool = False) -> bool:
 
 
 def _outside_project_error(path: Path, write: bool = False) -> str:
-    """Say which rule was hit, so the model corrects instead of retrying."""
+    """Say which rule was hit *and where to go instead*.
+
+    Naming only the rule sent the model looking for a second forbidden
+    location: told ~/.tomas was read-only it tried the system temp directory,
+    was refused again, and spent two tool calls before landing in the project.
+    An error that names the writable scratch path ends that search in one.
+    """
     if write and _within(path, TOMAS_HOME):
         return (f"Error: {path} is under ~/.tomas, which is read-only. "
-                f"Use save_memory or the self_notes API to write there.")
+                f"For a throwaway helper script use {SCRATCH_DIR}; for durable "
+                f"notes use save_memory or the self_notes API.")
+    if write:
+        return (f"Error: path outside project: {path}. Writes are only allowed "
+                f"under {PROJECT_DIR}. For a throwaway helper script use "
+                f"{SCRATCH_DIR} — the system temp directory is not writable "
+                f"from here.")
     return (f"Error: path outside project: {path}. "
             f"Readable roots: {PROJECT_DIR} (read-write), {TOMAS_HOME} (read-only).")
 
@@ -1552,9 +1827,13 @@ Memory and self-improvement:
   (read_file or list_files) before telling them it is done. State the exact
   path you verified, not just the path you intended to use.
 - A helper script you write only to carry out a step -- a converter, a
-  generator, glue you will not need again -- is not a deliverable. Put it in
-  a temp directory outside the project, or skip the file and pass the code to
-  `run_command` directly. Only what the user asked for belongs in their repo.
+  generator, glue you will not need again -- is not a deliverable. Only what
+  the user asked for belongs in their repo. Write it to `_scratch/` in the
+  project root, which exists for exactly this, or skip the file and pass the
+  code to `run_command` directly.
+- Do NOT try to write to the system temp directory or anywhere under
+  `~/.tomas`. Both are outside the writable sandbox and the call will be
+  refused; `_scratch/` is the one scratch location you have.
 
 Large deliverables:
 - You have a per-reply output limit. A long document -- a methodichka, a
@@ -1632,53 +1911,153 @@ def _truncate_section(text: str, max_chars: int, label: str = "") -> str:
 
 
 # Maximum size for each system-prompt section (in characters)
-MAX_INSTRUCTIONS_CHARS = 8000       # AGENTS.md + global instructions
+MAX_INSTRUCTIONS_CHARS = 24000      # AGENTS.md + CLAUDE.md + global instructions
 MAX_DIRECTIVES_CHARS = 1000         # standing rules (bounded by MAX_DIRECTIVES too)
 MAX_LEARNED_CHARS = 1500            # retrieved facts (bounded by k, not by store size)
 MAX_SKILLS_CHARS = 4000             # skills section
 MAX_TRIGGERED_SKILL_CHARS = 6000    # full body of a skill this message triggers
-MAX_TOTAL_SYSTEM_PROMPT = 28000     # hard cap on the entire system prompt.
-# ~7k tokens against the 200k context the default models actually have. The
-# old 20000 left so little headroom that adding one bundled skill pushed the
-# prompt to 19245 and the next edit to that skill would have silently cut it.
+MAX_TOTAL_SYSTEM_PROMPT = 44000     # hard cap on the entire system prompt.
+# ~11k tokens against the 200k context the default models actually have.
+#
+# Raised from 8000/28000 when CLAUDE.md started being loaded alongside AGENTS.md
+# (it had been documented as loaded for a long time without being loaded at
+# all). Together they are 16,259 chars here, so the old instructions budget was
+# discarding 8,259 of them — half the project's conventions, silently, with the
+# truncation notice as the only trace.
+#
+# Affordable because of where this content now sits: the instructions are part
+# of the stable prefix, so they are re-read from cache rather than re-tokenised
+# every turn. The per-turn cost of a larger stable prefix is close to nothing;
+# the per-turn cost of a larger *volatile* tail is not, which is why those
+# budgets are unchanged.
+#
+# Worth knowing: AGENTS.md and CLAUDE.md overlap substantially in this repo —
+# both describe the tool layers, the prompt load order and the quirks. Deduping
+# them would recover roughly 2,000-3,000 chars of prompt with no loss.
+
+
+# The smallest the stable prefix may be squeezed to when the volatile tail is
+# unusually large. BASE_PROMPT plus the environment section is what the agent
+# *is*; below this the rules it operates by start disappearing.
+MIN_STABLE_CHARS = 6000
+
+# Cached stable prefix, and the filesystem signature it was built from.
+_stable_prefix: Optional[str] = None
+_stable_signature: Optional[tuple] = None
+
+
+def _stable_inputs() -> list[Path]:
+    """Every file whose contents can change the stable prefix."""
+    import skills_manager
+    paths = [PROJECT_DIR / name for name in
+             (*instructions_manager.PROJECT_INSTRUCTION_FILES,
+              "AGENT_INSTRUCTIONS.md", "BEHAVIOR.md")]
+    paths.append(instructions_manager.PROJECT_INSTRUCTIONS_DIR
+                 / f"{PROJECT_DIR.name}.md")
+    try:
+        paths.extend(sorted(instructions_manager.GLOBAL_INSTRUCTIONS_DIR.glob("*.md")))
+    except OSError:
+        pass
+    paths.extend(skills_manager.SKILL_DIRS)
+    return paths
+
+
+def _stable_fingerprint() -> tuple:
+    """(path, mtime, size) for each input — cheap, and changes when they do.
+
+    Rebuilding the stable half cost 18.8 ms and 98 `exists()` calls on every
+    turn, re-reading files that change at most once a session. Keying on stat
+    rather than a timer means an edit to AGENTS.md still takes effect on the
+    very next message, which is what makes the file worth editing.
+    """
+    signature = []
+    for path in _stable_inputs():
+        try:
+            st = path.stat()
+            signature.append((str(path), int(st.st_mtime_ns), st.st_size))
+        except OSError:
+            signature.append((str(path), 0, -1))    # absent is a state too
+    return tuple(signature)
+
+
+def invalidate_prompt_cache() -> None:
+    """Drop the cached prefix. For callers that change instructions in-process."""
+    global _stable_prefix, _stable_signature
+    _stable_prefix = None
+    _stable_signature = None
 
 
 def build_system_prompt(user_message: str = "") -> str:
-    """Build the system prompt for this turn.
+    """Build the system prompt for this turn, stable part first.
 
     `user_message` is what learned knowledge is retrieved against. An empty
     query falls back to the most recently confirmed facts, so callers that
     have no message yet still get something sensible.
+
+    ── Why the order is what it is ──
+
+    Everything that does not depend on `user_message` is emitted before
+    anything that does. Prefix caching — DeepSeek's automatic kind, Anthropic's
+    `cache_control`, OpenAI's — matches on an exact byte prefix, and the system
+    prompt is serialised *before* the messages. So the first byte that differs
+    from last turn ends the cache hit for the system prompt **and for the whole
+    conversation history behind it**.
+
+    The catalogue used to sit last, after two sections rebuilt per message.
+    Measured on Zen/DeepSeek over five turns with a populated fact store: 52.0%
+    of prompt tokens served from cache, 14,864 billed as new. With the stable
+    content moved ahead of the volatile content, the same five turns cached
+    83.9% and billed 4,752 — 68% less. In a long session the saving is larger
+    still, because it is the history that stops being re-read.
     """
-    prompt = BASE_PROMPT + _environment_section()
-    # project-level instructions from AGENTS.md / agent.md + .tomas/instructions/
-    instructions_section = build_instructions_section(PROJECT_DIR)
-    if instructions_section:
-        instructions_section = _truncate_section(
-            instructions_section, MAX_INSTRUCTIONS_CHARS, "instructions"
-        )
-        prompt += f"\n\n{instructions_section}"
-    # legacy support: AGENT_INSTRUCTIONS.md or BEHAVIOR.md (loaded after for compatibility)
-    for candidate in [PROJECT_DIR / "AGENT_INSTRUCTIONS.md", PROJECT_DIR / "BEHAVIOR.md"]:
-        if candidate.exists():
-            legacy = candidate.read_text(encoding="utf-8")
-            legacy = _truncate_section(legacy, 2000, candidate.name)
-            prompt += f"\n\n# Agent Instructions ({candidate.name})\n{legacy}"
-            break
-    # ── Standing rules — always on, never retrieved ──
-    # This sits here, directly after the instructions section, for a measured
-    # reason. A 30-turn session ran two standing rules at once: "end with My
-    # Lord" from AGENT.md (static, imperative heading) was obeyed 29/29; "append
-    # the date" from the fact store (retrieved, filed under "What I've learned")
-    # was obeyed 0/29 — while being present in the prompt on all 29 turns. The
-    # rule was never the problem; the channel was. Directives now ride the
-    # channel that gets complied with, and are phrased as orders, not notes.
+    # ── Stable: identical every turn until a file on disk changes ──
+    global _stable_prefix, _stable_signature
+    signature = _stable_fingerprint()
+    if _stable_prefix is not None and signature == _stable_signature:
+        stable = _stable_prefix
+    else:
+        stable = BASE_PROMPT + _environment_section()
+        # project-level instructions from AGENTS.md / agent.md / CLAUDE.md
+        # plus ~/.tomas/instructions/
+        instructions_section = build_instructions_section(PROJECT_DIR)
+        if instructions_section:
+            instructions_section = _truncate_section(
+                instructions_section, MAX_INSTRUCTIONS_CHARS, "instructions"
+            )
+            stable += f"\n\n{instructions_section}"
+        # legacy support: AGENT_INSTRUCTIONS.md or BEHAVIOR.md
+        for candidate in [PROJECT_DIR / "AGENT_INSTRUCTIONS.md",
+                          PROJECT_DIR / "BEHAVIOR.md"]:
+            if candidate.exists():
+                legacy = candidate.read_text(encoding="utf-8")
+                legacy = _truncate_section(legacy, 2000, candidate.name)
+                stable += f"\n\n# Agent Instructions ({candidate.name})\n{legacy}"
+                break
+        # installed skills — budgeted by whole entries, not by slicing the
+        # joined string at a character offset (which used to cut mid-skill-
+        # name). Names only; it does not vary with the message, so it belongs
+        # up here where it can be cached rather than re-sent every turn.
+        skills_section = build_skills_section(max_chars=MAX_SKILLS_CHARS)
+        if skills_section:
+            stable += f"\n\n{skills_section}"
+        _stable_prefix = stable
+        _stable_signature = signature
+
+    # ── Volatile: rebuilt against this turn's message ──
+    tail = ""
+    # Standing rules — always on, never retrieved. These lead the tail for a
+    # measured reason. A 30-turn session ran two standing rules at once: "end
+    # with My Lord" from AGENT.md (static, imperative heading) was obeyed 29/29;
+    # "append the date" from the fact store (retrieved, filed under "What I've
+    # learned") was obeyed 0/29 — while being present in the prompt on all 29
+    # turns. The rule was never the problem; the channel was. Directives keep
+    # their own imperative heading and still precede the retrieved facts.
     try:
         directives = learning.directives_for_prompt()
         if directives:
             directives = _truncate_section(directives, MAX_DIRECTIVES_CHARS,
                                            "standing rules")
-            prompt += (
+            tail += (
                 "\n\n# Standing rules from the user — these apply to EVERY reply\n"
                 "You MUST follow every rule below on every single turn. They "
                 "apply even when the current message is about something else "
@@ -1701,39 +2080,37 @@ def build_system_prompt(user_message: str = "") -> str:
             # Heading rewritten from "What I've learned about this user and
             # project". That phrasing read as a dossier and the model treated it
             # as trivia. Same data, actionable framing.
-            prompt += ("\n\n# Context retrieved for this message — apply what is "
-                       "relevant\n"
-                       f"{learned}")
+            tail += ("\n\n# Context retrieved for this message — apply what is "
+                     "relevant\n"
+                     f"{learned}")
     except Exception:
         pass
-    # A skill this message triggers goes in first, in full. The catalogue
-    # below only names skills — enough to pick one, useless for following one
-    # — and nothing ever read `triggers`, so a procedure written for a job
-    # never reached the model while it was doing that job. It precedes the
-    # catalogue because the total cap truncates from the end: instructions the
-    # model is meant to act on now must not be the first thing dropped.
+    # A skill this message triggers goes in full. The catalogue above only
+    # names skills — enough to pick one, useless for following one — and
+    # nothing ever read `triggers`, so a procedure written for a job never
+    # reached the model while it was doing that job.
     try:
         triggered = build_triggered_skills(user_message, MAX_TRIGGERED_SKILL_CHARS)
         if triggered:
-            prompt += f"\n\n{triggered}"
+            tail += f"\n\n{triggered}"
     except Exception:
         pass
-    # installed skills — budgeted by whole entries, not by slicing the joined
-    # string at a character offset (which used to cut mid-skill-name).
-    skills_section = build_skills_section(max_chars=MAX_SKILLS_CHARS)
-    if skills_section:
-        prompt += f"\n\n{skills_section}"
     # NOTE: the self-improvement tips/session-context block used to be injected
     # here. It was template text addressed to a human developer ("Consider
     # creating shortcuts or aliases for this tool") that consumed context and
     # changed nothing about the model's behaviour. Reflection replaces it; the
     # generator code is still in self_improve.py pending deletion.
+
     # ── Hard cap on the total system prompt ──
-    if len(prompt) > MAX_TOTAL_SYSTEM_PROMPT:
-        prompt = _truncate_section(
-            prompt, MAX_TOTAL_SYSTEM_PROMPT, "system prompt"
-        )
-    return prompt
+    # The tail is what the model must act on *now* — the user's standing rules
+    # and the procedure for the job in hand — so the cap is taken out of the
+    # stable half, from the end (the skills catalogue), and never out of the
+    # tail. Trimming from the end of the joined string, as this used to, made
+    # the triggered skill body the first thing dropped.
+    if len(stable) + len(tail) > MAX_TOTAL_SYSTEM_PROMPT:
+        room = max(MIN_STABLE_CHARS, MAX_TOTAL_SYSTEM_PROMPT - len(tail))
+        stable = _truncate_section(stable, room, "system prompt")
+    return stable + tail
 
 # ---------------------------------------------------------------------------
 # Three-layer memory system
@@ -1955,8 +2332,16 @@ def _render_reflection_log(limit: int = 5) -> str:
 # Context management — auto-compaction
 # ---------------------------------------------------------------------------
 
+def estimate_tool_tokens(tools: list) -> int:
+    """Token cost of a tool block, counted as the JSON it is serialised to."""
+    try:
+        return int(sum(len(json.dumps(t)) for t in tools) / CHARS_PER_TOKEN_JSON)
+    except Exception:
+        return 0
+
+
 def _estimate_tokens(messages: list) -> int:
-    """Rough token estimate. For HTML-heavy tool results use chars//3."""
+    """Rough token estimate for a message list."""
     total_chars = 0
     for m in messages:
         content = m.get("content", "")
@@ -1969,11 +2354,135 @@ def _estimate_tokens(messages: list) -> int:
                     total_chars += len(str(item))
         else:
             total_chars += len(str(content))
-    return total_chars // 3
+    return total_chars // CHARS_PER_TOKEN_PROSE
 
 def _estimate_system_prompt_tokens(system_prompt: str) -> int:
     """Estimate tokens for the system prompt string."""
-    return len(system_prompt) // 3
+    return len(system_prompt) // CHARS_PER_TOKEN_PROSE
+
+# ── Pruning old tool results ───────────────────────────────────────────
+# Measured on a real 55-call session: history was 48,655 tokens of the ~60,000
+# sent per call, and 29,394 of those — 60% of the history — were tool results.
+# A file read on turn 2 was still being re-sent on turn 50. The model has long
+# stopped reading it; the transcript is paying for it every single turn.
+
+#: How many of the most recent tool-result batches are kept verbatim.
+#:
+#: Counted in batches, not user turns. The first version counted user turns and
+#: found nothing to prune in the very session that motivated the feature: it
+#: made 56 tool calls inside *two* user turns, so "older than 3 turns" never
+#: matched anything. Long agentic work happens *within* a turn, which is
+#: exactly where the history piles up.
+TOOL_RESULT_KEEP_TURNS = _env_int("TOMAS_KEEP_RESULT_BATCHES", 8, minimum=1)
+
+#: Results smaller than this are left alone — stubbing a 300-char result costs
+#: information and saves nothing.
+TOOL_RESULT_STUB_OVER = _env_int("TOMAS_STUB_RESULTS_OVER", 2_000, minimum=200)
+
+#: Only prune once there is this much to gain, in characters.
+#:
+#: This is what keeps pruning cache-friendly. Stubbing rewrites a message in
+#: the middle of the transcript, which invalidates the prefix cache from that
+#: point on — so doing it every turn would trade one saving for a permanent
+#: stream of cache misses. Pruning in occasional large batches pays that cost
+#: rarely. Stubbing is monotonic (a stub is never re-stubbed), so everything
+#: before the pruned point stays byte-identical.
+TOOL_RESULT_PRUNE_AT = _env_int("TOMAS_PRUNE_RESULTS_AT", 20_000, minimum=2_000)
+
+_PRUNED_MARK = "[older tool result released from context"
+
+
+def _is_user_turn(message: dict) -> bool:
+    """True for a real user message, as opposed to a tool-result carrier.
+
+    Both have role "user" — the tool-result ones carry a list of tool_result
+    blocks and no prose, which is what separates one turn from the next.
+    """
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return True
+    if isinstance(content, list):
+        return any(isinstance(b, dict) and b.get("type") != "tool_result"
+                   for b in content)
+    return False
+
+
+def prunable_chars(messages: list, keep_turns: int = TOOL_RESULT_KEEP_TURNS,
+                   stub_over: int = TOOL_RESULT_STUB_OVER) -> int:
+    """How much could be reclaimed right now, without changing anything."""
+    return sum(saved for _, _, saved in _prune_targets(messages, keep_turns,
+                                                       stub_over))
+
+
+def _prune_targets(messages: list, keep_batches: int, stub_over: int):
+    """Yield (message_index, block_index, chars_saved) for each stubbable result.
+
+    Walks backwards counting *batches of tool results* — one message carrying
+    tool_result blocks is one batch — and leaves the newest `keep_batches`
+    alone. Those are what the model is still reasoning over; everything behind
+    them is reference material it can re-fetch far more cheaply than it can
+    carry.
+    """
+    batches_seen = 0
+    for i in range(len(messages) - 1, -1, -1):
+        content = messages[i].get("content")
+        if not isinstance(content, list):
+            continue
+        results = [(j, b) for j, b in enumerate(content)
+                   if isinstance(b, dict) and b.get("type") == "tool_result"]
+        if not results:
+            continue
+        batches_seen += 1
+        if batches_seen <= keep_batches:
+            continue
+        for j, block in results:
+            body = block.get("content")
+            if not isinstance(body, str) or body.startswith(_PRUNED_MARK):
+                continue
+            if len(body) > stub_over:
+                yield i, j, len(body)
+
+
+def prune_tool_results(messages: list,
+                       keep_turns: int = TOOL_RESULT_KEEP_TURNS,
+                       stub_over: int = TOOL_RESULT_STUB_OVER,
+                       prune_at: int = TOOL_RESULT_PRUNE_AT) -> int:
+    """Replace the body of old, large tool results with a stub, in place.
+
+    Returns the characters reclaimed (0 if it was not worth doing yet).
+
+    The `tool_use`/`tool_result` pairing is preserved exactly — only the body
+    text is replaced — because dropping the block outright leaves a dangling
+    tool_call that upstreams reject.
+
+    The stub says what was there and how to get it back, so this is a
+    *release*, not a loss: the model can re-read the file if it turns out to
+    still need it, which is far cheaper than carrying it for fifty turns.
+    """
+    targets = list(_prune_targets(messages, keep_turns, stub_over))
+    if sum(saved for _, _, saved in targets) < prune_at:
+        return 0
+    reclaimed = 0
+    for i, j, _ in targets:
+        block = messages[i]["content"][j]
+        body = block["content"]
+        block["content"] = (
+            f"{_PRUNED_MARK} — it was {len(body):,} characters. "
+            f"Re-run the tool if you need it again.]")
+        reclaimed += len(body) - len(block["content"])
+    return reclaimed
+
+
+def maybe_prune(messages: list) -> list:
+    """Prune if it is worth it, and say so. Mirrors `maybe_compact`'s shape."""
+    reclaimed = prune_tool_results(messages)
+    if reclaimed > 0:
+        print(f'  {DIM}[context] released {reclaimed:,} chars '
+              f'(~{reclaimed // 4:,} tokens) of old tool results{RESET}')
+    return messages
+
 
 def maybe_compact(messages: list, system_prompt: str = "") -> list:
     """Compact the conversation if it's getting too large.
@@ -1983,7 +2492,14 @@ def maybe_compact(messages: list, system_prompt: str = "") -> list:
     msg_tok = _estimate_tokens(messages)
     sys_tok = _estimate_system_prompt_tokens(system_prompt) if system_prompt else 0
     # Total budget includes system prompt + tool definitions + max_tokens + messages
-    total_budget = CONTEXT_WINDOW * COMPACTION_THRESHOLD
+    #
+    # Capped in absolute terms as well as proportionally. 75% of a million-token
+    # window is 750,000 tokens, so on a large-context model compaction simply
+    # never fired: a long session grew without limit and every turn paid to
+    # re-read all of it — slower and dearer each message, for history the model
+    # had long stopped using. The proportional rule still governs small windows,
+    # where 75% is the real constraint.
+    total_budget = min(CONTEXT_WINDOW * COMPACTION_THRESHOLD, COMPACTION_CEILING)
     if msg_tok + sys_tok + TOOL_TOKENS + MAX_TOKENS < total_budget:
         return messages
     print(f'  {DIM}[context] compacting conversation...{RESET}')
@@ -2023,6 +2539,14 @@ def maybe_compact(messages: list, system_prompt: str = "") -> list:
 # ---------------------------------------------------------------------------
 
 MAX_TOOL_CALLS_PER_TURN = int(os.environ.get("TOMAS_MAX_TOOL_CALLS", "40"))
+# How many times bypass mode may extend the budget without asking. Nine
+# extensions plus the initial budget is 400 tool calls at the default — more
+# than any observed task (the session that motivated the mode used 56) while
+# still being a number, so an unattended runaway ends instead of billing on.
+MAX_AUTO_CONTINUATIONS = _env_int("TOMAS_MAX_AUTO_CONTINUATIONS", 9, minimum=1)
+# Ceiling on a single tool result, kept in step with core.state's fail-safe.
+# Raise it when a task genuinely needs one enormous result in context.
+MAX_RESULT_CHARS = _env_int("TOMAS_MAX_RESULT_CHARS", 30_000, minimum=2_000)
 _streaming_disabled = False  # set True if provider doesn't support streaming
 
 # The loop itself now lives in core/loop.py. These aliases keep older call
@@ -2198,9 +2722,145 @@ def parse_text_tool_calls(text: str) -> list[dict]:
     return calls
 
 
+def cache_marked_system(system_prompt: str):
+    """Mark the stable prefix so the provider caches it instead of re-reading it.
+
+    Every turn resends ~6,300 identical tokens — the system prompt plus the
+    tool definitions — and re-tokenising and re-attending them is most of what
+    a short turn costs. One `cache_control` breakpoint at the end of the system
+    block covers the whole prefix, because Anthropic's cache hierarchy is
+    tools → system → messages: marking system caches the tools ahead of it too.
+
+    Returns the block form when caching is on, the plain string otherwise, so
+    the call site stays a single assignment. OpenAI-wire providers get the
+    string: they do prefix caching server-side and have no `cache_control`,
+    and `anthropic_to_openai` flattens block lists anyway.
+    """
+    if not system_prompt:
+        return system_prompt
+    return [{"type": "text", "text": system_prompt,
+             "cache_control": {"type": "ephemeral"}}]
+
+
+#: How many `cache_control` breakpoints Anthropic accepts in one request.
+#: One is spent on the system block; the rest are available to the history.
+MAX_CACHE_BREAKPOINTS = 4
+
+#: Don't spend a breakpoint on a trivial amount of history — each one has a
+#: write cost, and caching 200 tokens never repays it.
+MIN_CACHED_HISTORY_CHARS = 4_000
+
+
+def _measure(message: dict) -> int:
+    """Characters the model actually sees in one message.
+
+    Deliberately not `json.dumps`: that escapes Cyrillic to `\\uXXXX`, six
+    characters for one, and inflated a real Ukrainian transcript four-fold —
+    which would make every size threshold in this module fire at a quarter of
+    its intended size on exactly the sessions this project is used for.
+    """
+    content = message.get("content")
+    if isinstance(content, str):
+        return len(content)
+    total = 0
+    for block in content or []:
+        if not isinstance(block, dict):
+            total += len(str(block))
+            continue
+        kind = block.get("type")
+        if kind == "text":
+            total += len(block.get("text") or "")
+        elif kind == "tool_result":
+            total += len(str(block.get("content") or ""))
+        elif kind == "tool_use":
+            try:
+                total += len(json.dumps(block.get("input") or {},
+                                        ensure_ascii=False))
+            except Exception:
+                total += len(str(block.get("input") or ""))
+        else:
+            total += len(str(block))
+    return total
+
+
+def clear_history_cache_marks(messages: list) -> None:
+    """Remove every `cache_control` this module put on the history."""
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict):
+                block.pop("cache_control", None)
+
+
+def mark_history_for_caching(messages: list, breakpoints: int = 3) -> int:
+    """Put `cache_control` on the history so it is re-read, not re-processed.
+
+    Only the system block was ever marked. But the system prompt is ~7,000
+    tokens while the history reached 48,655 in a real session — so the part
+    that dominated the bill was the part paying full price on every turn,
+    because Anthropic caches a *prefix* and the prefix ended where the marks
+    did.
+
+    Mutates in place and returns how many marks were placed. In place because
+    `core.loop` appends to this very list: handing back a copy would send the
+    marked version to the model while the assistant's replies accumulated in
+    an object nobody reads — the no-memory bug, reintroduced silently.
+
+    Moving a breakpoint between turns is free: `cache_control` is a directive
+    about where to cut, not content, so it does not change the prefix the cache
+    is keyed on. That is what makes re-marking every turn safe.
+
+    Only messages whose content is *already* a block list are marked. A string
+    would have to be reshaped into blocks to carry the key, and that rewrites
+    the user's own turns in the saved transcript for a few tokens of benefit.
+    Tool-heavy sessions — the ones with history worth caching — are mostly
+    block-list messages anyway.
+    """
+    clear_history_cache_marks(messages)
+    if len(messages) < 2 or breakpoints < 1:
+        return 0
+
+    # Candidates are any block-list message except the last. Turn boundaries
+    # are deliberately *not* used: a turn that makes 56 tool calls offers one
+    # boundary and one breakpoint, leaving the bulk of its own history uncached
+    # — which is the case that needs caching most.
+    running, sized = 0, []
+    for i, message in enumerate(messages):
+        running += _measure(message)
+        if (i < len(messages) - 1
+                and isinstance(message.get("content"), list)
+                and running >= MIN_CACHED_HISTORY_CHARS):
+            sized.append(i)
+    if not sized:
+        return 0
+
+    # The latest candidate matters most — it caches the longest prefix. The
+    # others are spread evenly behind it so that when the tail shifts, there is
+    # still a usable cached prefix further back instead of an all-or-nothing
+    # miss.
+    chosen = {sized[-1]}
+    for n in range(1, breakpoints):
+        chosen.add(sized[max(0, len(sized) * (breakpoints - n) // (breakpoints + 1))])
+
+    placed = 0
+    for i in sorted(chosen)[-breakpoints:]:
+        tail = next((b for b in reversed(messages[i]["content"])
+                     if isinstance(b, dict)), None)
+        if tail is not None:
+            tail["cache_control"] = {"type": "ephemeral"}
+            placed += 1
+    return placed
+
+
 def build_state(system_prompt: str, messages: list, responder) -> AgentState:
     """Assemble the turn context the core needs out of this module's globals."""
     selected, withheld = tools_for_turn(messages)
+    # Compacted here rather than at discovery so `ALL_TOOLS` keeps the full
+    # schemas: selection scores against descriptions, and scoring clipped text
+    # would quietly change which tools a message retrieves.
+    selected = compact_tool_schemas(selected)
     if withheld:
         system_prompt = system_prompt + withheld_tools_notice(withheld)
     caps = _active_capabilities()
@@ -2217,13 +2877,25 @@ def build_state(system_prompt: str, messages: list, responder) -> AgentState:
                     + list(messages))
         system_prompt = ""
 
+    # Last, so it wraps the finished text: the withheld-tools notice and the
+    # text-protocol description are both appended above, and a breakpoint
+    # placed before them would cache a prefix that no longer matches.
+    if caps.prompt_caching and caps.system_prompt:
+        system_prompt = cache_marked_system(system_prompt)
+    if caps.prompt_caching:
+        # The system block spends one of the four breakpoints; the history
+        # gets the rest. In place — see the note in mark_history_for_caching
+        # about why a copy would lose the transcript.
+        mark_history_for_caching(messages,
+                                 breakpoints=MAX_CACHE_BREAKPOINTS - 1)
+
     return AgentState(
         system_prompt=system_prompt,
         messages=messages,
         get_client=_get_client,
         get_model=_get_model,
         tools=selected if caps.tool_use else [],
-        max_tokens=min(MAX_TOKENS, caps.max_output_tokens) or MAX_TOKENS,
+        max_tokens=effective_max_tokens(caps),
         execute_tool=execute_tool,
         risk_of=risk_for,
         origin_of=_tool_origin,
@@ -2231,7 +2903,10 @@ def build_state(system_prompt: str, messages: list, responder) -> AgentState:
         approvals=APPROVALS,
         auto_approve_low=AUTO_APPROVE_LOW,
         yolo=YOLO_MODE,
+        auto_continue=BYPASS_MODE,
+        max_auto_continuations=MAX_AUTO_CONTINUATIONS,
         tool_budget=MAX_TOOL_CALLS_PER_TURN,
+        max_result_chars=MAX_RESULT_CHARS,
         streaming_enabled=(not _streaming_disabled) and caps.streaming,
         on_tool_call=_record_tool_call,
     )
@@ -2561,7 +3236,7 @@ KEY_HELP = [
     ("Ctrl+L",       "clear the screen, keep what is typed"),
     ("Ctrl+C",       "cancel"),
     ("⇧+Space",      "toggle auto-approve"),
-    ("F5 F6 F7 F8",  "auto · default · strict · yolo"),
+    ("F5 F6 F7 F8 F9", "auto · default · strict · yolo · bypass"),
 ]
 
 
@@ -2605,7 +3280,7 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
       - "__continue__" to skip agent processing and continue
       - None           if command produced no output
     """
-    global mcp_manager, AUTO_APPROVE_LOW, YOLO_MODE
+    global mcp_manager, AUTO_APPROVE_LOW, YOLO_MODE, BYPASS_MODE
     parts = cmd_args.strip().split(maxsplit=1)
     cmd = parts[0].lower() if parts else ""
 
@@ -2658,18 +3333,13 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
     if cmd == "status":
         model_status = _get_model()
         cw = _current_context_window
-        if YOLO_MODE:
-            mode = "yolo"
-            mode_color = RED
-        else:
-            mode = "auto" if AUTO_APPROVE_LOW else "default"
-            mode_color = GREEN if AUTO_APPROVE_LOW else YELLOW
+        mode = current_mode_name()
         lines = [
             f'  {BOLD}TOMAS Status{RESET}',
             f'  {DIM}{"─" * 46}{RESET}',
             f'  {CYAN}◎{RESET}  Model:     {model_status}',
             f'  {CYAN}▣{RESET}  Context:   {cw:,} tokens',
-            f'  {CYAN}⚙{RESET}  Mode:      {mode_color}{mode}{RESET}',
+            f'  {CYAN}⚙{RESET}  Mode:      {mode_color(mode)}{mode}{RESET}',
             f'  {CYAN}✉{RESET}  Messages:  {len(messages)} in history',
         ]
         try:
@@ -2682,7 +3352,8 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
             pass
         if mcp_manager:
             lines.append(f'  {CYAN}⚡{RESET}  MCP tools: {len(mcp_manager.tools)} loaded')
-        lines.append(f'  {CYAN}⌨{RESET}  Toggle:    {DIM}⇧+Space{RESET}  ·  {DIM}F5{RESET} auto  {DIM}F6{RESET} default  {DIM}F7{RESET} strict  {DIM}F8{RESET} yolo')
+        lines.append(f'  {CYAN}⌨{RESET}  Toggle:    {DIM}⇧+Space{RESET}  ·  '
+                     f'{DIM}{MODE_KEYS_HINT}{RESET}')
         # ── Token stats ──
         s = _session_tokens
         if s["calls"] > 0:
@@ -2725,27 +3396,42 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
         elif arg in ("yolo", "YOLO"):
             AUTO_APPROVE_LOW = True
             YOLO_MODE = True
+            BYPASS_MODE = False
             return (
                 f'  {BOLD}{RED}⚡ YOLO mode enabled!{RESET} {RED}All tools auto-approved.{RESET}'
             )
+        elif arg in ("bypass", "bypass-permissions", "nonstop"):
+            AUTO_APPROVE_LOW = True
+            YOLO_MODE = True
+            BYPASS_MODE = True
+            return (
+                f'  {BOLD}{RED}⇥ BYPASS mode enabled!{RESET} '
+                f'{RED}All tools auto-approved and the turn will not stop to '
+                f'ask whether to continue.{RESET}\n'
+                f'  {DIM}Bounded at {MAX_AUTO_CONTINUATIONS} automatic budget '
+                f'extensions ({MAX_TOOL_CALLS_PER_TURN * (MAX_AUTO_CONTINUATIONS + 1)} '
+                f'tool calls per turn); loop detection still applies.{RESET}'
+            )
         # No arg or unknown arg — show current mode
-        if YOLO_MODE:
-            mode = "yolo"
-        else:
-            mode = "auto" if AUTO_APPROVE_LOW else "default"
+        mode = current_mode_name()
         lines = [
             f'  {BOLD}Current Mode{RESET}',
             f'  {DIM}{"─" * 46}{RESET}',
             f'  {CYAN}⚙{RESET}  Mode:        {BOLD}{mode}{RESET}',
             f'  {CYAN}✓{RESET}  Auto-approve: {"ON" if AUTO_APPROVE_LOW else "OFF"}',
+            f'  {CYAN}⇥{RESET}  Auto-continue: '
+            f'{"ON — up to %d extensions" % MAX_AUTO_CONTINUATIONS if BYPASS_MODE else "OFF — asks at the budget checkpoint"}',
             '',
             f'  {DIM}Quick keys:{RESET}',
-            f'    {DIM}⇧+Space{RESET}  — toggle  ·  {DIM}F5{RESET} auto  {DIM}F6{RESET} default  {DIM}F7{RESET} strict  {DIM}F8{RESET} yolo',
+            f'    {DIM}⇧+Space{RESET}  — toggle  ·  {DIM}Tab{RESET} cycles  ·  '
+            f'{DIM}F5{RESET} auto  {DIM}F6{RESET} default  {DIM}F7{RESET} strict  '
+            f'{DIM}F8{RESET} yolo  {DIM}F9{RESET} bypass',
             f'  {DIM}Slash commands:{RESET}',
             f'    /mode auto     — auto-approve low-risk tools',
             f'    /mode default  — ask before every tool',
             f'    /mode strict   — ask for everything, clear overrides',
             f'    /mode yolo     — {RED}auto-approve ALL tools (no prompts){RESET}',
+            f'    /mode bypass   — {RED}yolo + never ask whether to continue{RESET}',
         ]
         return '\n'.join(lines)
 
@@ -3370,7 +4056,7 @@ def read_input_with_suggestions(prompt: str) -> str:
     except ImportError:
         return _read_input_cross_platform(prompt)
 
-    global AUTO_APPROVE_LOW, YOLO_MODE, _history_index  # allow F-key / YOLO mode switching
+    global _history_index   # mode switching goes through set_mode()
     base_prompt = prompt
 
     buffer: list[str] = []
@@ -3391,10 +4077,14 @@ def read_input_with_suggestions(prompt: str) -> str:
 
     # ── mode helpers ─────────────────────────────────────────────────┬─
     def _mode_badge() -> str:
-        if YOLO_MODE:
+        mode = current_mode_name()
+        if mode == "bypass":
+            # Distinct from YOLO on sight: this one also removes the stop that
+            # would otherwise interrupt a long unattended run.
+            return f'[{RED}{BOLD}BYPASS ⇥{RESET}]'
+        if mode == "yolo":
             return f'[{RED}YOLO{RESET}]'
-        mode = "auto" if AUTO_APPROVE_LOW else "default"
-        color = GREEN if AUTO_APPROVE_LOW else YELLOW
+        color = GREEN if mode == "auto" else YELLOW
         return f'[{color}{mode}{RESET}]'
 
     def _build_prompt() -> str:
@@ -3404,26 +4094,11 @@ def read_input_with_suggestions(prompt: str) -> str:
             return base_prompt[:idx] + badge + ' ' + base_prompt[idx:]
         return badge + ' ' + base_prompt
 
-    def _set_mode(m: str):
-        global AUTO_APPROVE_LOW, YOLO_MODE
-        YOLO_MODE = False  # any explicit mode switch exits YOLO except YOLO itself
-        if m == "auto":
-            AUTO_APPROVE_LOW = True
-        elif m == "default":
-            AUTO_APPROVE_LOW = False
-        elif m == "strict":
-            AUTO_APPROVE_LOW = False
-            # Reset non-built-in risk overrides and clear "always" approvals
-            APPROVALS.clear()
-            builtins = {"read_file", "list_files", "search_code", "edit_file",
-                        "write_file", "save_memory", "run_command", "fetch_url",
-                        "fetch_url_with_browser", "search_web"}
-            for k in list(RISK_LEVELS.keys()):
-                if k not in builtins:
-                    RISK_LEVELS[k] = "high"
-        elif m == "yolo":
-            AUTO_APPROVE_LOW = True
-            YOLO_MODE = True
+    # Delegates to the module-level `set_mode` rather than repeating the flag
+    # writes. This copy had drifted from the /mode handler's — it knew nothing
+    # about read_mcp_resource, and a mode added to one was invisible to the
+    # other, which is exactly how bypass would have ended up half-wired.
+    _set_mode = set_mode
 
     # ── helpers ──────────────────────────────────────────────────────────
 
@@ -3499,13 +4174,9 @@ def read_input_with_suggestions(prompt: str) -> str:
         cf = _cmd_filter()
 
         # Mode status string (always shown in suggestion line)
-        if YOLO_MODE:
-            mode = "yolo"
-            mode_clr = RED
-        else:
-            mode = "auto" if AUTO_APPROVE_LOW else "default"
-            mode_clr = GREEN if AUTO_APPROVE_LOW else YELLOW
-        mode_str = f'  {DIM}mode:{RESET} {mode_clr}{mode}{RESET}  {DIM}⇧+Space:toggle  F5/6/7/8:auto·default·strict·yolo{RESET}'
+        mode = current_mode_name()
+        mode_str = (f'  {DIM}mode:{RESET} {mode_color(mode)}{mode}{RESET}  '
+                    f'{DIM}⇧+Space:toggle  {MODE_KEYS_HINT}{RESET}')
 
         if matches:
             parts = []
@@ -3696,16 +4367,18 @@ def read_input_with_suggestions(prompt: str) -> str:
                 # the second call gives the key itself.
                 ext = msvcrt.getwch()
 
-                # F5–F8 — quick mode switch
-                if ext in ('\x3f', '\x40', '\x41', '\x42'):
+                # F5–F9 — quick mode switch
+                if ext in ('\x3f', '\x40', '\x41', '\x42', '\x43'):
                     if ext == '\x3f':      # F5 — toggle auto/default
                         _set_mode("default" if AUTO_APPROVE_LOW else "auto")
                     elif ext == '\x40':    # F6 — default mode
                         _set_mode("default")
                     elif ext == '\x41':    # F7 — strict mode
                         _set_mode("strict")
-                    else:                  # F8 — YOLO mode
+                    elif ext == '\x42':    # F8 — YOLO mode
                         _set_mode("yolo")
+                    else:                  # F9 — bypass mode
+                        _set_mode("bypass")
                     _refresh()
                     if _is_slash():
                         _show()
@@ -3766,13 +4439,15 @@ def read_input_with_suggestions(prompt: str) -> str:
                     _refresh()
                     _show()
                 else:
-                    # Tab outside slash command → cycle mode: auto → default → yolo → auto
-                    if YOLO_MODE:
-                        _set_mode("auto")
-                    elif AUTO_APPROVE_LOW:
-                        _set_mode("default")
-                    else:
-                        _set_mode("yolo")
+                    # Tab outside a slash command cycles the modes, in the one
+                    # order MODE_CYCLE defines — indexing it rather than
+                    # branching on the flags means a new mode joins the cycle
+                    # by being added to the tuple, not by editing this if/else.
+                    try:
+                        nxt = (MODE_CYCLE.index(current_mode_name()) + 1) % len(MODE_CYCLE)
+                    except ValueError:
+                        nxt = 0          # e.g. strict, which is not in the cycle
+                    _set_mode(MODE_CYCLE[nxt])
                     _refresh()
                     _hide()
                 continue
@@ -4036,13 +4711,19 @@ def main() -> int:
     cw_str = f'{_current_context_window:,}' if _current_context_window else '?'
     print(f'  {DIM}Context:{RESET}  {CYAN}{cw_str} tokens{RESET}')
     print(f'  {DIM}Project:{RESET}  {BLUE}{PROJECT_DIR.name}{RESET}')
-    mode_name = 'auto' if AUTO_APPROVE_LOW else 'default'
-    mode_color = GREEN if AUTO_APPROVE_LOW else YELLOW
-    yolo_name = 'YOLO' if YOLO_MODE else ''
-    mode_display = f'{mode_color}{mode_name}{RESET}'
-    if YOLO_MODE:
+    mode_name = current_mode_name()
+    if mode_name == "bypass":
+        mode_display = f'{RED}{BOLD}BYPASS ⇥{RESET}'
+    elif mode_name == "yolo":
         mode_display = f'{RED}{BOLD}YOLO ⚡{RESET}'
+    else:
+        mode_display = f'{mode_color(mode_name)}{mode_name}{RESET}'
     print(f'  {DIM}Mode:{RESET}      {mode_display}')
+    if mode_name == "bypass":
+        print(f'  {DIM}           all tools auto-approved · never asks to '
+              f'continue · up to '
+              f'{MAX_TOOL_CALLS_PER_TURN * (MAX_AUTO_CONTINUATIONS + 1)} '
+              f'tool calls per turn{RESET}')
     print()
 
     # ── Initialize MCP connections (single pass, no pre-test) ──
@@ -4103,14 +4784,14 @@ def main() -> int:
             ALL_TOOLS = list(TOOLS)
             COMBINED_TOOLS = TOOLS
             MCP_TOOL_NAME_MAP = {}
-        TOOL_TOKENS = sum(len(json.dumps(t)) for t in COMBINED_TOOLS) // 6
+        TOOL_TOKENS = estimate_tool_tokens(COMBINED_TOOLS)
     except Exception as e:
         print(f'  {RED}⚠{RESET}  MCP initialization failed: {e}')
         mcp_manager = MCPManager()
         ALL_TOOLS = list(TOOLS)
         COMBINED_TOOLS = TOOLS
         MCP_TOOL_NAME_MAP = {}
-        TOOL_TOKENS = sum(len(json.dumps(t)) for t in COMBINED_TOOLS) // 6
+        TOOL_TOKENS = estimate_tool_tokens(COMBINED_TOOLS)
 
     # ── Initialize self-improving system ──
     self_improve.init()
@@ -4185,6 +4866,12 @@ def main() -> int:
                 # Regular user message, plus any images it names.
                 messages.append({"role": "user",
                                  "content": build_user_content(user_input)})
+            # Release old tool results before considering compaction: pruning
+            # is cheap and reversible (the model can re-read a file), while
+            # compaction spends a model call and rewrites the whole transcript.
+            # Doing it in this order means a session often no longer needs to
+            # compact at all.
+            messages = maybe_prune(messages)
             messages = maybe_compact(messages)
             # Retrieve learned knowledge against what the user just asked.
             system_prompt = build_system_prompt(user_input)  # re-inject every turn

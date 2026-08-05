@@ -733,7 +733,7 @@ def run_sessions(args: argparse.Namespace) -> int:
         selected = [entry]
 
     agent.COMBINED_TOOLS = agent.TOOLS
-    agent.TOOL_TOKENS = sum(len(json.dumps(t)) for t in agent.TOOLS) // 6
+    agent.TOOL_TOKENS = agent.estimate_tool_tokens(agent.TOOLS)
 
     # The permission mode is part of the experiment, so state it. Previous runs
     # inherited an interactive default with nothing to answer the prompt, so

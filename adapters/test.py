@@ -16,6 +16,11 @@ class TestAdapter:
         # Canned answers for successive ask_continue calls; the last one
         # repeats. Default: keep going.
         self._continue_answers = list(continue_answers or [True])
+        # How many times the core actually put the question. "Was it asked?"
+        # and "what was the answer?" are different assertions, and bypass mode
+        # is defined by the first: an adapter that always answers True looks
+        # identical to one that was never consulted.
+        self.continue_asks = 0
 
     def run(self, state, user_message=None) -> str:
         """Run a turn with this adapter as the state's responder.
@@ -44,6 +49,7 @@ class TestAdapter:
         return self._responder.ask(event)
 
     def ask_continue(self, event) -> bool:
+        self.continue_asks += 1
         if len(self._continue_answers) > 1:
             return self._continue_answers.pop(0)
         return self._continue_answers[0]

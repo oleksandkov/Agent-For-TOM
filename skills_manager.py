@@ -355,6 +355,36 @@ def improve_skill(name: str, addition: str,
     return write_skill(path, meta, merged)
 
 
+# A catalogue entry only has to be enough to *pick* a skill. The full text is
+# injected separately, in full, when a message actually triggers one — so
+# shipping every word of every description bought nothing and cost the same
+# tokens on every turn forever. One skill's description ran to a thousand
+# characters of trigger phrases ("open a website", "fill out a form", …), which
+# is guidance for the skill, not for choosing it.
+#
+# 60 is chosen against the section budget rather than by taste: with 45 skills
+# installed the untruncated list needed 6,879 characters, so 19 of them were
+# dropped entirely and the model could not know they existed. At 60 the whole
+# catalogue fits inside MAX_SKILLS_CHARS with room to spare. A terse entry is
+# still findable; a missing one is not, and the names carry most of the
+# meaning anyway.
+SKILL_SUMMARY_CHARS = 60
+
+
+def _summarise(description: str) -> str:
+    """First sentence, capped — enough to choose by, not the whole procedure."""
+    text = " ".join((description or "").split())
+    if len(text) <= SKILL_SUMMARY_CHARS:
+        return text
+    # Prefer a sentence boundary inside the budget; a clean stop reads better
+    # than a hard cut and is usually the summary sentence anyway.
+    window = text[:SKILL_SUMMARY_CHARS]
+    stop = max(window.rfind(". "), window.rfind("! "), window.rfind("? "))
+    if stop >= SKILL_SUMMARY_CHARS // 2:
+        return window[:stop + 1]
+    return window.rsplit(" ", 1)[0].rstrip(",;:") + "…"
+
+
 def build_skills_section(max_chars: Optional[int] = None) -> str:
     """
     Build a markdown section listing all installed skills and their
@@ -379,7 +409,7 @@ def build_skills_section(max_chars: Optional[int] = None) -> str:
 
     def render(s: dict) -> str:
         origin = " *(learned from your past sessions)*" if s.get("learned") else ""
-        return f"- **{s['name']}**: {s['description']}{origin}"
+        return f"- **{s['name']}**: {_summarise(s['description'])}{origin}"
 
     entries = [render(s) for s in skills]
     if max_chars is None:
