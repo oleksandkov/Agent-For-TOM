@@ -20,6 +20,7 @@ if str(PROJECT_DIR) not in sys.path:
 from adapters.test import TestAdapter
 from core.events import (
     ContinuationNeeded,
+    ErrorOccurred,
     LoopDetected,
     ToolFinished,
     ToolStarted,
@@ -335,6 +336,116 @@ class TestUsageAccounting(unittest.TestCase):
         self.assertEqual(state.usage["total_input"], 20)
         self.assertEqual(state.usage["input"], 10, "last call, for the ctx %")
         self.assertEqual(adapter.of(TurnFinished)[0].usage["total_output"], 10)
+
+
+class TestTruncationIsReported(unittest.TestCase):
+    """A turn cut off at the output limit must say so.
+
+    From a real session on `deepseek-v4-flash-free`. Four consecutive turns
+    showed `4,096 out` and no reply at all — the user asked "so where the
+    files?", "where it is?", "create it?" and got silence each time. The model
+    was a reasoning model spending the whole output budget thinking, hitting
+    the cap before emitting any text or tool call. `stop_reason` was read only
+    to answer "did it ask for tools?", so `max_tokens` fell through the same
+    branch as a normal finish and vanished.
+    """
+
+    def _run(self, content):
+        state = make_state(stub_client(FakeResponse(content, "max_tokens")))
+        adapter = TestAdapter()
+        reply = adapter.run(state, "make me a lab guide")
+        return state, adapter, reply
+
+    def test_an_empty_truncated_reply_is_retried_with_more_room(self):
+        # Recoverable exactly once: reporting and stopping leaves the user to
+        # discover an env var by themselves.
+        state, adapter, reply = self._run([])
+        errors = adapter.of(ErrorOccurred)
+        self.assertEqual(len(errors), 2, "expected an escalation then a report")
+        self.assertIn("Retrying once with", errors[0].message)
+        self.assertGreater(state.max_tokens, 8192)
+        self.assertEqual(reply, "")
+
+    def test_the_escalation_is_bounded(self):
+        from core.loop import MAX_OUTPUT_CEILING
+        state, _, _ = self._run([])
+        self.assertLessEqual(state.max_tokens, MAX_OUTPUT_CEILING)
+
+    def test_it_only_escalates_once_per_turn(self):
+        # Otherwise a model that never answers loops, quadrupling the bill.
+        _, adapter, _ = self._run([])
+        self.assertEqual(
+            len([e for e in adapter.of(ErrorOccurred)
+                 if "Retrying once with" in e.message]), 1)
+
+    def test_the_final_message_changes_the_advice(self):
+        # After escalation has been spent, "raise the limit" is no longer the
+        # useful move — the shape of the request is.
+        _, adapter, _ = self._run([])
+        final = adapter.of(ErrorOccurred)[-1].message
+        self.assertIn("one piece at a time", final)
+
+    def test_a_partial_reply_is_not_retried(self):
+        # The model was writing, so re-running only re-bills the same work.
+        state, adapter, reply = self._run([text_block("ЛАБОРАТОРНА РОБОТА №6")])
+        self.assertEqual(state.max_tokens, 8192)
+        self.assertEqual(
+            [e for e in adapter.of(ErrorOccurred)
+             if "Retrying once with" in e.message], [])
+
+    def test_a_partial_reply_is_kept_but_flagged(self):
+        state, adapter, reply = self._run([text_block("ЛАБОРАТОРНА РОБОТА №6")])
+        self.assertIn("ЛАБОРАТОРНА", reply, "half a document still beats none")
+        self.assertIn("cut off", adapter.of(ErrorOccurred)[0].message)
+
+    def test_the_failure_is_recorded_for_the_session_file(self):
+        # Otherwise the transcript saves as a turn that simply produced nothing.
+        state, _, _ = self._run([])
+        self.assertIn("max_tokens", state.last_error or "")
+
+    def test_a_normal_finish_reports_nothing(self):
+        state = make_state(stub_client(FakeResponse([text_block("done")], "end_turn")))
+        adapter = TestAdapter()
+        adapter.run(state, "hi")
+        self.assertEqual(adapter.of(ErrorOccurred), [])
+
+    def test_a_truncated_tool_request_is_not_flagged_as_a_dead_end(self):
+        # stop_reason "tool_use" means the call did come through.
+        state = make_state(stub_client(
+            FakeResponse([tool_block()], "tool_use"),
+            FakeResponse([text_block("done")], "end_turn"),
+        ))
+        adapter = TestAdapter()
+        adapter.run(state, "go")
+        self.assertEqual(adapter.of(ErrorOccurred), [])
+
+
+class TestOutputTokenCeiling(unittest.TestCase):
+    """Nothing probes max_output_tokens, so its default is the real limit."""
+
+    def test_the_default_is_not_below_the_agent_ceiling(self):
+        import agent
+        import provider_manager
+        default = provider_manager.Capabilities().max_output_tokens
+        # agent applies min(MAX_TOKENS, max_output_tokens) as a hard ceiling, so
+        # a low unmeasured default silently caps every provider. It was 4096.
+        self.assertGreaterEqual(default, agent.MAX_TOKENS)
+
+    def test_the_ceiling_is_configurable(self):
+        import os
+
+        import agent
+        saved = os.environ.get("AGENT_MAX_TOKENS")
+        try:
+            os.environ["AGENT_MAX_TOKENS"] = "32000"
+            self.assertEqual(agent._env_int("AGENT_MAX_TOKENS", 8192, 256), 32000)
+            for junk in ("", "abc", "0", "-5"):
+                os.environ["AGENT_MAX_TOKENS"] = junk
+                self.assertEqual(agent._env_int("AGENT_MAX_TOKENS", 8192, 256), 8192)
+        finally:
+            os.environ.pop("AGENT_MAX_TOKENS", None)
+            if saved is not None:
+                os.environ["AGENT_MAX_TOKENS"] = saved
 
 
 if __name__ == "__main__":

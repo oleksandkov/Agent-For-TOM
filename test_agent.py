@@ -54,6 +54,31 @@ def section(title: str):
     print(f"\n{SECTION} {title}")
 
 
+def _cleanup_test_memory(key: str, fact_text: str) -> None:
+    """Undo a save_memory the suite performed against the real ~/.tomas store.
+
+    This suite deliberately exercises the real write path, so it has to put the
+    store back. It did not, and the fixture fact ended up being retrieved into
+    genuine prompts.
+    """
+    try:
+        import learning
+        (Path.home() / ".tomas" / "memory" / f"{key}.md").unlink(missing_ok=True)
+        index = Path.home() / ".tomas" / "memory" / "MEMORY.md"
+        if index.exists():
+            kept = [ln for ln in index.read_text(encoding="utf-8").splitlines()
+                    if f"{key}.md" not in ln]
+            index.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        for scope in ("global", "project"):
+            facts = learning.load_facts(scope)
+            remaining = [f for f in facts if f.get("fact") != fact_text]
+            if len(remaining) != len(facts):
+                from learning.store import save_facts
+                save_facts(scope, remaining)
+    except Exception:
+        pass
+
+
 # ─────────────────────────────────────────────────────────────────────
 # 1. Built-in tool handlers
 # ─────────────────────────────────────────────────────────────────────
@@ -103,6 +128,9 @@ def test_builtin_tools():
     check("save_memory works", "Saved memory" in out, out[:80])
     mem_file = Path.home() / ".tomas" / "memory" / "test-key.md"
     check("save_memory writes file", mem_file.exists())
+    # Clean up: this writes to the *real* store, and "test desc: test content"
+    # was found sitting in a live prompt's retrieved-context block.
+    _cleanup_test_memory("test-key", "test desc: test content")
 
     # fetch_url
     out = agent.handle_fetch_url({"url": "https://example.com"})

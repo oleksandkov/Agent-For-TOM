@@ -102,7 +102,16 @@ class Capabilities:
     vision: bool = False
     context_window: int = 200_000  # standard Claude tier; probing narrows this per-model
     max_tools: int = 128
-    max_output_tokens: int = 4096
+    # 8192, not 4096. Nothing probes this field — grep it — so the default is
+    # the value every provider actually runs with, and `agent.py` applies it as
+    # `min(MAX_TOKENS, max_output_tokens)`, i.e. a hard ceiling. A pessimistic
+    # unmeasured guess therefore capped *every* provider at 4096 output tokens
+    # forever, which breaks reasoning models outright: they spend the budget on
+    # internal reasoning, get truncated before emitting any content or tool
+    # call, and the turn comes back empty. That is this class's documented
+    # contract violated by its own default — "defaults are the optimistic case;
+    # probing only ever narrows them".
+    max_output_tokens: int = 8192
     probed_at: float = 0.0
 
     @property
@@ -170,19 +179,72 @@ class Provider:
 #  Config file
 # ══════════════════════════════════════════════════════════════════════
 
+EMPTY_CONFIG = {"active": None, "providers": {}}
+
+
 def load_config() -> dict:
+    """Read the provider config, preserving anything unreadable.
+
+    This used to swallow every exception and return an empty config, which is
+    indistinguishable from "no providers configured". The next `save_config`
+    then wrote that emptiness over the real file — one unreadable byte and
+    every configured provider was gone, silently. A file that fails to parse is
+    now moved aside with its contents intact, so the loss is recoverable and
+    visible instead of total and quiet.
+    """
+    if not PROVIDERS_CONFIG_PATH.exists():
+        return dict(EMPTY_CONFIG)
     try:
-        if PROVIDERS_CONFIG_PATH.exists():
-            return json.loads(PROVIDERS_CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {"active": None, "providers": {}}
+        raw = PROVIDERS_CONFIG_PATH.read_text(encoding="utf-8")
+    except OSError:
+        # Cannot read it *right now* (locked, permissions). Do not treat a
+        # transient failure as "the user has no providers".
+        return dict(EMPTY_CONFIG)
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        try:
+            quarantine = PROVIDERS_CONFIG_PATH.with_name(
+                f"providers.json.corrupt-{int(time.time())}")
+            PROVIDERS_CONFIG_PATH.replace(quarantine)
+        except OSError:
+            pass
+        return dict(EMPTY_CONFIG)
+    return parsed if isinstance(parsed, dict) else dict(EMPTY_CONFIG)
 
 
 def save_config(config: dict) -> None:
+    """Write the provider config atomically, keeping one generation back.
+
+    A direct `write_text` truncates the target before the new bytes land, so an
+    interrupted write leaves nothing at all. This writes a sibling temp file and
+    replaces, which on Windows and POSIX alike is atomic — the file is either
+    the old config or the new one, never a hole.
+    """
     PROVIDERS_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PROVIDERS_CONFIG_PATH.write_text(
-        json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    payload = json.dumps(config, indent=2, ensure_ascii=False)
+
+    # Keep the previous generation. Cheap insurance against a caller that
+    # passes an empty config by mistake.
+    if PROVIDERS_CONFIG_PATH.exists():
+        try:
+            backup = PROVIDERS_CONFIG_PATH.with_name("providers.json.bak")
+            backup.write_text(
+                PROVIDERS_CONFIG_PATH.read_text(encoding="utf-8"),
+                encoding="utf-8")
+        except OSError:
+            pass
+
+    tmp = PROVIDERS_CONFIG_PATH.with_name(f"providers.json.tmp{os.getpid()}")
+    try:
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(PROVIDERS_CONFIG_PATH)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def list_providers() -> list[Provider]:

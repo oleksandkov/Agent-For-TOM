@@ -117,7 +117,20 @@ from adapters.terminal import TerminalAdapter
 MODEL = os.environ.get("AGENT_MODEL")
 PROJECT_DIR = Path(os.environ.get("AGENT_PROJECT_DIR", os.getcwd())).resolve()
 MEMORY_DIR = Path.home() / ".tomas" / "memory"
-MAX_TOKENS = 8192
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    """An int from the environment, ignoring anything unusable."""
+    try:
+        value = int(os.environ.get(name, "").strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value >= minimum else default
+
+
+# Output-token ceiling per turn. Overridable because the right value depends on
+# the model: a reasoning model spends most of this budget thinking before it
+# writes anything, so a limit that is generous for a chat model truncates it to
+# nothing. Raise it when a long document or a reasoning model gets cut off.
+MAX_TOKENS = _env_int("AGENT_MAX_TOKENS", 8192, minimum=256)
 COMPACTION_THRESHOLD = 0.75  # compact when total budget (msg_tok + TOOL_TOKENS + MAX_TOKENS) exceeds this fraction of CONTEXT_WINDOW
 DEFAULT_CONTEXT_WINDOW = 200_000  # fallback if API doesn't report context window (standard Claude tier)
 CONTEXT_WINDOW = DEFAULT_CONTEXT_WINDOW  # will be updated dynamically at startup
@@ -1509,6 +1522,23 @@ Rules:
 - Use absolute or project-relative paths.
 - If a task is done, stop calling tools and summarize.
 - Memory files listed in the memory index can be read with read_file when you need their detail.
+
+Memory and self-improvement:
+- When the user states a durable preference, correction, or rule -- "always...",
+  "never...", "from now on...", "I prefer...", or a correction to something you
+  just did -- call save_memory in that same turn. Do not wait to be asked to
+  remember it, and do not merely acknowledge it in prose: an acknowledgement is
+  forgotten when the session ends, a saved memory is not.
+- Phrase what you save the way the user phrased it. A rule meant for every reply
+  ("always end with the date") must be saved in those words, because that is what
+  makes it apply on every later turn rather than only when the topic comes up.
+- Any standing rule already in your system prompt applies to EVERY reply in this
+  session -- including replies about a completely unrelated topic, and including
+  turns that are mostly tool calls. Following it on turn 1 and forgetting it by
+  turn 20 is the failure to avoid.
+- Before producing substantial work for a returning user, apply what you have
+  been told about their conventions, terminology and formatting, rather than a
+  generic default.
 - A denied tool call will stay denied. Do not re-issue it with different wording.
 - Reply in the language the user wrote in.
 - Never say a file was created, saved, edited, or a task was completed unless
@@ -1525,6 +1555,20 @@ Rules:
   generator, glue you will not need again -- is not a deliverable. Put it in
   a temp directory outside the project, or skip the file and pass the code to
   `run_command` directly. Only what the user asked for belongs in their repo.
+
+Large deliverables:
+- You have a per-reply output limit. A long document -- a methodichka, a
+  report, a multi-section guide -- will not fit in one reply, and a reply that
+  hits the limit is thrown away: the user gets nothing at all.
+- So do not compose a long document in your reply text. Build it on disk,
+  section by section: write_file the first section, then edit_file to append
+  each following one. Each tool call is a separate turn with its own budget, so
+  a document of any length is reachable this way, and progress survives even if
+  a later turn fails.
+- Say which section you are on as you go, so the user can see progress rather
+  than waiting through several silent turns.
+- Only after the file is complete and you have verified it with read_file do
+  you convert it (e.g. word-docs convert_to_pdf) or summarise it to the user.
 - .docx, .pdf, .xlsx and .pptx are structured containers, not text.
   write_file cannot produce them. Build a Word document with the word-docs
   MCP tools (create_document, then add_heading / add_paragraph / add_table),
@@ -1589,6 +1633,7 @@ def _truncate_section(text: str, max_chars: int, label: str = "") -> str:
 
 # Maximum size for each system-prompt section (in characters)
 MAX_INSTRUCTIONS_CHARS = 8000       # AGENTS.md + global instructions
+MAX_DIRECTIVES_CHARS = 1000         # standing rules (bounded by MAX_DIRECTIVES too)
 MAX_LEARNED_CHARS = 1500            # retrieved facts (bounded by k, not by store size)
 MAX_SKILLS_CHARS = 4000             # skills section
 MAX_TRIGGERED_SKILL_CHARS = 6000    # full body of a skill this message triggers
@@ -1620,6 +1665,30 @@ def build_system_prompt(user_message: str = "") -> str:
             legacy = _truncate_section(legacy, 2000, candidate.name)
             prompt += f"\n\n# Agent Instructions ({candidate.name})\n{legacy}"
             break
+    # ── Standing rules — always on, never retrieved ──
+    # This sits here, directly after the instructions section, for a measured
+    # reason. A 30-turn session ran two standing rules at once: "end with My
+    # Lord" from AGENT.md (static, imperative heading) was obeyed 29/29; "append
+    # the date" from the fact store (retrieved, filed under "What I've learned")
+    # was obeyed 0/29 — while being present in the prompt on all 29 turns. The
+    # rule was never the problem; the channel was. Directives now ride the
+    # channel that gets complied with, and are phrased as orders, not notes.
+    try:
+        directives = learning.directives_for_prompt()
+        if directives:
+            directives = _truncate_section(directives, MAX_DIRECTIVES_CHARS,
+                                           "standing rules")
+            prompt += (
+                "\n\n# Standing rules from the user — these apply to EVERY reply\n"
+                "You MUST follow every rule below on every single turn. They "
+                "apply even when the current message is about something else "
+                "entirely, and even on turns where you mostly call tools. These "
+                "are not background information about the user; they are "
+                "instructions to you, and the user checks whether you followed "
+                "them.\n\n"
+                f"{directives}")
+    except Exception:
+        pass
     # ── What the agent has learned — retrieved, not dumped ──
     # This replaces the old memory-index dump, the notes dump and the tips
     # block. Those three grew with everything ever learned until entries
@@ -1629,7 +1698,11 @@ def build_system_prompt(user_message: str = "") -> str:
         learned = learning.recall(user_message, k=5)
         if learned:
             learned = _truncate_section(learned, MAX_LEARNED_CHARS, "learned")
-            prompt += ("\n\n# What I've learned about this user and project\n"
+            # Heading rewritten from "What I've learned about this user and
+            # project". That phrasing read as a dossier and the model treated it
+            # as trivia. Same data, actionable framing.
+            prompt += ("\n\n# Context retrieved for this message — apply what is "
+                       "relevant\n"
                        f"{learned}")
     except Exception:
         pass
@@ -1676,9 +1749,15 @@ def save_memory(key: str, description: str, content: str) -> None:
     """Persist an explicit "remember this" from the user.
 
     Writes the markdown file (still useful to read and edit by hand) and
-    records the same thing as an `explicit` fact, which is what retrieval
-    actually reads. Explicit means the user said it outright — no inference —
-    so it goes active immediately rather than through the evidence gate.
+    records the same thing as a fact, which is what the prompt actually reads.
+    Either way the user said it outright — no inference — so it goes active
+    immediately rather than through the evidence gate.
+
+    The kind decides which prompt channel it lands in, and that decision is
+    what determines whether it gets followed. An unconditional rule ("always
+    append the date") becomes a `directive` and is injected on every turn; a
+    conditional preference ("prefers PowerShell") stays `explicit` and is
+    retrieved when the topic comes up.
     """
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     filename = f"{key.replace(' ', '-').lower()}.md"
@@ -1702,7 +1781,12 @@ def save_memory(key: str, description: str, content: str) -> None:
 
     if learning.is_enabled():
         try:
-            learning.remember("explicit", f"{description}: {content}".strip(": "),
+            body = f"{description}: {content}".strip(": ")
+            # Classify on the whole record: the rule wording can live in either
+            # half ("Never delete logs" / "see the runbook").
+            kind = (learning.KIND_DIRECTIVE if learning.looks_like_directive(body)
+                    else learning.KIND_EXPLICIT)
+            learning.remember(kind, body,
                               evidence=f"user asked to remember '{key}'",
                               scope="global")
         except Exception:
@@ -1730,6 +1814,10 @@ def init_learning() -> None:
         if imported:
             print(f'  {GREEN}✦{RESET} {DIM}Imported {imported} existing '
                   f'memories/notes into the learning store{RESET}')
+        repaired = learning.repair_frontmatter_facts()
+        if repaired.get("repaired"):
+            print(f'  {GREEN}✦{RESET} {DIM}Repaired {repaired["repaired"]} '
+                  f'learned fact(s) that had note metadata baked in{RESET}')
     except Exception:
         pass
 
@@ -1743,6 +1831,13 @@ def reflect_on_session_end(messages: list) -> None:
     """
     if not learning.is_enabled():
         return
+    try:
+        # Corrections first: deterministic, free, and independent of whether
+        # the reflection model call succeeds. A provider outage at session end
+        # should not cost the user the one signal they gave explicitly.
+        learning.promote_corrections(messages)
+    except Exception:
+        pass
     try:
         learning.run_session_reflection(messages, call_model=_learning_call_model)
         for scope in ("global", "project"):
@@ -1844,11 +1939,16 @@ def _render_reflection_log(limit: int = 5) -> str:
                     "skill_candidates")):
             lines.append(f'      {DIM}(learned nothing — the correct answer '
                          f'for most sessions){RESET}')
-    mode_now = os.environ.get("TOMAS_REFLECT", "shadow")
+    mode_now = learning.reflect_mode()
     if mode_now == "shadow":
         lines.append('')
         lines.append(f'  {DIM}Shadow mode: nothing above was written to the '
-                     f'store. Set TOMAS_REFLECT=active to enable.{RESET}')
+                     f'store. Unset TOMAS_REFLECT to enable (active is the '
+                     f'default).{RESET}')
+    elif mode_now == "off":
+        lines.append('')
+        lines.append(f'  {DIM}Reflection is off (TOMAS_REFLECT=off). Nothing is '
+                     f'learned from finished sessions.{RESET}')
     return '\n'.join(lines)
 
 # ---------------------------------------------------------------------------
@@ -2177,6 +2277,150 @@ def _run_text_protocol(state, adapter, reply: str, messages: list) -> str:
     return reply
 
 
+# ── Deterministic rule capture ─────────────────────────────────────────
+# A live run exposed the other half of the problem. Told "Rule one: always end
+# every reply with the date. Save that to memory", the model replied "Saved."
+# and never called save_memory — three times in a row, in a session whose tool
+# log shows ten calls and not one of them a write. BASE_PROMPT already forbids
+# claiming an action was taken without calling the tool; a weak model ignored
+# it anyway.
+#
+# Retrieval was only ever half the loop. If capture depends on the model
+# choosing to call a tool, then on a model that does not, the user's rule is
+# lost while being told it was kept — which is worse than refusing outright.
+# So when the user states a rule *and* asks for it to be saved, save it here,
+# deterministically, before the model gets a chance not to.
+#
+# Both signals are required. Either alone is too loose: "always run the tests
+# first" is conversation, and "save this file" is not a rule.
+_SAVE_REQUEST = re.compile(
+    r"\b(?:save|remember|store|keep)\b.{0,30}?"
+    r"\b(?:that|this|it|them|memory|rules?|preferences?)\b"
+    # Ukrainian writes this with U+02BC (ʼ) or U+2019 (’) far more often than
+    # with an ASCII quote, and matching only ' silently drops the whole
+    # language — the one this agent defaults to.
+    r"|запам['’ʼʹ]?ятай|\b(?:збережи|запомни|сохрани)\b"
+    r"|\bfrom now on\b|\bвідтепер\b|\bотныне\b",
+    re.IGNORECASE,
+)
+
+
+def capture_stated_rule(user_text: str) -> Optional[str]:
+    """Persist a rule the user stated and asked to have saved.
+
+    Returns the text captured, or None. Never raises — nothing in the learning
+    path may break the user's turn.
+    """
+    text = (user_text or "").strip()
+    if not text or len(text) > 600:
+        return None
+    if not _SAVE_REQUEST.search(text):
+        return None
+    try:
+        if not learning.is_enabled() or not learning.looks_like_directive(text):
+            return None
+        learning.remember(learning.KIND_DIRECTIVE, text,
+                          evidence="user stated it and asked to save it",
+                          scope="global")
+        return text
+    except Exception:
+        return None
+
+
+# ── Standing-rule reinforcement ────────────────────────────────────────
+# Compliance in the transcripts is bimodal *per session*, not per turn: whatever
+# the model did on turn 1 it kept doing for the next 29, whether or not that
+# matched the rule. That is transcript momentum, and a system prompt alone does
+# not beat it — the conversation is simply the louder signal by turn 20. So the
+# rules are also restated in-context, periodically and briefly.
+STANDING_RULE_REMINDER_EVERY = 10
+_REMINDER_OPEN = "<standing-rules>"
+_REMINDER_CLOSE = "</standing-rules>"
+
+
+def _reinforce_standing_rules(messages: list) -> None:
+    """Every Nth user turn, restate the standing rules inside the conversation.
+
+    Appended to the user's own message rather than sent as a separate turn, so
+    it cannot be mistaken for something the user said on its own and cannot
+    desynchronise the user/assistant alternation some providers require.
+    """
+    if not messages or messages[-1].get("role") != "user":
+        return
+    user_turns = sum(1 for m in messages
+                     if m.get("role") == "user" and isinstance(m.get("content"), str))
+    if user_turns == 0 or user_turns % STANDING_RULE_REMINDER_EVERY != 0:
+        return
+    try:
+        rules = learning.directives_for_prompt()
+    except Exception:
+        return
+    if not rules:
+        return
+    content = messages[-1].get("content")
+    if not isinstance(content, str) or _REMINDER_OPEN in content:
+        return
+    messages[-1]["content"] = (
+        f"{content}\n\n{_REMINDER_OPEN}\n"
+        f"Still in force — these applied to every reply so far and apply to "
+        f"this one:\n{rules}\n{_REMINDER_CLOSE}"
+    )
+
+
+def _text_of_message(message: dict) -> str:
+    """The plain text of a message, whatever block shape it arrived in."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    parts = []
+    for block in content or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+    return "\n".join(parts)
+
+
+def _intercept_slash_command(messages: list) -> Optional[str]:
+    """Run a `/command` that arrived as a *message* rather than as REPL input.
+
+    `handle_slash_command` used to be reachable only from the REPL's own input
+    path, so a harness, a subagent, or a pasted script that sent "/status" as a
+    message got it forwarded to the model as prose. The model then either
+    invented the output or tried to shell out to reimplement the command — both
+    observed, repeatedly, in the session transcripts.
+
+    Unknown commands deliberately fall through to the model: a message that
+    merely begins with a path must not be swallowed. `//` escapes a literal
+    leading slash.
+
+    The name is matched against SLASH_COMMANDS *before* dispatching, rather
+    than relying on the handler's return value — the handler answers an
+    unrecognised command with the help screen, not with None, so dispatching
+    first would turn "/usr/local/bin is where it lives" into a help dump.
+    """
+    if not messages or messages[-1].get("role") != "user":
+        return None
+    text = _text_of_message(messages[-1]).strip()
+    if not text.startswith("/") or text.startswith("//"):
+        return None
+    # Only a single-line command — a code block that happens to open with a
+    # slash is not an instruction to the REPL.
+    if "\n" in text:
+        return None
+    name = text[1:].split(maxsplit=1)[0].lower() if len(text) > 1 else ""
+    if name not in SLASH_COMMANDS:
+        return None
+    try:
+        result = handle_slash_command(text[1:], messages)
+    except Exception:
+        return None
+    if result is None:
+        return None
+    # The command consumed the turn; drop the user message so the transcript
+    # does not carry a prompt that never reached the model.
+    messages.pop()
+    return result
+
+
 def agent_loop(system_prompt: str, messages: list) -> str:
     """Shim — drives core.loop.run_turn through the terminal adapter.
 
@@ -2184,6 +2428,20 @@ def agent_loop(system_prompt: str, messages: list) -> str:
     should drive run_turn directly with their own adapter instead.
     """
     global _streaming_disabled
+
+    handled = _intercept_slash_command(messages)
+    if handled is not None:
+        return handled
+
+    # Capture before the model call, so the rule is stored whether or not the
+    # model bothers to call save_memory — and so it is already in the prompt
+    # this same turn rather than only from the next one.
+    if messages and messages[-1].get("role") == "user":
+        captured = capture_stated_rule(_text_of_message(messages[-1]))
+        if captured:
+            system_prompt = build_system_prompt(_text_of_message(messages[-1]))
+
+    _reinforce_standing_rules(messages)
 
     interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
     adapter = TerminalAdapter(interactive=interactive)
@@ -2267,14 +2525,26 @@ SLASH_COMMANDS = {
     "load":         {"desc": "Load a saved session: /load <id>",  "icon": "📂"},
     "session":      {"desc": "Session mgmt: list/save/continue",  "icon": "📋"},
     "sessions":     {"desc": "Alias for /session list",            "icon": "📋"},
+    "rules":        {"desc": "Standing rules applied to every reply",  "icon": "📌"},
     "note":         {"desc": "Create a self-note: /note <title> <content>", "icon": "📝"},
     "notes":        {"desc": "List all self-notes",               "icon": "📒"},
     "exit":         {"desc": "Exit TOMAS",                        "icon": "✕"},
 }
 
 def _get_model() -> str:
-    """Read model from environment."""
-    return os.environ.get("AGENT_MODEL") or "Not set"
+    """Read model from environment or active provider configuration."""
+    model = os.environ.get("AGENT_MODEL")
+    if model:
+        return model
+    try:
+        import provider_manager
+        active = provider_manager.get_active()
+        if active and active.model:
+            return active.model
+    except Exception:
+        pass
+    return "Not set"
+
 
 
 # The keys the prompt actually binds. Kept next to the help renderer so a new
@@ -2286,6 +2556,8 @@ KEY_HELP = [
     ("Esc",          "clear the line"),
     ("Ctrl+W",       "delete the last word"),
     ("Ctrl+U",       "clear the line"),
+    ("Ctrl+Z",       "undo the last clear, paste or history recall"),
+    ("Ctrl+Y",       "copy the line to the clipboard · ↑ first to copy an older one"),
     ("Ctrl+L",       "clear the screen, keep what is typed"),
     ("Ctrl+C",       "cancel"),
     ("⇧+Space",      "toggle auto-approve"),
@@ -2777,6 +3049,52 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
         return (f'  {GREEN}✓{RESET} Incognito: nothing from this session will be '
                 f'reflected on or stored.')
 
+    # ── Standing rules ──
+    if cmd == "rules":
+        rest = (parts[1] if len(parts) > 1 else "").strip()
+        if rest.startswith("forget"):
+            target = rest.split(maxsplit=1)
+            if len(target) < 2:
+                return (f'  {YELLOW}Usage:{RESET} {CYAN}/rules forget <id>{RESET}')
+            removed = learning.forget(target[1].strip())
+            if not removed:
+                return f'  {DIM}No rule with id {target[1].strip()}.{RESET}'
+            # Precise about what a tombstone does: it stops *reflection*
+            # inferring the rule again. Stating it yourself still brings it
+            # back, which is the behaviour you want — otherwise one /forget
+            # would permanently blacklist a rule you later change your mind on.
+            return (f'  {GREEN}✓{RESET} Rule removed: '
+                    f'{removed.get("fact", "")[:70]}\n'
+                    f'  {DIM}Reflection will not infer it again. Telling me the '
+                    f'rule yourself still restores it.{RESET}')
+
+        directives = learning.load_directives()
+        if not directives:
+            return (f'  {DIM}No standing rules. Tell me one ("always end every '
+                    f'reply with the date") and it will be saved.{RESET}')
+
+        today = time.strftime("%Y-%m-%d")
+        conflicts = learning.find_conflicts(directives)
+        in_conflict = {i for pair in conflicts for i in pair}
+        lines = [f'  {BOLD}Standing rules ({len(directives)}){RESET}',
+                 f'  {DIM}Applied to every reply, on every turn.{RESET}',
+                 f'  {DIM}{"─" * 60}{RESET}']
+        for i, fact in enumerate(directives, 1):
+            text = (fact.get("fact") or "").replace("\n", " ")[:96]
+            fid = fact.get("id", "?")
+            lines.append(f'  {i}. {text}')
+            notes = []
+            expired = learning.stale_dates(fact.get("fact", ""), today)
+            if expired:
+                notes.append(f'names {", ".join(expired)}, today is {today}')
+            if fid in in_conflict:
+                notes.append('conflicts with another rule')
+            note = f'  {YELLOW}⚠ {"; ".join(notes)}{RESET}' if notes else ''
+            lines.append(f'     {DIM}{fid}{RESET}{note}')
+        lines.append('')
+        lines.append(f'  {DIM}Remove one with{RESET} {CYAN}/rules forget <id>{RESET}')
+        return "\n".join(lines)
+
     # ── Self-note commands ──
     if cmd == "note":
         # parts is split with maxsplit=1: parts[1] = "title content..."
@@ -2921,6 +3239,25 @@ def grab_clipboard_image(dest: Path) -> bool:
         return False
 
 
+def put_clipboard_text(text: str) -> bool:
+    """Put `text` on the clipboard. False if it could not be done.
+
+    `clip.exe` is on every Windows box and takes its input on stdin, so there
+    is nothing to quote or escape — which matters here, because the thing being
+    copied is arbitrary user text full of quotes, newlines and Cyrillic. It
+    writes whatever bytes it is given, so the encoding is stated outright
+    rather than left to the console code page.
+    """
+    if sys.platform != "win32" or not text:
+        return False
+    try:
+        proc = subprocess.run(["clip"], input=text.encode("utf-16-le"),
+                              capture_output=True, timeout=10)
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
 def _image_paths_in(text: str) -> list[Path]:
     """Existing image files named anywhere in the message.
 
@@ -3042,6 +3379,12 @@ def read_input_with_suggestions(prompt: str) -> str:
     drawn_rows = 1               # rows the input block occupied on the last draw
     pastes: dict[str, str] = {}  # placeholder -> the text it stands in for
     escape_armed = False         # an Esc on an empty line; a second one exits
+    # Undo history for Ctrl+Z. Snapshots are taken before a *destructive* edit
+    # only — Ctrl+U, Ctrl+W, a paste, a history recall. Typing is not
+    # snapshotted per character: undoing one letter at a time is useless, and
+    # the keystroke that actually needs taking back is the one that wiped a
+    # long prompt in a single press.
+    undo_stack: list[list[str]] = []
 
     # Reset history navigation to past-the-end
     _history_index = len(_input_history)
@@ -3086,6 +3429,21 @@ def read_input_with_suggestions(prompt: str) -> str:
 
     def _repr() -> str:
         return ''.join(buffer)
+
+    def _checkpoint() -> None:
+        """Remember the line before something destructive happens to it."""
+        if undo_stack and undo_stack[-1] == buffer:
+            return                       # nothing changed since the last one
+        undo_stack.append(list(buffer))
+        if len(undo_stack) > 50:
+            undo_stack.pop(0)
+
+    def _flash(message: str) -> None:
+        """One-line feedback under the prompt, gone on the next redraw."""
+        sys.stdout.write('\033[1B\r\033[2K'
+                         f'  {DIM}{message}{RESET}'
+                         '\033[1A\r')
+        sys.stdout.flush()
 
     def _is_slash() -> bool:
         return _repr().startswith('/')
@@ -3245,6 +3603,9 @@ def read_input_with_suggestions(prompt: str) -> str:
         its size instead of its content. `_expand` puts the real text back at
         send time, so the model still receives all of it.
         """
+        if not text:
+            return
+        _checkpoint()   # a paste is one keystroke's worth of damage to undo
         if len(text) >= PASTE_COLLAPSE_CHARS:
             lines = text.count('\n') + 1
             marker = (f'[#{len(pastes) + 1} pasted {len(text)} chars'
@@ -3321,6 +3682,7 @@ def read_input_with_suggestions(prompt: str) -> str:
             # keystroke the user meant as "copy".
             if ch == '\x03':
                 if buffer:
+                    _checkpoint()
                     buffer.clear()
                     selected = None
                     _hide()
@@ -3364,18 +3726,20 @@ def read_input_with_suggestions(prompt: str) -> str:
                 elif ext == 'H':  # ↑ Up arrow — history recall
                     if _input_history:
                         _hide()
+                        _checkpoint()   # recall replaces whatever was typed
                         if _history_index > 0:
                             _history_index -= 1
-                        buffer = list(_input_history[_history_index])
+                        buffer[:] = list(_input_history[_history_index])
                         _refresh()
                 elif ext == 'P':  # ↓ Down arrow — history forward
                     _hide()
+                    _checkpoint()
                     if _history_index < len(_input_history) - 1:
                         _history_index += 1
-                        buffer = list(_input_history[_history_index])
+                        buffer[:] = list(_input_history[_history_index])
                     else:
                         _history_index = len(_input_history)
-                        buffer = []
+                        buffer.clear()
                     _refresh()
                 # ← / → are silently consumed
                 continue
@@ -3430,6 +3794,7 @@ def read_input_with_suggestions(prompt: str) -> str:
             # way to correct a long prompt one character at a time. Ctrl+W and
             # Ctrl+U are the two readline keys that pay off without one.
             if ch == '\x17':
+                _checkpoint()
                 while buffer and buffer[-1].isspace():
                     buffer.pop()
                 while buffer and not buffer[-1].isspace():
@@ -3442,10 +3807,47 @@ def read_input_with_suggestions(prompt: str) -> str:
             # ── Ctrl+U — clear the input line ─────────────────────────────
             if ch == '\x15':
                 if buffer:
+                    _checkpoint()
                     buffer.clear()
                     selected = None
                     _hide()
                     _refresh()
+                continue
+
+            # ── Ctrl+Z — undo the last destructive edit ───────────────────
+            # Ctrl+U and Ctrl+W each destroy work in one keystroke and there
+            # was no way back: a long prompt cleared by a mistyped Ctrl+U had
+            # to be typed again from scratch. This restores the line as it was
+            # before that press, repeatedly, back to the start of the turn.
+            if ch == '\x1a':
+                if undo_stack:
+                    buffer[:] = undo_stack.pop()
+                    selected = None
+                    _hide()
+                    _refresh()
+                    if _is_slash():
+                        _show()
+                else:
+                    _flash('nothing to undo')
+                continue
+
+            # ── Ctrl+Y — copy the current line to the clipboard ───────────
+            # Ctrl+C cannot do this: the terminal intercepts it whenever a
+            # selection exists and only forwards it here when there is none,
+            # so binding copy to it would work about half the time. Paired
+            # with ↑, this copies *any* earlier prompt — recall it, press
+            # Ctrl+Y — which beats reselecting it with the mouse across a
+            # block that may have scrolled.
+            if ch == '\x19':
+                text = _expand(_repr())
+                if not text.strip():
+                    _flash('nothing to copy')
+                elif put_clipboard_text(text):
+                    lines = text.count('\n') + 1
+                    _flash(f'copied {len(text)} chars'
+                           f'{f" · {lines} lines" if lines > 1 else ""} to clipboard')
+                else:
+                    _flash('could not reach the clipboard')
                 continue
 
             # ── Ctrl+G — attach the image on the clipboard ─────────────────
@@ -3727,7 +4129,9 @@ def main() -> int:
 
     print(f'  {DIM}─── Type {RESET}{BOLD}quit{RESET}{DIM} or {RESET}{BOLD}exit{RESET}{DIM} to leave · {RESET}{BOLD}/help{RESET}{DIM} for commands · {RESET}{BOLD}Esc Esc{RESET}{DIM} also exits ───{RESET}')
     print(f'  {DIM}    {RESET}{BOLD}Shift+Enter{RESET}{DIM} newline · paste keeps its line breaks · '
-          f'{RESET}{BOLD}Ctrl+G{RESET}{DIM} attach clipboard image · {RESET}{BOLD}Ctrl+C{RESET}{DIM} copies{RESET}')
+          f'{RESET}{BOLD}Ctrl+G{RESET}{DIM} attach clipboard image{RESET}')
+    print(f'  {DIM}    {RESET}{BOLD}Ctrl+Y{RESET}{DIM} copy the line ({RESET}{BOLD}↑{RESET}{DIM} first for an '
+          f'earlier one) · {RESET}{BOLD}Ctrl+Z{RESET}{DIM} undo a clear or paste{RESET}')
     print()
 
     messages: list = []

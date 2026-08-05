@@ -51,6 +51,109 @@ STATUS_OBSERVED = "observed"
 STATUS_CANDIDATE = "candidate"
 STATUS_ACTIVE = "active"
 
+# ── Kinds ──────────────────────────────────────────────────────────────
+# `directive` is the one kind retrieval must never own. The rest are beliefs
+# about the user or the code — conditional, topical, correctly selected by
+# relevance. A directive is unconditional ("always end with X"), so scoring it
+# against the current message is a category error: the message it is relevant
+# to is *every* message. Directives bypass recall entirely and are injected
+# whole, every turn, in the imperative section of the prompt.
+KIND_DIRECTIVE = "directive"
+KIND_EXPLICIT = "explicit"
+
+# A directive costs prompt budget on every single turn, so the cap is small and
+# hard. Oldest-first eviction with a visible notice — silently dropping a rule
+# the user set is the failure mode this whole change exists to remove.
+MAX_DIRECTIVES = 10
+MAX_DIRECTIVE_CHARS = 800
+
+# Unconditional phrasing, in the three languages this agent actually sees.
+# A false positive costs one prompt line; a false negative costs a rule that is
+# silently never followed. The asymmetry is why this leans permissive.
+_DIRECTIVE_PATTERNS = [
+    re.compile(r"(?i)\b(?:always|never|every\s+(?:time|turn|reply|response|message)"
+               r"|each\s+(?:reply|response|report|message)|from\s+now\s+on"
+               r"|in\s+all\s+(?:replies|responses)|do\s+not\s+ever|don'?t\s+ever)\b"),
+    re.compile(r"(?i)\b(?:завжди|ніколи|кожн\w*|віднині|надалі|обов'?язково"
+               r"|у\s+кожн\w+\s+відповід\w+)\b"),
+    re.compile(r"(?i)\b(?:всегда|никогда|кажд\w*|отныне|впредь|обязательно"
+               r"|в\s+кажд\w+\s+ответ\w*)\b"),
+]
+
+
+# ── Directive hygiene ──────────────────────────────────────────────────
+# A rule is not a fact: it stays in force until removed, so a rule that has
+# quietly become wrong keeps being obeyed. The two ways that happens are a rule
+# that names a specific date ("always append 2026-08-05" — correct for exactly
+# one day) and two rules that contradict each other, where whichever the model
+# reads last wins and the user cannot tell which that is.
+
+_DATE_RE = re.compile(
+    r"\b(\d{4})-(\d{2})-(\d{2})\b"                    # 2026-08-05
+    r"|\b(\d{2})[./](\d{2})[./](\d{4})\b"             # 05.08.2026
+)
+
+_POSITIVE_RE = re.compile(r"(?i)\b(?:always|завжди|всегда|must|обов'?язково)\b")
+_NEGATIVE_RE = re.compile(r"(?i)\b(?:never|ніколи|никогда|do not|don'?t|не\s+)\b")
+
+
+def dates_in(text: str) -> list[str]:
+    """ISO and DD.MM.YYYY dates mentioned in a rule, as ISO strings."""
+    found = []
+    for match in _DATE_RE.finditer(text or ""):
+        if match.group(1):
+            found.append(f"{match.group(1)}-{match.group(2)}-{match.group(3)}")
+        else:
+            found.append(f"{match.group(6)}-{match.group(5)}-{match.group(4)}")
+    return found
+
+
+def stale_dates(text: str, today: Optional[str] = None) -> list[str]:
+    """Dates in this rule that are not today — i.e. the rule has expired."""
+    today = today or time.strftime("%Y-%m-%d")
+    return [d for d in dates_in(text) if d != today]
+
+
+def find_conflicts(directives: list[dict]) -> list[tuple[str, str]]:
+    """Pairs of rules that look like they contradict each other.
+
+    Deliberately narrow. Full semantic contradiction needs a model; what is
+    detectable cheaply is the common case — two rules about the same subject
+    where one says "always" and the other "never". A false positive costs a
+    warning line, so this only ever warns and never edits or drops a rule.
+    """
+    conflicts = []
+    for i, a in enumerate(directives):
+        text_a = a.get("fact") or ""
+        for b in directives[i + 1:]:
+            text_b = b.get("fact") or ""
+            polar = ((_POSITIVE_RE.search(text_a) and _NEGATIVE_RE.search(text_b))
+                     or (_NEGATIVE_RE.search(text_a) and _POSITIVE_RE.search(text_b)))
+            if not polar:
+                continue
+            words_a = set(extract_keywords(text_a, max_keywords=20))
+            words_b = set(extract_keywords(text_b, max_keywords=20))
+            if not words_a or not words_b:
+                continue
+            overlap = len(words_a & words_b) / min(len(words_a), len(words_b))
+            if overlap >= 0.6:
+                conflicts.append((a.get("id", ""), b.get("id", "")))
+    return conflicts
+
+
+def looks_like_directive(text: str) -> bool:
+    """True when the text reads as a standing rule rather than a preference.
+
+    "Always end every reply with the date" is a directive — it governs output
+    the user has not asked about yet. "The user prefers PowerShell" is not; it
+    only applies when the topic comes up, which is exactly what retrieval is
+    good at. Getting this split right is what decides whether a rule is obeyed
+    0% or 100% of the time.
+    """
+    if not text:
+        return False
+    return any(p.search(text) for p in _DIRECTIVE_PATTERNS)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Project scoping
@@ -190,16 +293,60 @@ def _write_project_meta() -> None:
         pass
 
 
-def load_active_facts(scopes: tuple = ("global", "project")) -> list[dict]:
-    """Only `active` facts are ever eligible to enter a prompt."""
+def load_active_facts(scopes: tuple = ("global", "project"),
+                      exclude_kinds: tuple = ()) -> list[dict]:
+    """Only `active` facts are ever eligible to enter a prompt.
+
+    `exclude_kinds` keeps directives out of retrieval — they are injected
+    unconditionally elsewhere, and letting them compete for the top-k as well
+    would spend the retrieval budget restating what the prompt already says.
+    """
     out = []
     for scope in scopes:
         for fact in load_facts(scope):
-            if fact.get("status") == STATUS_ACTIVE:
+            if fact.get("status") != STATUS_ACTIVE:
+                continue
+            if fact.get("kind") in exclude_kinds:
+                continue
+            fact = dict(fact)
+            fact["scope"] = scope
+            out.append(fact)
+    return out
+
+
+def load_directives(scopes: tuple = ("global", "project"),
+                    limit: int = MAX_DIRECTIVES,
+                    max_chars: int = MAX_DIRECTIVE_CHARS) -> list[dict]:
+    """Every active standing rule, unscored, newest first.
+
+    No relevance scoring and no `MIN_SCORE` gate: a rule that applies to every
+    turn cannot be selected by how well it matches this turn. The only limits
+    are the two budgets, and hitting either is reported rather than silently
+    truncating — see `over_budget` on the returned records.
+    """
+    found = []
+    for scope in scopes:
+        for fact in load_facts(scope):
+            if (fact.get("status") == STATUS_ACTIVE
+                    and fact.get("kind") == KIND_DIRECTIVE):
                 fact = dict(fact)
                 fact["scope"] = scope
-                out.append(fact)
-    return out
+                found.append(fact)
+
+    # Newest first: the most recent instruction wins the budget, because a rule
+    # the user set thirty seconds ago is the one they are watching for.
+    found.sort(key=lambda f: -f.get("last_seen", 0))
+
+    kept, used = [], 0
+    for fact in found[:limit]:
+        text = (fact.get("fact") or "").strip()
+        if used + len(text) > max_chars and kept:
+            break
+        kept.append(fact)
+        used += len(text)
+    for fact in kept:
+        fact["over_budget"] = len(found) - len(kept)
+    return kept
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -285,6 +432,102 @@ def forget(fact_id: str, scopes: tuple = ("global", "project")) -> Optional[dict
 # ═══════════════════════════════════════════════════════════════════════
 
 _MIGRATION_MARKER = LEARNED_DIR / ".migrated"
+_REPAIR_MARKER = LEARNED_DIR / ".repaired-frontmatter"
+
+# Facts written by the self-note bridge before it was fixed carry the note's
+# whole YAML frontmatter inside the fact text.
+_FRONTMATTER_IN_FACT = re.compile(
+    r"^(?P<title>.*?):\s*---\s*\n.*?\n---\s*\n+(?P<body>.*)$",
+    re.DOTALL,
+)
+
+
+def repair_frontmatter_facts() -> dict:
+    """Re-derive facts that were stored with a note's frontmatter baked in.
+
+    Those rows are unusable in three separate ways: the keyword list is all
+    `created_at` / `auto_generated` / note-id so the fact cannot be retrieved by
+    its own subject, the 240-char render cap cuts the text off before the
+    sentence the user actually wrote, and what does reach the prompt is a wall
+    of metadata spending budget to say nothing.
+
+    The same pass reclassifies pre-existing facts that are standing rules but
+    were stored as `explicit`, because they predate the `directive` kind. That
+    is not cosmetic: those are precisely the rules that were being injected as
+    background trivia and ignored.
+
+    Runs once. Returns a small report so the caller can say what it did.
+    """
+    report = {"repaired": 0, "promoted": 0, "reclassified": 0, "dropped": 0}
+    if _REPAIR_MARKER.exists():
+        return report
+    try:
+        for scope in ("global", "project"):
+            facts = load_facts(scope)
+            if not facts:
+                continue
+            kept, changed = [], False
+            for fact in facts:
+                text = fact.get("fact") or ""
+                match = _FRONTMATTER_IN_FACT.match(text)
+                if not match:
+                    if (fact.get("kind") == KIND_EXPLICIT
+                            and looks_like_directive(text)):
+                        fact["kind"] = KIND_DIRECTIVE
+                        fact["status"] = STATUS_ACTIVE
+                        report["reclassified"] += 1
+                        changed = True
+                    kept.append(fact)
+                    continue
+                changed = True
+                title = match.group("title").strip()
+                body = match.group("body").strip()
+                if not body:
+                    # Nothing survived but metadata — there is no fact here.
+                    report["dropped"] += 1
+                    continue
+                fact["fact"] = redact(f"{title}: {body}" if title else body)
+                fact["keywords"] = extract_keywords(fact["fact"])
+                if looks_like_directive(body):
+                    fact["kind"] = KIND_DIRECTIVE
+                    if fact.get("status") != STATUS_ACTIVE:
+                        fact["status"] = STATUS_ACTIVE
+                        report["promoted"] += 1
+                report["repaired"] += 1
+                kept.append(fact)
+            if changed:
+                save_facts(scope, kept)
+
+        LEARNED_DIR.mkdir(parents=True, exist_ok=True)
+        _REPAIR_MARKER.write_text(
+            json.dumps({"at": time.time(), **report}), encoding="utf-8")
+    except Exception:
+        return report
+    return report
+
+
+# Evidence strings the harness stamps on anything it writes, so its own rows
+# can be found and removed again. A test that leaves facts in the real store
+# spends the user's prompt budget on "written by tests/simulate.py" forever.
+HARNESS_EVIDENCE_TAG = "[harness-probe]"
+
+
+def purge_harness_probes(scopes: tuple = ("global", "project")) -> int:
+    """Remove rows this repo's own test harness wrote. Called by the harness.
+
+    Deliberately not part of `repair_frontmatter_facts`: repairing malformed
+    data is safe to do behind the user's back, deleting rows from their store is
+    not. The harness made these, so the harness cleans them up.
+    """
+    removed = 0
+    for scope in scopes:
+        facts = load_facts(scope)
+        kept = [f for f in facts
+                if HARNESS_EVIDENCE_TAG not in " ".join(f.get("evidence") or [])]
+        if len(kept) != len(facts):
+            removed += len(facts) - len(kept)
+            save_facts(scope, kept)
+    return removed
 
 
 def migrate_legacy_stores() -> int:

@@ -148,5 +148,93 @@ class TestProvidersConfigLocation(unittest.TestCase):
         )
 
 
+class TestProvidersConfigSurvives(unittest.TestCase):
+    """A provider config that vanishes takes every configured key with it.
+
+    Observed for real: `~/.tomas/providers.json` held six providers, and after
+    an install it was gone outright. Two mechanisms in this file made that
+    possible and both are closed here.
+    """
+
+    def setUp(self):
+        import provider_manager
+        self.pm = provider_manager
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "providers.json"
+        self._saved = provider_manager.PROVIDERS_CONFIG_PATH
+        provider_manager.PROVIDERS_CONFIG_PATH = self.path
+
+    def tearDown(self):
+        self.pm.PROVIDERS_CONFIG_PATH = self._saved
+        self._tmp.cleanup()
+
+    def _write(self, text):
+        self.path.write_text(text, encoding="utf-8")
+
+    def test_a_round_trip_keeps_the_providers(self):
+        self.pm.save_config({"active": "A", "providers": {"A": {"model": "m"}}})
+        self.assertEqual(self.pm.load_config()["active"], "A")
+
+    def test_a_corrupt_file_is_quarantined_not_discarded(self):
+        # It used to return an empty config, which the next save then wrote
+        # over the top of — one unreadable byte and every provider was gone.
+        self._write("{not json at all")
+        self.assertEqual(self.pm.load_config(), self.pm.EMPTY_CONFIG)
+        quarantined = list(self.path.parent.glob("providers.json.corrupt-*"))
+        self.assertEqual(len(quarantined), 1)
+        self.assertIn("not json", quarantined[0].read_text(encoding="utf-8"))
+
+    def test_a_save_keeps_the_previous_generation(self):
+        self.pm.save_config({"active": "A", "providers": {"A": {}}})
+        self.pm.save_config({"active": None, "providers": {}})
+        backup = self.path.with_name("providers.json.bak")
+        self.assertTrue(backup.exists())
+        self.assertIn('"A"', backup.read_text(encoding="utf-8"))
+
+    def test_a_missing_file_is_not_an_error(self):
+        self.assertEqual(self.pm.load_config(), self.pm.EMPTY_CONFIG)
+
+    def test_a_non_dict_payload_does_not_propagate(self):
+        self._write("[1, 2, 3]")
+        self.assertEqual(self.pm.load_config(), self.pm.EMPTY_CONFIG)
+
+    def test_no_temp_files_are_left_behind(self):
+        self.pm.save_config({"active": "A", "providers": {"A": {}}})
+        self.assertEqual(list(self.path.parent.glob("providers.json.tmp*")), [])
+
+
+class TestInstallerProtectsUserConfig(unittest.TestCase):
+    """install.ps1 must not copy secrets into the tree it later deletes."""
+
+    def setUp(self):
+        root = Path(__file__).parent.parent
+        self.installer = (root / "install.ps1").read_text(
+            encoding="utf-8", errors="replace")
+
+    def test_env_and_providers_are_excluded_from_the_source_copy(self):
+        # $SrcDir is deleted wholesale by `TOMAS update`, so anything copied
+        # there is staged for destruction — and agent_cli treats a copied .env
+        # as a "legacy" file and migrates it back, hiding the round trip.
+        for pattern in ("'.env'", "'providers.json'"):
+            self.assertIn(pattern, self.installer,
+                          f"{pattern} must be in excludeFilePatterns")
+
+    def test_both_files_are_backed_up_before_any_write(self):
+        self.assertIn("backup-$stamp", self.installer)
+        self.assertIn('Join-Path $InstallDir "providers.json"', self.installer)
+
+    def test_an_empty_copy_is_fatal(self):
+        # "Copied 0 files" used to print [OK] and carry on.
+        self.assertIn('[FAIL] Copied 0 files', self.installer)
+
+    def test_a_locked_venv_names_the_process(self):
+        # Removal failed, venv creation failed, and it printed
+        # "[OK] Virtual environment created" over the top of both.
+        self.assertIn("These processes are running from inside it", self.installer)
+
+    def test_a_missing_requirements_file_is_fatal(self):
+        self.assertIn("[FAIL] No requirements.txt", self.installer)
+
+
 if __name__ == "__main__":
     unittest.main()

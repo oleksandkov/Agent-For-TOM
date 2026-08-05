@@ -201,7 +201,21 @@ if ($hasLocalSource) {
     # ModuleNotFoundError: No module named 'learning'.
     $exclude = @('.venv', '__pycache__', '.git', '.agent', '.claude', '.kilo',
                  '.github', '.pytest_cache', '.mypy_cache', 'node_modules')
-    $excludeFilePatterns = @('*.pyc', '.gitignore')
+    # `.env` must never be copied into $SrcDir. It holds API keys, and $SrcDir
+    # is deleted wholesale by `TOMAS update` — so copying it there both spreads
+    # the secret and stages it for destruction. agent_cli then treats the copy
+    # as a "legacy" env and migrates it back, which makes the round trip look
+    # deliberate. The durable copy lives at ~/.tomas/.env and stays there.
+    # `.env` and `providers.json` must never be copied into $SrcDir. They hold
+    # API keys and provider setup, and $SrcDir is deleted wholesale by
+    # `TOMAS update` — so copying them there both spreads the secret and stages
+    # it for destruction. agent_cli then treats the copied .env as a "legacy"
+    # file and migrates it back, which makes the round trip look deliberate.
+    # The durable copies live in ~/.tomas/ and stay there.
+    $excludeFilePatterns = @('*.pyc', '.gitignore', '.env', '.env.*',
+                             'providers.json',
+                             'simulation_results.json', 'cyrillic_results.json',
+                             'session_audit_*.json')
 
     Get-ChildItem -Path $localSource -File | Where-Object {
         $skip = $false
@@ -212,16 +226,58 @@ if ($hasLocalSource) {
     } | Copy-Item -Destination $SrcDir -Force
 
     $dirCount = 0
+    $copyErrors = @()
     foreach ($dir in (Get-ChildItem -Path $localSource -Directory)) {
         if ($exclude -contains $dir.Name) { continue }
         $dest = Join-Path $SrcDir $dir.Name
-        if (Test-Path $dest) { Remove-Item -Path $dest -Recurse -Force }
-        Copy-Item -Path $dir.FullName -Destination $dest -Recurse -Force
-        Get-ChildItem -Path $dest -Recurse -Directory -Filter '__pycache__' `
-            -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path $dest) {
+            Remove-Item -Path $dest -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        # Walk and copy file by file, skipping __pycache__ on the way in.
+        # `Copy-Item -Recurse` copied those directories and then deleted them
+        # afterwards, which meant a stale or locked .pyc aborted the copy with
+        # "Could not find a part of the path ...\learning\__pycache__" and left
+        # the package directory empty. Excluding at copy time removes the whole
+        # failure mode instead of cleaning up after it.
+        $sourceRoot = $dir.FullName.TrimEnd('\')
+        foreach ($item in (Get-ChildItem -Path $sourceRoot -Recurse -File -ErrorAction SilentlyContinue)) {
+            $relative = $item.FullName.Substring($sourceRoot.Length).TrimStart('\')
+            if ($relative -match '(^|\\)(__pycache__|\.pytest_cache|\.mypy_cache)(\\|$)') { continue }
+            if ($item.Extension -eq '.pyc') { continue }
+            $target = Join-Path $dest $relative
+            $targetDir = Split-Path -Parent $target
+            if (-not (Test-Path $targetDir)) {
+                $null = New-Item -ItemType Directory -Path $targetDir -Force
+            }
+            try {
+                Copy-Item -LiteralPath $item.FullName -Destination $target -Force -ErrorAction Stop
+            } catch {
+                $copyErrors += "$relative : $($_.Exception.Message)"
+            }
+        }
         $dirCount++
     }
-    Write-Host "  [OK] Copied $( (Get-ChildItem $SrcDir -File).Count ) files and $dirCount directories to $SrcDir" -ForegroundColor Green
+
+    $fileCount = (Get-ChildItem $SrcDir -File -ErrorAction SilentlyContinue).Count
+    if ($copyErrors.Count -gt 0) {
+        Write-Host "  [WARN] $($copyErrors.Count) file(s) could not be copied:" -ForegroundColor Yellow
+        foreach ($e in ($copyErrors | Select-Object -First 5)) {
+            Write-Host "         $e" -ForegroundColor DarkYellow
+        }
+    }
+    # A copy that moved nothing is a failed install, not a successful one. This
+    # used to print [OK] with "Copied 0 files", carry on, warn that there was no
+    # requirements.txt, and only fall over three steps later.
+    if ($fileCount -eq 0) {
+        Write-Host "  [FAIL] Copied 0 files from $localSource" -ForegroundColor Red
+        Write-Host "         The install would be empty. Common causes:" -ForegroundColor Yellow
+        Write-Host "         - a running TOMAS or MCP server is locking $SrcDir" -ForegroundColor Yellow
+        Write-Host "           (close TOMAS, then: Get-Process python | Where-Object" -ForegroundColor Yellow
+        Write-Host "            { `$_.Path -like '*\.tomas\*' } | Stop-Process -Force)" -ForegroundColor Yellow
+        Write-Host "         - the source folder is not a TOMAS checkout" -ForegroundColor Yellow
+        exit 1
+    }
+    Write-Host "  [OK] Copied $fileCount files and $dirCount directories to $SrcDir" -ForegroundColor Green
 }
 else {
     Write-Host ""
@@ -280,11 +336,36 @@ if ($existingPythonExe) {
 if (-not $venvPythonOk) {
     if (Test-Path $VenvDir) {
         Write-Host "  [WARN] Existing venv is corrupted, removing..." -ForegroundColor Yellow
-        Remove-Item -Path $VenvDir -Recurse -Force
+        Remove-Item -Path $VenvDir -Recurse -Force -ErrorAction SilentlyContinue
+        # A venv cannot be replaced while something is executing out of it.
+        # Windows reports this as "Access to the path ...python.exe is denied",
+        # the removal half-succeeds, `python -m venv` then fails to write its
+        # launcher, and the installer used to print "[OK] Virtual environment
+        # created" over the top of all of it. Name the process instead.
+        if (Test-Path $VenvDir) {
+            $holders = @(Get-Process -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -and $_.Path.StartsWith($VenvDir, 'OrdinalIgnoreCase') })
+            Write-Host "  [FAIL] Could not remove the existing venv at $VenvDir" -ForegroundColor Red
+            if ($holders.Count -gt 0) {
+                Write-Host "         These processes are running from inside it:" -ForegroundColor Yellow
+                foreach ($h in $holders) {
+                    Write-Host "           PID $($h.Id)  $($h.ProcessName)  $($h.Path)" -ForegroundColor Yellow
+                }
+                Write-Host "         Close TOMAS (its MCP servers keep running after it exits), or:" -ForegroundColor Yellow
+                Write-Host "           $($holders.Id -join ', ') | ForEach-Object { Stop-Process -Id `$_ -Force }" -ForegroundColor Cyan
+            } else {
+                Write-Host "         Something is holding files open there. Close TOMAS and any" -ForegroundColor Yellow
+                Write-Host "         editor or terminal with that venv activated, then re-run." -ForegroundColor Yellow
+            }
+            exit 1
+        }
     }
     & $pythonPath -m venv $VenvDir
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "  [FAIL] Failed to create virtual environment" -ForegroundColor Red
+    # $LASTEXITCODE alone missed this: venv can report success having failed to
+    # write the launcher. Check for the executable it was supposed to produce.
+    if ($LASTEXITCODE -ne 0 -or -not (Get-VenvPythonExe $VenvDir)) {
+        Write-Host "  [FAIL] Failed to create virtual environment at $VenvDir" -ForegroundColor Red
+        Write-Host "         python -m venv exited $LASTEXITCODE and produced no python executable." -ForegroundColor Yellow
         exit 1
     }
     Write-Host "  [OK] Virtual environment created" -ForegroundColor Green
@@ -370,7 +451,14 @@ if (Test-Path $reqFile) {
         }
     }
 } else {
-    Write-Host "  [WARN] No requirements.txt found" -ForegroundColor Yellow
+    # Not a warning: TOMAS cannot run without anthropic, dotenv and the rest.
+    # Reaching here means the source copy dropped it, so the install is broken
+    # in exactly the way the next step is about to discover anyway.
+    Write-Host "  [FAIL] No requirements.txt at $reqFile" -ForegroundColor Red
+    Write-Host "         The source copy is incomplete — dependencies cannot be" -ForegroundColor Yellow
+    Write-Host "         installed and TOMAS will not start. Re-run the installer" -ForegroundColor Yellow
+    Write-Host "         from a complete checkout with TOMAS closed." -ForegroundColor Yellow
+    exit 1
 }
 
 # -- Verify the install can actually start -----------------------------
@@ -632,7 +720,34 @@ Write-Host "  [OK] Sessions directory: $SessionsDir" -ForegroundColor Green
 Write-Host ""
 Write-Host "  [8/9] Configuring environment..." -ForegroundColor Cyan
 
+# Back up before touching anything, always. These files are the only copy of
+# the user's API keys and provider setup, and an installer that loses them has
+# done real damage that no error message undoes. The copies have to be made
+# *before* any branch below decides what to write.
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+foreach ($precious in @($EnvFile, (Join-Path $InstallDir "providers.json"))) {
+    if (Test-Path $precious) {
+        $backupPath = "$precious.backup-$stamp"
+        try {
+            Copy-Item -LiteralPath $precious -Destination $backupPath -Force -ErrorAction Stop
+            Write-Host "  [OK] Backed up $(Split-Path -Leaf $precious) to $(Split-Path -Leaf $backupPath)" -ForegroundColor DarkGray
+        } catch {
+            Write-Host "  [WARN] Could not back up $(Split-Path -Leaf $precious): $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+}
+
 if (-not (Test-Path $EnvFile)) {
+    # If a backup from an earlier run exists, say so rather than silently
+    # handing back an empty template — a missing .env on a machine that has run
+    # TOMAS before means something removed it, and the keys are recoverable.
+    $priorBackups = @(Get-ChildItem -Path $InstallDir -Filter ".env.backup-*" -Force -ErrorAction SilentlyContinue |
+                      Sort-Object LastWriteTime -Descending)
+    if ($priorBackups.Count -gt 0) {
+        Write-Host "  [WARN] .env was missing, but $($priorBackups.Count) backup(s) exist." -ForegroundColor Yellow
+        Write-Host "         Your API keys are in: $($priorBackups[0].FullName)" -ForegroundColor Yellow
+        Write-Host "         Copy them into the new .env after this finishes." -ForegroundColor Yellow
+    }
     @"
 # TOMAS configuration (created by install.ps1)
 # Required: set your API key below

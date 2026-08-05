@@ -9,10 +9,20 @@ One cheap call per session, at session end, off the hot path. Every failure
 mode returns {}: learning must never break or delay the user's work.
 
 Modes (TOMAS_REFLECT):
-    shadow   run and log what WOULD be learned; write nothing. The default,
-             so you can read real output before trusting it.
-    active   also record observations, subject to the evidence gate.
+    active   record observations, subject to the evidence gate. The default.
+    shadow   run and log what WOULD be learned; write nothing. For inspecting
+             output before trusting it.
     off      do not run at all.
+
+`shadow` was the default for long enough that an install could run for months
+with a reflection log holding a single entry and `promoted: []` — a learning
+system that cost a model call per session and had never, once, learned
+anything. Shipping it disabled made the safe choice the invisible one.
+
+`active` is safe because the evidence gate is doing the work it was built for:
+reflection writes `observed`, and nothing reaches a prompt below `active`
+status, which takes three independent sightings. A one-off wrong guess costs a
+row in a JSONL file and decays out in thirty days.
 """
 
 from __future__ import annotations
@@ -38,6 +48,41 @@ Report only what the transcript actually supports. Do not invent preferences
 from a single ambiguous exchange. An empty list is the correct answer when
 nothing was learned — most sessions teach nothing, and that is fine.
 
+THE ONE TEST every entry must pass:
+    Would this still be true and useful in a session about a COMPLETELY
+    DIFFERENT topic, three months from now?
+
+If not, leave it out. This is the rule that is most often broken, so check each
+entry against it before you write it.
+
+  BAD  "The user asked about internet providers in Ukraine"
+       — that is what happened, not what was learned. It will never be true
+         again and helps with nothing.
+  GOOD "The user writes in Ukrainian and expects replies in Ukrainian"
+       — durable, applies to every future session.
+
+  BAD  "The user wanted the factorial function fixed"
+  GOOD "The user wants type annotations on every Python function"
+
+  BAD  skill "ukrainian-language-telecom-research"
+       — a skill for one question the user asked once.
+  GOOD skill "lab-guide-structure"
+       — a procedure the user will need every time they ask for the same
+         kind of artefact.
+
+Rules for each field:
+- user_preferences: how this person wants to be worked with — language,
+  formatting, tools, conventions, level of detail. Never an event, a topic they
+  asked about, or a task they wanted done. Set confidence below 0.5 if you are
+  inferring rather than quoting.
+- corrections: only where the user actually pushed back on something the agent
+  did. "lesson" must be phrased as an instruction for next time, not a
+  description of what went wrong.
+- skill_candidates: a repeatable PROCEDURE, worth writing down because it will
+  be needed again. If you cannot name a second, different occasion where it
+  would apply, do not propose it.
+- project_notes: true of this codebase and still true after this task is done.
+
 Return JSON only:
 {
   "user_preferences": [
@@ -60,8 +105,8 @@ Return JSON only:
 
 
 def mode() -> str:
-    value = os.environ.get("TOMAS_REFLECT", "shadow").strip().lower()
-    return value if value in ("shadow", "active", "off") else "shadow"
+    value = os.environ.get("TOMAS_REFLECT", "active").strip().lower()
+    return value if value in ("shadow", "active", "off") else "active"
 
 
 def cheapest_available_model(current_model: str) -> str:

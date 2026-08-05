@@ -10,6 +10,7 @@ questions both belong to the adapter driving it.
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Iterator, Optional
 
@@ -41,6 +42,162 @@ _RETRYABLE_MARKERS = (
     "Service Unavailable", "Gateway Timeout",
     "timeout", "timed out",
 )
+
+# A quota is not a busy signal. These say "you have spent your allowance",
+# which no amount of backing off inside one turn will clear — a free-tier run
+# burned 14 consecutive turns at ~38s each (the full 5/10/20s ladder, three
+# times over) discovering that, then reported the turns as failures. Retrying
+# these is worse than not retrying: it stalls the user and keeps hammering a
+# limiter that is already refusing.
+_QUOTA_MARKERS = (
+    "FreeUsageLimitError",
+    "insufficient_quota",
+    "quota exceeded",
+    "billing",
+    "credit balance",
+    "usage limit",
+    "monthly limit",
+    # OpenRouter's daily free-tier cap. Found the hard way: it says neither
+    # "quota" nor "limit exceeded" in any form the list above matched, so a
+    # live run burned the full 5/10/20s ladder on every remaining turn before
+    # giving up — the exact waste the quota short-circuit exists to prevent.
+    "free-models-per-day",
+    "openrouter_free_tier_daily",
+    "per-day",
+    "daily limit",
+    "add credits",
+    "purchase credits",
+)
+
+
+# Providers often state the wait in the message body rather than a header:
+# Gemini says "Please retry in 6.152706999s.", others emit a retryDelay field.
+_RETRY_HINT_RE = re.compile(
+    r"(?:please\s+)?retry(?:\s+again)?\s+(?:in|after)\s+([0-9]+(?:\.[0-9]+)?)\s*s"
+    r"|retry[_-]?delay[\"'\s:]+([0-9]+(?:\.[0-9]+)?)\s*s?",
+    re.IGNORECASE,
+)
+
+# A per-minute cap is a blip; a per-day one is an allowance. Google puts the
+# distinction in quotaId (…PerMinute-FreeTier / …PerDay-FreeTier) while using
+# identical prose for both.
+_PER_MINUTE_RE = re.compile(r"per[_-]?minute", re.IGNORECASE)
+
+# …and Google attaches a short "Please retry in 11.9s" to a *daily* cap too,
+# so the retry hint cannot be the last word. An explicit per-day quota is an
+# allowance: it will still be exhausted eleven seconds from now.
+_PER_DAY_RE = re.compile(r"per[_-]?day|daily", re.IGNORECASE)
+
+
+def retry_hint_seconds(err: Exception) -> Optional[float]:
+    """A wait the provider stated in the error text, if any."""
+    match = _RETRY_HINT_RE.search(str(err))
+    if not match:
+        return None
+    raw = match.group(1) or match.group(2)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return min(value, MAX_RETRY_DELAY) if value > 0 else None
+
+
+def is_quota_error(err: Exception) -> bool:
+    """True when the failure is an exhausted allowance, not a transient blip.
+
+    A stated retry time outranks the wording, always. Gemini answers a
+    *per-minute* limit with "You exceeded your current quota, please check your
+    plan and billing details … Please retry in 6.15s." — prose that reads like a
+    dead account attached to a six-second wait. Matching on "billing" alone
+    turned every ordinary rate-limit into a fatal error and killed runs that
+    would have succeeded on the next attempt.
+    """
+    text = str(err)
+    # Precedence, most specific first. Per-day beats the retry hint because
+    # Google sends both together; the hint beats the prose because the prose is
+    # identical for a six-second cap and a dead account.
+    if _PER_DAY_RE.search(text):
+        return True
+    if retry_hint_seconds(err) is not None:
+        return False
+    if _PER_MINUTE_RE.search(text):
+        return False
+    low = text.lower()
+    return any(marker.lower() in low for marker in _QUOTA_MARKERS)
+
+
+def retry_after_seconds(err: Exception) -> Optional[float]:
+    """Honour a server-supplied Retry-After, when there is one.
+
+    The provider knows when its window reopens and we do not; guessing with a
+    fixed ladder either hammers too early or waits far longer than needed.
+    """
+    for attr in ("response", "http_response"):
+        response = getattr(err, attr, None)
+        headers = getattr(response, "headers", None)
+        if not headers:
+            continue
+        for key in ("retry-after", "Retry-After",
+                    "x-ratelimit-reset-after", "anthropic-ratelimit-requests-reset",
+                    "x-ratelimit-reset", "X-RateLimit-Reset"):
+            try:
+                raw = headers.get(key)
+            except Exception:
+                raw = None
+            if raw is None:
+                continue
+            try:
+                value = float(str(raw).strip())
+            except (TypeError, ValueError):
+                continue
+            value = _as_delay_seconds(value)
+            if value > 0:
+                return min(value, MAX_RETRY_DELAY)
+    return None
+
+
+def _as_delay_seconds(value: float) -> float:
+    """Normalise a rate-limit header to "seconds from now".
+
+    Providers disagree about what these carry: some send a delta in seconds,
+    OpenRouter sends an absolute epoch in *milliseconds*
+    (`X-RateLimit-Reset: 1785974400000`). Sleeping 1.7 billion seconds because
+    a header looked like a delta is not a recoverable mistake, so anything
+    implausibly large is read as a timestamp and converted.
+    """
+    now = time.time()
+    if value > now * 100:          # epoch in milliseconds
+        return value / 1000.0 - now
+    if value > now / 2:            # epoch in seconds
+        return value - now
+    return value                   # already a delta
+
+
+MAX_RETRY_DELAY = 60.0
+
+# Hard ceiling for the one automatic max_tokens escalation. High enough that a
+# reasoning model can think *and* write a real document; low enough that a
+# runaway cannot bill an unbounded completion.
+MAX_OUTPUT_CEILING = 32_768
+
+
+def backoff_delay(attempt: int, err: Optional[Exception] = None) -> float:
+    """5s, 10s, 20s — jittered, capped, and overridden by Retry-After.
+
+    Jitter matters as soon as more than one client is retrying: without it they
+    all wake at the same instant and re-collide on the same limiter.
+    """
+    if err is not None:
+        supplied = retry_after_seconds(err)
+        if supplied is None:
+            supplied = retry_hint_seconds(err)
+        if supplied is not None:
+            # A hair over what they asked for: coming back at exactly the
+            # stated instant races the window and 429s again.
+            return round(supplied + 0.5, 2)
+    import random
+    base = min(5 * (2 ** attempt), MAX_RETRY_DELAY)
+    return round(base * random.uniform(0.8, 1.2), 2)
 
 _CLIENT_ERROR_MARKERS = (
     "400", "Bad Request", "invalid_request",
@@ -143,12 +300,23 @@ def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
                 usage_info = getattr(final_msg, "usage", None)
 
     wants_tools = has_tool_use or stop_reason == "tool_use"
+    if stop_reason == "max_tokens" and not wants_tools:
+        yield from _report_truncation(state, "".join(text_parts))
     # When tools were requested the caller immediately re-issues the request
     # non-streamed to get complete tool_use blocks. Counting the streamed call
     # too would bill the same turn twice.
     if not wants_tools:
         _record_usage(state, usage_info)
     return "".join(text_parts), wants_tools
+
+
+def _quota_error(err: Exception) -> ErrorOccurred:
+    """The message a quota failure deserves: what happened and what to do."""
+    return ErrorOccurred(
+        "The provider's usage limit is exhausted — this is a quota, not a "
+        "temporary blip, so retrying will not clear it. Switch provider or model "
+        "with /provider or /model, or wait for the allowance to reset.",
+        detail=str(err), recoverable=False)
 
 
 def _model_call(state: AgentState) -> Iterator[AgentEvent]:
@@ -180,6 +348,9 @@ def _model_call(state: AgentState) -> Iterator[AgentEvent]:
                     "message may be too large. Try /compact to reduce context size.",
                     detail=str(e), recoverable=False))
                 return None
+            if is_quota_error(e):
+                yield fail(_quota_error(e))
+                return None
             if not is_retryable_error(e):
                 yield fail(ErrorOccurred("Error communicating with the AI service.",
                                          detail=str(e), recoverable=False))
@@ -188,12 +359,15 @@ def _model_call(state: AgentState) -> Iterator[AgentEvent]:
                 yield fail(ErrorOccurred(f"The AI service is unavailable right now: {e}",
                                          detail=str(e), recoverable=False))
                 return None
-            delay = 5 * (2 ** attempt)
+            delay = backoff_delay(attempt, e)
             yield RetryScheduled(attempt + 1, MAX_RETRIES, delay, str(e))
             time.sleep(delay)
         except Exception as e:
+            if is_quota_error(e):
+                yield fail(_quota_error(e))
+                return None
             if attempt < MAX_RETRIES and is_retryable_error(e):
-                delay = 5 * (2 ** attempt)
+                delay = backoff_delay(attempt, e)
                 yield RetryScheduled(attempt + 1, MAX_RETRIES, delay, str(e))
                 time.sleep(delay)
             else:
@@ -235,6 +409,36 @@ def _wind_down(state: AgentState, response, reason: str) -> Iterator[AgentEvent]
     yield TurnFinished(reply=text, usage=dict(state.usage))
 
 
+def _report_truncation(state: AgentState, text: str) -> Iterator[AgentEvent]:
+    """Say that the reply was cut off at the output limit.
+
+    This was swallowed completely. `stop_reason` was read only to answer "did
+    it ask for tools?", so `max_tokens` fell through the same branch as a
+    normal finish. On a reasoning model the whole budget goes to internal
+    reasoning, the visible content is empty, and the turn ended with no text,
+    no tool call and no error — the user saw a token counter and nothing else,
+    asked "where is the file?", and got another empty turn.
+
+    An empty truncated reply is a failure and is recorded as one; a partial one
+    is still useful, so it is shown with a warning rather than discarded.
+    """
+    limit = state.max_tokens
+    if text.strip():
+        message = (f"The reply was cut off at the {limit}-token output limit — "
+                   f"what you see above is incomplete.")
+    else:
+        # Reached only after the automatic escalation has already been spent,
+        # so "raise the limit" is no longer the useful advice — the shape of
+        # the request is.
+        message = (
+            f"Still no reply within {limit} output tokens. The model is "
+            f"spending the whole budget reasoning. Ask for one piece at a time "
+            f"(a single section rather than a whole document), set "
+            f"AGENT_MAX_TOKENS higher, or switch to a non-reasoning model.")
+    state.last_error = f"truncated at max_tokens={limit}"
+    yield ErrorOccurred(message, detail=state.last_error, recoverable=True)
+
+
 def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[AgentEvent]:
     """Drive one user turn to completion, yielding events as it goes."""
     started = time.perf_counter()
@@ -246,6 +450,7 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
     denials = 0          # per-turn, so the message can escalate
     budget = state.tool_budget
     signatures: list[str] = []
+    escalated = False    # max_tokens has been raised once for this turn
 
     while True:
         yield ThinkingStarted(state.get_model())
@@ -265,11 +470,21 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                 # Tools requested: fall through to the non-streamed call, which
                 # returns complete tool_use blocks.
             except Exception as e:
-                # Any streaming failure is recoverable the same way: a provider
-                # whose streaming endpoint 5xxs (or that has no streaming API at
-                # all) still works fine non-streamed. Disable it and fall
-                # through, rather than retrying the streaming call three times
-                # and then giving up on the turn entirely.
+                # A quota is the one streaming failure that falling through
+                # cannot fix — the non-streamed call spends another request to
+                # be told the same thing. Stop here.
+                if is_quota_error(e):
+                    event = _quota_error(e)
+                    state.last_error = event.detail or event.message
+                    yield event
+                    yield TurnFinished(reply="", usage=dict(state.usage),
+                                       seconds=time.perf_counter() - started)
+                    return
+                # Any other streaming failure is recoverable the same way: a
+                # provider whose streaming endpoint 5xxs (or that has no
+                # streaming API at all) still works fine non-streamed. Disable
+                # it and fall through, rather than retrying the streaming call
+                # three times and then giving up on the turn entirely.
                 state.streaming_enabled = False
                 state.streaming_error = str(e)
                 state.streaming_error_retryable = is_retryable_error(e)
@@ -283,6 +498,25 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
 
         if response.stop_reason != "tool_use":
             text = "".join(b.text for b in response.content if hasattr(b, "text"))
+            # A reasoning model that produced *nothing* spent the entire budget
+            # thinking. That is recoverable exactly once, by giving it more
+            # room — reporting the failure and stopping leaves the user to
+            # discover an env var. Only when the reply is empty: a partial
+            # answer means the model was writing, and re-running would just
+            # re-bill the same work.
+            if (response.stop_reason == "max_tokens" and not text.strip()
+                    and not escalated and state.max_tokens < MAX_OUTPUT_CEILING):
+                escalated = True
+                previous = state.max_tokens
+                state.max_tokens = min(state.max_tokens * 4, MAX_OUTPUT_CEILING)
+                yield ErrorOccurred(
+                    f"No reply within {previous} output tokens — the model spent "
+                    f"them reasoning. Retrying once with {state.max_tokens}.",
+                    detail=f"escalating max_tokens {previous} -> {state.max_tokens}",
+                    recoverable=True)
+                continue
+            if response.stop_reason == "max_tokens":
+                yield from _report_truncation(state, text)
             if text:
                 state.messages.append({"role": "assistant", "content": text})
                 yield AssistantMessage(text)

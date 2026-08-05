@@ -16,6 +16,7 @@ PROJECT_DIR = Path(__file__).parent.parent.resolve()
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
+import learning
 import skills_manager
 import self_notes
 
@@ -55,6 +56,11 @@ class TestNotesReachThePrompt(unittest.TestCase):
         shutil.rmtree(self_notes.NOTES_DIR, ignore_errors=True)
         self_notes.NOTES_DIR = self._orig_notes_dir
         self_notes.NOTES_INDEX = self._orig_index
+        # The notes directory is sandboxed above, but create_note also bridges
+        # into the learning store — which is not. Without this the suite leaves
+        # "Use edit_file for existing files" in the user's real facts.jsonl,
+        # where it spends retrieval budget in every real prompt forever.
+        learning.purge_harness_probes()
 
     def test_empty_notes_return_empty_string(self):
         self.assertEqual(self_notes.get_notes_for_context(), "")
@@ -64,6 +70,7 @@ class TestNotesReachThePrompt(unittest.TestCase):
             title="Use edit_file for existing files",
             content="write_file overwrites silently; edit_file is safer for existing files.",
             note_type="lesson",
+            evidence_tag=learning.HARNESS_EVIDENCE_TAG,
         )
         section = self_notes.get_notes_for_context()
         self.assertIn("Use edit_file for existing files", section)
@@ -73,6 +80,7 @@ class TestNotesReachThePrompt(unittest.TestCase):
     def test_auto_generated_notes_are_excluded(self):
         self_notes.create_note(
             title="auto note", content="body", auto_generated=True,
+            evidence_tag=learning.HARNESS_EVIDENCE_TAG,
         )
         self.assertEqual(self_notes.get_notes_for_context(), "")
 

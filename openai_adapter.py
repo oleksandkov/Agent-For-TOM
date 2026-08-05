@@ -373,8 +373,12 @@ def build_from_active():
         return None
     base = provider.base_url or os.environ.get("ANTHROPIC_BASE_URL", "")
     headers = dict(provider.extra_headers or {})
-    key = (provider.env.get("ANTHROPIC_API_KEY")
-           or os.environ.get("ANTHROPIC_API_KEY", ""))
+    # Ask the provider for its key rather than reaching for ANTHROPIC_API_KEY.
+    # `api_key_env` is a configurable field, and hardcoding the Anthropic name
+    # here meant any provider that set it — OPENROUTER_API_KEY, say — probed
+    # fine (probe uses provider.api_key) and then failed every real call with
+    # "Missing Authentication header".
+    key = provider.api_key or os.environ.get("ANTHROPIC_API_KEY", "")
 
     if provider.type == "zen":
         # A zen provider points at the local proxy port, which only ever meant

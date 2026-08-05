@@ -549,5 +549,107 @@ class TestImageAttachment(unittest.TestCase):
         self.assertIsInstance(content, str)
 
 
+CTRL_U, CTRL_W, CTRL_Y, CTRL_Z, CTRL_C = "\x15", "\x17", "\x19", "\x1a", "\x03"
+
+
+class TestUndo(unittest.TestCase):
+    """Ctrl+U and Ctrl+W each destroy a whole prompt in one keystroke.
+
+    Before Ctrl+Z there was no way back from either: a long prompt cleared by
+    a mistyped Ctrl+U had to be typed again from scratch.
+    """
+
+    def test_undo_restores_a_cleared_line(self):
+        result, _ = drive_prompt(
+            FakeKeyboard().type("привіт світ").key(CTRL_U).key(CTRL_Z).enter())
+        self.assertEqual(result, "привіт світ")
+
+    def test_undo_restores_a_deleted_word(self):
+        result, _ = drive_prompt(
+            FakeKeyboard().type("hello world").key(CTRL_W).key(CTRL_Z).enter())
+        self.assertEqual(result, "hello world")
+
+    def test_undo_restores_a_cancelled_line(self):
+        result, _ = drive_prompt(
+            FakeKeyboard().type("draft text").key(CTRL_C).key(CTRL_Z).enter())
+        self.assertEqual(result, "draft text")
+
+    def test_undo_steps_back_through_several_edits(self):
+        result, _ = drive_prompt(
+            FakeKeyboard().type("one").key(CTRL_U)
+            .type("two").key(CTRL_U).key(CTRL_Z).key(CTRL_Z).enter())
+        self.assertEqual(result, "one")
+
+    def test_undo_on_a_fresh_line_says_so_and_does_not_crash(self):
+        result, screen = drive_prompt(
+            FakeKeyboard().type("xy").key(CTRL_Z).enter())
+        self.assertEqual(result, "xy")
+        self.assertIn("nothing to undo", screen.written)
+
+    def test_typing_is_not_snapshotted_per_character(self):
+        # Undoing one letter at a time is useless; the keystroke worth taking
+        # back is the one that wiped the line.
+        result, _ = drive_prompt(FakeKeyboard().type("abc").key(CTRL_Z).enter())
+        self.assertEqual(result, "abc")
+
+    def test_a_paste_can_be_undone(self):
+        result, _ = drive_prompt(
+            FakeKeyboard().type("keep ").paste("unwanted paste")
+            .key(CTRL_Z).enter())
+        self.assertEqual(result, "keep ")
+
+
+class TestCopyTheLine(unittest.TestCase):
+    """Ctrl+Y copies what is typed — including any earlier prompt via ↑."""
+
+    def setUp(self):
+        self.copied = []
+        self._real = agent.put_clipboard_text
+        agent.put_clipboard_text = lambda t: (self.copied.append(t), True)[1]
+
+    def tearDown(self):
+        agent.put_clipboard_text = self._real
+
+    def test_it_copies_the_current_line(self):
+        drive_prompt(FakeKeyboard().type("скопіюй це").key(CTRL_Y).enter())
+        self.assertEqual(self.copied, ["скопіюй це"])
+
+    def test_the_line_survives_being_copied(self):
+        result, _ = drive_prompt(
+            FakeKeyboard().type("still here").key(CTRL_Y).enter())
+        self.assertEqual(result, "still here")
+
+    def test_it_confirms_on_screen(self):
+        _, screen = drive_prompt(
+            FakeKeyboard().type("abc").key(CTRL_Y).enter())
+        self.assertIn("copied", screen.written)
+
+    def test_an_empty_line_copies_nothing(self):
+        _, screen = drive_prompt(FakeKeyboard().key(CTRL_Y).enter())
+        self.assertEqual(self.copied, [])
+        self.assertIn("nothing to copy", screen.written)
+
+    def test_a_collapsed_paste_is_copied_in_full(self):
+        # The buffer shows "[#1 pasted N chars]"; the clipboard must get the
+        # text, not the marker — same expansion the model receives on send.
+        big = "x" * (agent.PASTE_COLLAPSE_CHARS + 20)
+        drive_prompt(FakeKeyboard().paste(big).key(CTRL_Y).enter())
+        self.assertEqual(self.copied, [big])
+
+    def test_a_clipboard_failure_is_reported_not_swallowed(self):
+        agent.put_clipboard_text = lambda t: False
+        _, screen = drive_prompt(FakeKeyboard().type("abc").key(CTRL_Y).enter())
+        self.assertIn("could not reach the clipboard", screen.written)
+
+
+class TestKeyHelpIsComplete(unittest.TestCase):
+    """A binding users cannot discover may as well not exist."""
+
+    def test_the_new_keys_are_documented(self):
+        listed = {name for name, _ in agent.KEY_HELP}
+        self.assertIn("Ctrl+Z", listed)
+        self.assertIn("Ctrl+Y", listed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

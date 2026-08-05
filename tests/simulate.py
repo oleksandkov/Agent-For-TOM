@@ -42,7 +42,19 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+# Load the same durable config the real app loads. agent_cli.py reads
+# ~/.tomas/.env; importing `agent` directly only picks up the project .env, so
+# the harness was running against a different configuration than the one the
+# user actually runs — including, silently, a different API key.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path.home() / ".tomas" / ".env")
+except Exception:
+    pass
+
 import agent
+import learning
 import mcp_manager
 import openai_adapter
 import provider_manager
@@ -103,6 +115,14 @@ REQUIRED_ENTRY_POINTS: list[tuple[object, str]] = [
     (session_manager, "audit_transcript"),
     (self_notes, "create_note"),
     (self_notes, "list_notes"),
+    (self_notes, "delete_note"),
+    (learning, "recall"),
+    (learning, "remember"),
+    (learning, "looks_like_directive"),
+    (learning, "load_directives"),
+    (learning, "directives_for_prompt"),
+    (learning, "purge_harness_probes"),
+    (learning, "repair_frontmatter_facts"),
     (self_improve, "record_tool_call"),
     (self_improve, "migrate_remove_generated"),
     (skills_manager, "discover_skills"),
@@ -343,8 +363,41 @@ def check_learning(r: Results) -> None:
             str(skills_dir))
     note_id = self_notes.create_note(
         title="Harness probe", content="written by tests/simulate.py",
-        note_type="insight", tags=["harness"])
+        note_type="insight", tags=["harness"],
+        evidence_tag=learning.HARNESS_EVIDENCE_TAG)
     r.check(s, "self-notes writable", bool(note_id), str(note_id))
+    # Clean up after ourselves. Earlier runs left these behind, they accumulated
+    # evidence until they promoted to `active`, and "Harness probe: written by
+    # tests/simulate.py" then spent a third of the retrieval budget in every
+    # real prompt.
+    try:
+        self_notes.delete_note(note_id)
+    finally:
+        purged = learning.purge_harness_probes()
+    r.check(s, "harness cleans its own learned rows out", purged >= 1,
+            f"purged {purged}")
+
+    # ── Standing rules must not go through retrieval ──
+    # The bug this guards: a rule that applies to every turn cannot be selected
+    # by how well it matches *this* turn. One 30-turn session obeyed an
+    # AGENT.md rule 29/29 and an identically-worded stored rule 0/29.
+    r.check(s, "directive phrasing is detected",
+            learning.looks_like_directive("Always end every reply with the date")
+            and learning.looks_like_directive("Завжди відповідай українською")
+            and not learning.looks_like_directive("the user prefers PowerShell"))
+    r.check(s, "directives are excluded from recall",
+            learning.KIND_DIRECTIVE not in {
+                f.get("kind") for f in
+                learning.load_active_facts(exclude_kinds=(learning.KIND_DIRECTIVE,))})
+    r.check(s, "a directive reaches the prompt without the evidence gate",
+            "directive" in {f.get("kind") for f in learning.load_facts("global")}
+            or not learning.load_directives(),
+            "no directives stored yet — vacuously true")
+    prompt = agent.build_system_prompt("unrelated question about sockets")
+    directives = learning.directives_for_prompt()
+    r.check(s, "standing rules are injected imperatively when present",
+            (not directives) or "apply to EVERY reply" in prompt,
+            f"{len(directives)} chars of directives")
 
 
 def check_web(r: Results) -> None:
@@ -628,8 +681,47 @@ def run_checks(args: argparse.Namespace) -> int:
 #  Sessions — live, needs a provider
 # ══════════════════════════════════════════════════════════════════════
 
+# A run that keeps firing prompts into a provider that has already refused
+# produces a transcript full of orphaned turns, which then gets reported as
+# though the turns ran. Stop instead, and say why.
+CONSECUTIVE_FAILURE_LIMIT = 3
+
+
+def use_harness_memory() -> Path:
+    """Point the learning store at a harness-owned directory for this run.
+
+    Live sessions write to memory — that is half of what they exist to test —
+    and `capture_stated_rule` writes *before* the model answers, so a run that
+    aborts on the first turn still persists whatever the fixture said. Left
+    pointed at the real store, one simulation put "друге: кожна методичка
+    обовʼязково має такі розділи…" into every genuine prompt the user would
+    ever send.
+
+    A separate directory rather than a temp one that is deleted: rule
+    durability *across* harness invocations is exactly what the rules-* corpus
+    measures, so the harness needs a memory that persists — just not the
+    user's.
+    """
+    from learning import reflect, store
+
+    root = Path.home() / ".tomas" / "harness" / "learned"
+    store.LEARNED_DIR = root
+    store.GLOBAL_DIR = root / "global"
+    store.PROJECTS_DIR = root / "projects"
+    store.SKILLS_DIR = store.GLOBAL_DIR / "skills"
+    store.REFLECTION_LOG = root / "reflection-log.jsonl"
+    store.TOMBSTONES_PATH = root / "tombstones.json"
+    store._MIGRATION_MARKER = root / ".migrated"
+    store._REPAIR_MARKER = root / ".repaired-frontmatter"
+    reflect.SKILLS_DIR = store.SKILLS_DIR
+    reflect.REFLECTION_LOG = store.REFLECTION_LOG
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def run_sessions(args: argparse.Namespace) -> int:
-    from tests.session_prompts import SESSIONS, by_name
+    from tests.rule_checks import evaluate, parse_rule
+    from tests.session_prompts import SESSIONS, by_name, rules_for
 
     selected = SESSIONS
     if args.session:
@@ -643,23 +735,109 @@ def run_sessions(args: argparse.Namespace) -> int:
     agent.COMBINED_TOOLS = agent.TOOLS
     agent.TOOL_TOKENS = sum(len(json.dumps(t)) for t in agent.TOOLS) // 6
 
+    # The permission mode is part of the experiment, so state it. Previous runs
+    # inherited an interactive default with nothing to answer the prompt, so
+    # every write_file and run_command came back denied — and the results were
+    # still reported as capability findings.
+    mode = getattr(args, "permissions", "yolo")
+    agent.YOLO_MODE = (mode == "yolo")
+    agent.AUTO_APPROVE_LOW = (mode in ("yolo", "auto"))
+    print(f" permissions: {mode} "
+          f"(yolo={agent.YOLO_MODE}, auto_approve_low={agent.AUTO_APPROVE_LOW})")
+
+    if getattr(args, "memory", "harness") == "harness":
+        print(f" memory     : {use_harness_memory()}")
+    else:
+        print(f" memory     : {RED}REAL ~/.tomas/learned — this run will write "
+              f"to your actual memory{RESET}")
+
+    cli_rules = list(args.expect or [])
     failures = 0
     for name, goal, turns in selected:
         turns = turns[:args.turns] if args.turns else turns
         print(f"\n{'=' * 62}\n session: {name}\n goal:    {goal}\n{'=' * 62}")
         agent.reset_session_state()
         messages: list[dict] = []
-        system_prompt = agent.build_system_prompt(goal)
+
+        # A session declares the rules it is measured against; --expect adds
+        # to them. Declaring them beside the prompts keeps a complex rule
+        # readable next to the turns meant to exercise it.
+        try:
+            rules = [parse_rule(spec) for spec in rules_for(name) + cli_rules]
+        except ValueError as e:
+            print(f"{RED}[FAIL]{RESET} {e}")
+            return 2
+
+        planned = len(turns)
+        answered = 0
+        # Three counters per rule, not one. "Did not apply" must never be
+        # folded into "failed": a structural rule is irrelevant on a one-line
+        # answer, and counting those as misses reports 20% for a rule that was
+        # followed every single time it was relevant.
+        obeyed = {rule["name"]: 0 for rule in rules}
+        applied = {rule["name"]: 0 for rule in rules}
+        injected_log: list[dict] = []
+        consecutive_failures = 0
+        aborted = ""
 
         for i, prompt in enumerate(turns, 1):
-            print(f"\n  [turn {i}/{len(turns)}] {prompt}")
+            print(f"\n  [turn {i}/{planned}] {prompt}")
             messages.append({"role": "user", "content": prompt})
+
+            # Rebuilt per turn, exactly as the REPL does it (agent.py). Building
+            # it once per session — as this harness used to — meant every turn
+            # ran against knowledge retrieved for the *goal string*, so per-turn
+            # retrieval was never actually exercised by any run.
+            system_prompt = agent.build_system_prompt(prompt)
+
+            # What the model was actually given. Without this column there is no
+            # way to tell "the rule was missing from the prompt" from "the rule
+            # was there and ignored" — and that distinction is the whole finding.
+            injected = {
+                "turn": i,
+                "prompt": prompt,
+                "directives": learning.directives_for_prompt(),
+                "recalled": learning.recall(prompt, k=5),
+            }
+
             try:
                 reply = agent.agent_loop(system_prompt, messages)
             except Exception as e:
                 print(f"  {RED}turn failed:{RESET} {type(e).__name__}: {e}")
                 reply = ""
+
+            injected["answered"] = bool((reply or "").strip())
+            if injected["answered"]:
+                answered += 1
+                consecutive_failures = 0
+                verdicts = {}
+                for rule in rules:
+                    applicable, passed, detail = evaluate(rule, prompt, reply)
+                    verdicts[rule["name"]] = {
+                        "applicable": applicable, "passed": passed,
+                        "detail": detail,
+                    }
+                    if applicable:
+                        applied[rule["name"]] += 1
+                        obeyed[rule["name"]] += passed
+                injected["rules"] = verdicts
+                broke = [n for n, v in verdicts.items()
+                         if v["applicable"] and not v["passed"]]
+                if broke:
+                    print(f"  {RED}rule broken:{RESET} " + ", ".join(
+                        f"{n} ({verdicts[n]['detail']})" for n in broke))
+            else:
+                consecutive_failures += 1
+            injected_log.append(injected)
+
             print(f"  -> {(reply or '(no reply)')[:160]}")
+
+            if consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
+                aborted = (f"{consecutive_failures} consecutive turns produced no "
+                           f"reply — provider is refusing. Stopped at turn {i} of "
+                           f"{planned}.")
+                print(f"\n  {RED}ABORTED:{RESET} {aborted}")
+                break
 
         telemetry = agent.session_telemetry()
         sid = session_manager.save_session(
@@ -670,13 +848,42 @@ def run_sessions(args: argparse.Namespace) -> int:
         saved = json.loads((Path.home() / ".tomas" / "sessions" / f"{sid}.json")
                            .read_text(encoding="utf-8"))
         tm = saved.get("turn_metrics", {})
-        status = f"{GREEN}complete{RESET}" if saved.get("complete") else f"{RED}INCOMPLETE{RESET}"
-        if not saved.get("complete"):
+
+        log_path = PROJECT_DIR / f"session_audit_{sid}.json"
+        log_path.write_text(json.dumps({
+            "session": sid, "name": name, "goal": goal,
+            "planned": planned, "answered": answered,
+            "aborted": aborted,
+            "rules": rules,
+            "adherence": {k: {"obeyed": v, "applicable": applied[k],
+                              "of_answered": answered}
+                          for k, v in obeyed.items()},
+            "turns": injected_log,
+        }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        # An aborted run or a transcript the auditor calls incomplete is a
+        # failure, never a partial pass. Reporting a session as "evaluated"
+        # when it produced no replies is the specific mistake this guards.
+        ok = saved.get("complete") and not aborted and answered == planned
+        status = f"{GREEN}complete{RESET}" if ok else f"{RED}INCOMPLETE{RESET}"
+        if not ok:
             failures += 1
+
         print(f"\n  saved {sid} [{status}] "
+              f"answered {answered}/{planned} "
               f"total {tm.get('total_duration_sec', 0)}s "
               f"avg {tm.get('avg_turn_sec', 0)}s "
               f"{len(saved.get('tool_log', []))} tool calls")
+        for rule_name, count in obeyed.items():
+            # Four separate numbers. A rate over turns that never ran is how
+            # "16/28" got reported for a session with 16 answered turns; a rate
+            # over turns the rule never applied to is the same mistake wearing
+            # a different hat.
+            n = applied[rule_name]
+            pct = f"{100 * count / n:.0f}%" if n else "n/a"
+            print(f"    rule {rule_name}: obeyed {count}/{n} applicable ({pct}) "
+                  f"| {answered} answered of {planned} planned")
+        print(f"    audit -> {log_path.name}")
 
     return 1 if failures else 0
 
@@ -699,6 +906,23 @@ def main(argv: list[str] | None = None) -> int:
     p_sessions.add_argument("--turns", type=int, default=0,
                             help="cap turns per session (0 = all)")
     p_sessions.add_argument("--session", help="run one session by name")
+    p_sessions.add_argument("--expect", action="append", metavar="NAME=TEXT",
+                            help="score every reply for TEXT and report "
+                                 "obeyed/answered/planned. Repeatable, e.g. "
+                                 "--expect date=2026-08-05 --expect lord='my lord'")
+    p_sessions.add_argument("--memory", default="harness",
+                            choices=("harness", "real"),
+                            help="where live sessions write learned facts. "
+                                 "Defaults to a harness-owned store under "
+                                 "~/.tomas/harness/, because simulation "
+                                 "fixtures otherwise land in every real prompt "
+                                 "forever.")
+    p_sessions.add_argument("--permissions", default="yolo",
+                            choices=("yolo", "auto", "default"),
+                            help="permission mode for the run. Defaults to yolo: "
+                                 "a run that denies every write measures the "
+                                 "denial path, not the capability it claims to "
+                                 "test, and earlier runs silently did that.")
 
     args = parser.parse_args(argv)
 
