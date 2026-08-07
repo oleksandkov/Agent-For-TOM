@@ -152,6 +152,11 @@ class TurnFinished(AgentEvent):
     reply: str
     usage: dict = field(default_factory=dict)
     seconds: float = 0.0
+    # Set when the turn ended early because the host's interrupt signal
+    # (e.g. an adapter's Esc watcher) was seen, rather than reaching a
+    # natural end_turn/error. Adapters use it to render "stopped" rather
+    # than "finished".
+    interrupted: bool = False
 
 
 @dataclass

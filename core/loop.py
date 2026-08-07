@@ -288,6 +288,11 @@ def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
         messages=state.messages,
     ) as stream:
         for event in stream:
+            # Checked per chunk rather than only between turns: without this
+            # an Esc pressed mid-reply had to wait for the whole streamed
+            # answer to finish before it did anything.
+            if state.interrupted():
+                break
             if event.type == "content_block_delta":
                 if event.delta.type == "text_delta":
                     text_parts.append(event.delta.text)
@@ -512,12 +517,34 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
     discarded = ""
 
     while True:
+        # Checked once per iteration — after a tool batch or a continuation
+        # extension, before spending another model call — as well as inside
+        # the streaming and tool-execution loops below, which is where an
+        # Esc pressed mid-turn is actually seen.
+        if state.interrupted():
+            yield TurnFinished(reply="", usage=dict(state.usage),
+                               seconds=time.perf_counter() - started,
+                               interrupted=True)
+            return
+
         yield ThinkingStarted(state.get_model())
 
         # ── Streaming attempt ──
         if state.streaming_enabled:
             try:
                 text, wants_tools = yield from _stream_call(state)
+                if state.interrupted():
+                    # Whatever text arrived stays; a tool_use block that had
+                    # started is dropped rather than completed non-streamed —
+                    # acting on it after being told to stop would be worse
+                    # than showing an incomplete answer.
+                    if text:
+                        state.messages.append(
+                            {"role": "assistant", "content": text})
+                    yield TurnFinished(reply=text, usage=dict(state.usage),
+                                       seconds=time.perf_counter() - started,
+                                       interrupted=True)
+                    return
                 if not wants_tools:
                     if state.last_stop_reason == "max_tokens":
                         if _can_escalate(state, text, escalated):
@@ -630,6 +657,18 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
         # ── Execute ──
         tool_results = []
         for block in tool_blocks:
+            # A queued call that hasn't started yet is simply skipped — the
+            # one already running (if any) is stopped from inside its own
+            # handler (run_command polls this same signal to kill its
+            # subprocess), not by anything here.
+            if state.interrupted():
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": "Not executed: interrupted by user (Esc).",
+                })
+                continue
+
             risk = state.risk_of(block.name, block.input)
             yield ToolStarted(block.id, block.name, block.input, risk,
                               origin=state.origin_of(block.name))

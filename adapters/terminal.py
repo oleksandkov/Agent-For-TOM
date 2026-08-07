@@ -68,6 +68,16 @@ def summarise_args(name: str, args: dict) -> str:
     """One readable line for a tool call, in the caller's own script."""
     if not args:
         return ""
+    if name == "ask_user_question":
+        # The full options/descriptions are about to be drawn by the
+        # interactive picker itself; echoing the raw questions array here
+        # (the generic JSON fallback below) would print the same content
+        # twice, once as an unreadable escaped dump.
+        qs = args.get("questions") or []
+        n = len(qs)
+        first = str((qs[0] or {}).get("question", "")) if qs else ""
+        suffix = f" (+{n - 1} more)" if n > 1 else ""
+        return shorten(first.replace("\n", " "), max(20, term_width() - 40)) + suffix
     key = _HEADLINE_ARG.get(name)
     if key and key in args:
         head = str(args[key])
@@ -79,6 +89,33 @@ def summarise_args(name: str, args: dict) -> str:
     return shorten(rendered, max(20, term_width() - 40))
 
 
+def _poll_esc() -> bool:
+    """True if Esc was just pressed, without blocking.
+
+    Windows-only — matches the msvcrt-based input handling the rest of this
+    codebase already uses (see the "Windows-only REPL" note in CLAUDE.md).
+    Safe to call from a background thread: it only ever runs while the main
+    thread is blocked inside a model/tool call, never while input() is also
+    reading the console (every prompt stops the spinner first), so there is
+    no concurrent reader to race with.
+    """
+    try:
+        import msvcrt
+    except ImportError:
+        return False
+    if not msvcrt.kbhit():
+        return False
+    ch = msvcrt.getwch()
+    if ch == '\x1b':
+        return True
+    # Arrow/function keys arrive as a two-byte sequence ('\xe0' or '\x00'
+    # then a scan code); swallow the second byte so it isn't left sitting in
+    # the buffer to be misread as a stray character by the next real read.
+    if ch in ('\xe0', '\x00') and msvcrt.kbhit():
+        msvcrt.getwch()
+    return False
+
+
 class Thinking:
     """A one-line 'working' indicator for the wait before the first token.
 
@@ -86,14 +123,20 @@ class Thinking:
     several seconds of apparently-dead terminal that reads as a hang. This
     occupies exactly one line, erases itself completely, and never runs when
     output is not a terminal (so transcripts and tests stay clean).
+
+    Also doubles as the Esc-interrupt watcher: it is the one place already
+    polling in a background thread throughout a turn, so a single Esc press
+    is checked here rather than opening a second listener.
     """
 
     FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
-    def __init__(self, label: str = "thinking"):
+    def __init__(self, label: str = "thinking",
+                 interrupt: "threading.Event | None" = None):
         self.label = label
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._interrupt = interrupt
 
     def start(self) -> None:
         if self._thread is not None:
@@ -110,11 +153,20 @@ class Thinking:
         i = 0
         started = time.monotonic()
         while not self._stop.wait(0.08):
+            if self._interrupt is not None and _poll_esc():
+                self._interrupt.set()
+                try:
+                    sys.stdout.write(f"\r\033[2K  {DIM}⎋ stopping…{RESET}")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+                return
             frame = self.FRAMES[i % len(self.FRAMES)]
             secs = time.monotonic() - started
             elapsed = f" {secs:.0f}s" if secs >= 3 else ""
+            hint = "  (Esc to stop)" if self._interrupt is not None and secs >= 3 else ""
             try:
-                sys.stdout.write(f"\r\033[2K  {DIM}{frame} {self.label}{elapsed}{RESET}")
+                sys.stdout.write(f"\r\033[2K  {DIM}{frame} {self.label}{elapsed}{hint}{RESET}")
                 sys.stdout.flush()
             except Exception:
                 return
@@ -142,6 +194,12 @@ class TerminalAdapter:
         self._non_interactive_notice_shown = False
         self._stream: StreamWrap | None = None
         self._thinking: Thinking | None = None
+        # One press stops the turn — see Thinking, which polls for it, and
+        # is_interrupted(), which core.state.AgentState.interrupted reads.
+        self.esc_interrupt = threading.Event()
+
+    def is_interrupted(self) -> bool:
+        return self.esc_interrupt.is_set()
 
     # ── Driving ────────────────────────────────────────────────────
 
@@ -162,7 +220,7 @@ class TerminalAdapter:
         reply = ""
         # Started before the first `next()`, which is where the request is
         # actually sent and where all the waiting happens.
-        self._thinking = Thinking()
+        self._thinking = Thinking(interrupt=self.esc_interrupt)
         self._thinking.start()
         try:
             for event in gen:
@@ -203,6 +261,8 @@ class TerminalAdapter:
 
         elif isinstance(event, TurnFinished):
             self._end_stream_line()
+            if event.interrupted:
+                print(f'\n  {YELLOW}⎋{RESET}  Stopped ({event.seconds:.0f}s) — Esc was pressed.')
 
         elif isinstance(event, ToolStarted):
             self._end_stream_line()
@@ -219,6 +279,11 @@ class TerminalAdapter:
                 print(f'{head}{body}{" " * gap}{origin}')
             else:
                 print(f'{head}{body} {origin}'.rstrip())
+            # The tool call itself is a blocking wait — a slow run_command
+            # used to leave the screen dead between this line and the result,
+            # which is exactly what read as "stuck".
+            self._thinking = Thinking(label=event.name, interrupt=self.esc_interrupt)
+            self._thinking.start()
 
         elif isinstance(event, ToolFinished):
             result = event.result
@@ -233,7 +298,7 @@ class TerminalAdapter:
                 print(f'    {mark} {DIM}{shown}{RESET}')
             # The model is about to be called again with this result; that
             # wait is the same dead air the indicator exists for.
-            self._thinking = Thinking()
+            self._thinking = Thinking(interrupt=self.esc_interrupt)
             self._thinking.start()
 
         elif isinstance(event, ToolResultTruncated):

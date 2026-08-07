@@ -31,6 +31,7 @@ import json
 import base64
 import shutil
 import tempfile
+import threading
 import subprocess
 import urllib.request
 import urllib.error
@@ -278,6 +279,13 @@ _session_started_at: float = time.time()
 # Turns that produced no assistant reply (e.g. retries exhausted on a 429).
 _failed_turns: list[dict] = []
 
+# The current turn's Esc-interrupt signal, if the adapter driving it exposes
+# one (see adapters.terminal.TerminalAdapter.esc_interrupt). Set by
+# build_state() at the start of every turn. handle_run_command polls it to
+# kill a running subprocess immediately rather than only at the next loop
+# checkpoint, which for a shell command can be the whole timeout away.
+_CURRENT_INTERRUPT: Optional[threading.Event] = None
+
 
 def reset_session_state() -> None:
     """Start a fresh session's accounting. Called when a session begins or
@@ -422,6 +430,20 @@ def _fetch_model_context_window() -> int:
         pass
     # Fallback to hardcoded map
     return MODEL_CONTEXT_MAP.get(model, DEFAULT_CONTEXT_WINDOW)
+
+
+def _refresh_context_window() -> int:
+    """Re-fetch and apply the context window for the active model.
+
+    Called after a mid-session provider/model switch (see the `/model` and
+    `/provider` slash commands) so compaction math (`CONTEXT_WINDOW`) and the
+    status line (`_current_context_window`) reflect the new model rather than
+    the one the session started with.
+    """
+    global _current_context_window, CONTEXT_WINDOW
+    _current_context_window = _fetch_model_context_window()
+    CONTEXT_WINDOW = _current_context_window
+    return _current_context_window
 
 
 # MCP manager (initialized at startup when main() is called)
@@ -931,7 +953,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "run_command",
-        "description": "Execute a shell command. Returns '[exit N — ok|FAILED]' followed by stdout and any stderr, so you never need to append '2>&1' or infer success from the text.",
+        "description": "Execute a shell command. Returns '[exit N — ok|FAILED]' followed by stdout and any stderr, so you never need to append '2>&1' or infer success from the text. For a process that stays running (a dev server, a watcher), launch it detached with Windows `start /b ...` (or a trailing `&`) rather than waiting on it directly — the call returns immediately once it's launched, and its output is not captured.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1024,6 +1046,55 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "name": "ask_user_question",
+        "description": (
+            "Ask the user one or more multiple-choice questions and block "
+            "until they answer, through an interactive arrow-key picker — the "
+            "same mechanism Claude Code uses. Use this when a task is "
+            "genuinely ambiguous (more than one reasonable interpretation, a "
+            "choice with real consequences, missing information only the "
+            "user has) instead of guessing and possibly doing the wrong "
+            "thing. Do not use it for questions you could answer yourself by "
+            "reading the code. Each question gets 2-4 short, mutually "
+            "exclusive options (the user can always type a custom answer "
+            "instead) plus an optional multiSelect flag for 'choose any that "
+            "apply'. Returns the user's answer(s) for every question."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {"type": "string", "description": "The complete question to ask, clear and specific."},
+                            "header": {"type": "string", "description": "Very short label for this question (max ~12 chars), e.g. 'Auth method'."},
+                            "multiSelect": {"type": "boolean", "description": "True if the user may pick more than one option. Default false."},
+                            "options": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 4,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string", "description": "Short (1-5 word) display text for this choice."},
+                                        "description": {"type": "string", "description": "Optional one-line explanation of what picking this means."},
+                                    },
+                                    "required": ["label"],
+                                },
+                            },
+                        },
+                        "required": ["question", "options"],
+                    },
+                },
+            },
+            "required": ["questions"],
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -1042,6 +1113,11 @@ RISK_LEVELS: dict[str, str] = {
     "fetch_url_with_browser": "medium",
     "search_web": "low",
     "read_mcp_resource": "low",
+    # "none", not "low": asking the user a question has no side effects at
+    # all, and gating it behind "approve this tool call?" would put a
+    # permission prompt in front of the very interaction that *is* the
+    # human-in-the-loop control. See AgentState.needs_permission.
+    "ask_user_question": "none",
 }
 
 #: The tools whose risk tier strict mode leaves alone — they are this agent's
@@ -1387,6 +1463,101 @@ def _normalise_windows_command(cmd: str) -> tuple[str, Optional[str]]:
     return cmd, None
 
 
+# A command that hands off to a process it never waits for: Windows' `start`
+# builtin, or a trailing POSIX-style `&`. subprocess.run(capture_output=True)
+# waits for the stdout/stderr pipes to reach EOF, not for the shell to exit —
+# and a detached grandchild (e.g. `start /b cmd /c "npm run dev"`) inherits
+# the write end of those pipes and keeps it open for as long as it runs. A
+# dev server launched this way blocked the tool call for the full timeout
+# with nothing on screen to say why, because the shell itself had already
+# returned instantly.
+_BACKGROUND_START_RE = re.compile(r'(?:^|[&;]|\|\|)\s*start\s+', re.IGNORECASE)
+
+
+def _looks_backgrounded(cmd: str) -> bool:
+    if sys.platform == "win32" and _BACKGROUND_START_RE.search(cmd):
+        return True
+    stripped = cmd.rstrip()
+    return stripped.endswith('&') and not stripped.endswith('&&')
+
+
+def _run_command_background(cmd: str, env: dict) -> str:
+    """Launch a detached process and return immediately, without capturing
+    its output — there is no pipe left open for anything to block on."""
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        )
+    try:
+        subprocess.Popen(
+            cmd, shell=True, cwd=str(PROJECT_DIR), env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, **kwargs,
+        )
+    except Exception as e:
+        return f"Error: failed to launch background command: {e}"
+    return ("[exit 0 — ok] Started in the background (detached) — its output "
+            "is not captured. Check the port it binds to, or its own log "
+            "file, to confirm it came up.")
+
+
+def _kill_process_tree(proc: "subprocess.Popen") -> None:
+    if sys.platform == "win32":
+        # proc.kill() only signals the direct child (cmd.exe); /T also takes
+        # down whatever it spawned, so a killed build doesn't leave orphans.
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True)
+    else:
+        proc.kill()
+
+
+def _run_command_foreground(cmd: str, env: dict, timeout: int) -> str:
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+    proc = subprocess.Popen(
+        cmd, shell=True, cwd=str(PROJECT_DIR), env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        encoding="utf-8", errors="replace", creationflags=creationflags,
+    )
+    deadline = time.monotonic() + timeout
+    stdout = stderr = ""
+    while True:
+        try:
+            # Polled in short slices rather than one blocking wait, so an Esc
+            # interrupt takes effect within a fraction of a second instead of
+            # only at the timeout.
+            stdout, stderr = proc.communicate(timeout=0.25)
+            break
+        except subprocess.TimeoutExpired:
+            if _CURRENT_INTERRUPT is not None and _CURRENT_INTERRUPT.is_set():
+                _kill_process_tree(proc)
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                return "[exit -1 — interrupted] Command killed (Esc pressed)."
+            if time.monotonic() >= deadline:
+                _kill_process_tree(proc)
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                return f"Error: command timed out after {timeout}s"
+
+    parts = []
+    if (stdout or "").strip():
+        parts.append(stdout.rstrip())
+    if (stderr or "").strip():
+        parts.append(f"[stderr]\n{stderr.rstrip()}")
+    body = "\n".join(parts) or "(no output)"
+    if len(body) > 30000:
+        body = body[:15000] + "\n\n... [truncated] ...\n\n" + body[-15000:]
+    # The exit code is always reported. A command that fails while still
+    # writing to stdout used to be indistinguishable from one that succeeded.
+    status = "ok" if proc.returncode == 0 else f"FAILED (exit {proc.returncode})"
+    return f"[exit {proc.returncode} — {status}]\n{body}"
+
+
 def handle_run_command(params: dict) -> str:
     cmd = params["command"]
     for bad in BLOCKED_PATTERNS:
@@ -1399,29 +1570,12 @@ def handle_run_command(params: dict) -> str:
     # otherwise non-ASCII output is mangled beyond recovery on the way back.
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True,
-            encoding="utf-8", errors="replace",
-            timeout=timeout, cwd=str(PROJECT_DIR), env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return f"Error: command timed out after {timeout}s"
+        if _looks_backgrounded(cmd):
+            return _run_command_background(cmd, env)
+        return _run_command_foreground(cmd, env, timeout)
     finally:
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
-
-    parts = []
-    if (result.stdout or "").strip():
-        parts.append(result.stdout.rstrip())
-    if (result.stderr or "").strip():
-        parts.append(f"[stderr]\n{result.stderr.rstrip()}")
-    body = "\n".join(parts) or "(no output)"
-    if len(body) > 30000:
-        body = body[:15000] + "\n\n... [truncated] ...\n\n" + body[-15000:]
-    # The exit code is always reported. A command that fails while still
-    # writing to stdout used to be indistinguishable from one that succeeded.
-    status = "ok" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
-    return f"[exit {result.returncode} — {status}]\n{body}"
 
 SEARCH_PAGE_SIZE = 50
 
@@ -1504,6 +1658,93 @@ def handle_read_mcp_resource(params: dict) -> str:
             lines.append(f"  ... and {len(resources) - 100} more")
         return "\n".join(lines)
     return mcp_manager.read_resource(uri, server=server)
+
+
+def handle_ask_user_question(params: dict) -> str:
+    """Ask the user one or more multiple-choice questions and block for the
+    answer(s), through the same arrow-key picker `/config` uses (`_arrow_menu`
+    / `_arrow_checklist`, defined further down this file — resolved at call
+    time, so the forward reference is fine).
+
+    Risk tier "none" (see RISK_LEVELS) means this never goes through the
+    permission prompt: the interactive question itself is the human-in-the-
+    loop control, so gating it behind a separate "approve this tool?" would
+    be a redundant prompt in front of the real one.
+    """
+    questions = (params or {}).get("questions") or []
+    if not isinstance(questions, list) or not questions:
+        return "Error: 'questions' must be a non-empty list of question objects."
+
+    # Same test `agent_loop` uses to decide TerminalAdapter(interactive=...).
+    # This tool's risk tier ("none") means it skips the permission gate that
+    # would otherwise catch a non-interactive run and deny instead of
+    # blocking — without this check, a headless run (CI, the simulation
+    # harness) would hang forever on msvcrt.getwch() waiting for a keypress
+    # that can never come.
+    if not bool(getattr(sys.stdin, "isatty", lambda: False)()):
+        return (
+            "Error: cannot ask interactively — no interactive terminal is "
+            "attached (a non-interactive/headless run). Proceed using your "
+            "best judgement, state the assumption you made, and let the "
+            "user correct it afterward if it was wrong."
+        )
+
+    OTHER_LABEL = "✎ Other (type your own answer)"
+
+    def _ask_custom() -> str:
+        try:
+            return input(f'  {DIM}Your answer:{RESET} ').strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return ""
+
+    answered = []
+    for q in questions:
+        text = str(q.get("question") or "").strip()
+        options = q.get("options") or []
+        if not text or not isinstance(options, list) or len(options) < 2:
+            continue
+        header = str(q.get("header") or "").strip()
+        multi = bool(q.get("multiSelect"))
+
+        print()
+        badge = f'  {DIM}[{header}]{RESET}' if header else ''
+        print(f'  {MAGENTA}{BOLD}▌ TOMAS asks{RESET}{badge}')
+        print(f'  {text}')
+
+        labels = []
+        for opt in options:
+            label = str(opt.get("label", "")).strip()
+            desc = str(opt.get("description", "")).strip()
+            labels.append(f'{label}  {DIM}— {desc}{RESET}' if desc else label)
+        labels.append(OTHER_LABEL)
+        other_idx = len(options)
+
+        if multi:
+            picked = _arrow_checklist(
+                text, labels, footer='Space toggle · Enter confirm · Esc skip') or []
+            chosen = []
+            for i in picked:
+                if i == other_idx:
+                    custom = _ask_custom()
+                    if custom:
+                        chosen.append(custom)
+                else:
+                    chosen.append(str(options[i].get("label", "")))
+        else:
+            idx = _arrow_menu(text, labels, footer='↑↓ move · Enter select · Esc skip')
+            chosen = []
+            if idx == other_idx:
+                custom = _ask_custom()
+                if custom:
+                    chosen.append(custom)
+            elif idx != -1:
+                chosen.append(str(options[idx].get("label", "")))
+
+        print(f'  {GREEN}→{RESET} ' + (', '.join(chosen) if chosen else '(skipped)'))
+        answered.append({"question": text, "answers": chosen})
+
+    return json.dumps({"answers": answered}, ensure_ascii=False)
 
 
 def handle_fetch_url(params: dict) -> str:
@@ -1738,6 +1979,7 @@ HANDLERS: dict[str, Callable[[dict], str]] = {
     "fetch_url_with_browser": handle_fetch_url_with_browser,
     "search_web": handle_search_web,
     "read_mcp_resource": handle_read_mcp_resource,
+    "ask_user_question": handle_ask_user_question,
 }
 
 def execute_tool(name: str, params: dict) -> str:
@@ -1797,6 +2039,22 @@ Rules:
 - Use absolute or project-relative paths.
 - If a task is done, stop calling tools and summarize.
 - Memory files listed in the memory index can be read with read_file when you need their detail.
+
+Clarifying questions:
+- When a task has more than one reasonable interpretation, involves a choice
+  with real consequences (which library, which approach, overwrite vs. merge,
+  destructive vs. safe), or is missing information only the user has, call
+  ask_user_question instead of guessing. Do not use it for something you can
+  answer yourself by reading the code or the file system.
+- Do not use it for a simple yes/no you could infer from context, and do not
+  ask more questions than the task actually needs -- one well-chosen question
+  beats four.
+- Each question needs 2-4 short, genuinely distinct options (the user can
+  always type a custom answer instead of picking one) and, for a "choose any
+  that apply" question, multiSelect: true. You can ask several questions in
+  one call when they are all blocking the same next step.
+- The tool blocks until the user answers; use the returned answer(s) directly
+  in the same turn rather than asking again or second-guessing the choice.
 
 Memory and self-improvement:
 - When the user states a durable preference, correction, or rule -- "always...",
@@ -2231,6 +2489,15 @@ def _ago(timestamp: float) -> str:
         if seconds >= size:
             return f"{int(seconds // size)}{unit} ago"
     return "just now"
+
+
+def _fmt_duration(seconds: float) -> str:
+    """How long a turn took, in the shortest form that stays readable."""
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, rest = divmod(int(seconds), 60)
+    return f"{minutes}m {rest:02d}s"
 
 
 def _render_learned_facts() -> str:
@@ -2856,6 +3123,14 @@ def mark_history_for_caching(messages: list, breakpoints: int = 3) -> int:
 
 def build_state(system_prompt: str, messages: list, responder) -> AgentState:
     """Assemble the turn context the core needs out of this module's globals."""
+    global _CURRENT_INTERRUPT
+    # handle_run_command has no access to AgentState (execute_tool is a bare
+    # (name, params) -> str callable) so it reads this module global directly
+    # to kill its subprocess the moment Esc is pressed, instead of only at
+    # the next loop checkpoint — which for a shell command can be as far away
+    # as the whole timeout.
+    _CURRENT_INTERRUPT = getattr(responder, "esc_interrupt", None)
+
     selected, withheld = tools_for_turn(messages)
     # Compacted here rather than at discovery so `ALL_TOOLS` keeps the full
     # schemas: selection scores against descriptions, and scoring clipped text
@@ -2909,6 +3184,7 @@ def build_state(system_prompt: str, messages: list, responder) -> AgentState:
         max_result_chars=MAX_RESULT_CHARS,
         streaming_enabled=(not _streaming_disabled) and caps.streaming,
         on_tool_call=_record_tool_call,
+        interrupted=getattr(responder, "is_interrupted", lambda: False),
     )
 
 
@@ -3182,14 +3458,15 @@ SLASH_COMMANDS = {
     "help":         {"desc": "Show this help message",            "icon": "ℹ"},
     "clear":        {"desc": "Clear conversation history",        "icon": "✧"},
     "status":       {"desc": "Show current model and connection", "icon": "◈"},
-    "model":        {"desc": "Display the active LLM model",      "icon": "◎"},
+    "model":        {"desc": "Show/switch model: /model [list|<name>]", "icon": "◎"},
     "mode":         {"desc": "Show/change mode: /mode [auto|default]", "icon": "⚙"},
+    "config":       {"desc": "Interactive menu: provider, model, mode", "icon": "🛠"},
     "compact":      {"desc": "Force compact conversation now",    "icon": "⚙"},
     "skills":       {"desc": "List installed skills",            "icon": "⚡"},
     "skill":        {"desc": "Run a skill: /skill <name>",        "icon": "⚡"},
     "mcp-prompt":   {"desc": "MCP prompt templates: /mcp-prompt [name]", "icon": "◈"},
     "mcp-resources": {"desc": "List resources published by MCP servers", "icon": "◈"},
-    "provider":     {"desc": "Show provider capabilities; /provider probe to re-measure", "icon": "◎"},
+    "provider":     {"desc": "Show/switch provider: /provider [list|<name>|probe]", "icon": "◎"},
     "pdf-report":   {"desc": "Generate AI news PDF report",      "icon": "📄"},
     "zen":          {"desc": "OpenCode Zen proxy status",         "icon": "◉"},
     "self-improve": {"desc": "What the agent has learned",        "icon": "🧠"},
@@ -3268,6 +3545,277 @@ def _show_commands(match: str = "") -> str:
     lines.append('')
     lines.append(f'  {DIM}Type{RESET} {CYAN}/command{RESET} {DIM}to run — or just{RESET} {CYAN}/{RESET} {DIM}to see all{RESET}')
     return '\n'.join(lines)
+
+
+def _numbered_menu_fallback(title: str, items: list[str], footer: str = "") -> int:
+    """Digit-driven stand-in for `_arrow_menu` when msvcrt is unavailable."""
+    print(f'  {BOLD}{title}{RESET}')
+    for i, label in enumerate(items, 1):
+        print(f'    {CYAN}{i}{RESET}  {label}')
+    try:
+        sel = input(f'  {DIM}{footer or "Number to choose, Enter to cancel"}:{RESET} ').strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return -1
+    if not sel or not sel.isdigit():
+        return -1
+    n = int(sel)
+    return n - 1 if 1 <= n <= len(items) else -1
+
+
+def _arrow_menu(title: str, items: list[str], footer: str = "") -> int:
+    """A minimal arrow-key picker for slash-command menus (e.g. /config).
+
+    Deliberately not `agent_cli.arrow_menu` — that lives in the TUI
+    entrypoint, and importing it here would pull `agent_cli` into the
+    headless REPL (`agent.py` already reads raw keystrokes itself for the
+    main prompt — see `read_input_with_suggestions` — so this reuses the
+    exact same two-byte codes msvcrt reports for arrow keys, '\\xe0'/'\\x00'
+    prefix then 'H'/'P', rather than a second decoding of the same keys).
+    Returns the selected index, or -1 on Esc/cancel.
+    """
+    if not items:
+        return -1
+    try:
+        import msvcrt
+    except ImportError:
+        return _numbered_menu_fallback(title, items, footer)
+
+    CLEAR_LINE = '\033[2K'
+    CURSOR_UP_N = '\033[{}A'
+    ERASE_DOWN = '\033[J'
+    HIDE_CURSOR = '\033[?25l'
+    SHOW_CURSOR = '\033[?25h'
+
+    selected = 0
+    last_rows = 0
+
+    def draw() -> int:
+        rows = 0
+        sys.stdout.write(CLEAR_LINE + f'  {BOLD}{title}{RESET}\n')
+        rows += 1
+        for i, label in enumerate(items):
+            marker = f'{GREEN}▶{RESET} ' if i == selected else '  '
+            body = f'{BOLD}{label}{RESET}' if i == selected else label
+            sys.stdout.write(CLEAR_LINE + f'  {marker}{body}\n')
+            rows += 1
+        foot = footer or '↑↓ move · Enter select · Esc cancel'
+        sys.stdout.write(CLEAR_LINE + f'  {DIM}{foot}{RESET}\n')
+        rows += 1
+        return rows
+
+    def redraw():
+        nonlocal last_rows
+        if last_rows:
+            sys.stdout.write(CURSOR_UP_N.format(last_rows) + ERASE_DOWN)
+        last_rows = draw()
+        sys.stdout.flush()
+
+    sys.stdout.write(HIDE_CURSOR)
+    try:
+        redraw()
+        while True:
+            ch = msvcrt.getwch()
+            if ch in ('\xe0', '\x00'):
+                # Extended-key prefix: arrows report 'H' (up) / 'P' (down)
+                # for the byte that follows, same as the main prompt reader.
+                ext = msvcrt.getwch()
+                if ext == 'H':
+                    selected = (selected - 1) % len(items)
+                    redraw()
+                elif ext == 'P':
+                    selected = (selected + 1) % len(items)
+                    redraw()
+                continue
+            if ch == '\r':
+                return selected
+            if ch in ('\x1b', 'q', 'Q'):
+                return -1
+            if ch.isdigit() and ch != '0':
+                n = int(ch)
+                if n <= len(items):
+                    return n - 1
+    finally:
+        sys.stdout.write(SHOW_CURSOR)
+        sys.stdout.flush()
+
+
+def _numbered_checklist_fallback(title: str, items: list[str],
+                                 footer: str = "") -> Optional[list[int]]:
+    """Digit-driven stand-in for `_arrow_checklist` when msvcrt is unavailable."""
+    print(f'  {BOLD}{title}{RESET}')
+    for i, label in enumerate(items, 1):
+        print(f'    {CYAN}{i}{RESET}  {label}')
+    try:
+        sel = input(f'  {DIM}{footer or "Comma-separated numbers, Enter for none"}:{RESET} ').strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if not sel:
+        return []
+    picked = []
+    for part in sel.split(','):
+        part = part.strip()
+        if part.isdigit() and 1 <= int(part) <= len(items):
+            picked.append(int(part) - 1)
+    return picked
+
+
+def _arrow_checklist(title: str, items: list[str], footer: str = "") -> Optional[list[int]]:
+    """Multi-select sibling of `_arrow_menu`.
+
+    ↑↓ moves, Space toggles the box under the cursor, a digit toggles that
+    item directly, Enter confirms whatever is checked (possibly nothing),
+    Esc cancels — returning `None` there rather than `[]` lets a caller tell
+    "confirmed an empty selection" from "backed out" apart.
+    """
+    if not items:
+        return []
+    try:
+        import msvcrt
+    except ImportError:
+        return _numbered_checklist_fallback(title, items, footer)
+
+    CLEAR_LINE = '\033[2K'
+    CURSOR_UP_N = '\033[{}A'
+    ERASE_DOWN = '\033[J'
+    HIDE_CURSOR = '\033[?25l'
+    SHOW_CURSOR = '\033[?25h'
+
+    cursor = 0
+    checked = [False] * len(items)
+    last_rows = 0
+
+    def draw() -> int:
+        rows = 0
+        sys.stdout.write(CLEAR_LINE + f'  {BOLD}{title}{RESET}\n')
+        rows += 1
+        for i, label in enumerate(items):
+            box = f'{GREEN}[x]{RESET}' if checked[i] else '[ ]'
+            marker = f'{GREEN}▶{RESET} ' if i == cursor else '  '
+            body = f'{BOLD}{label}{RESET}' if i == cursor else label
+            sys.stdout.write(CLEAR_LINE + f'  {marker}{box} {body}\n')
+            rows += 1
+        foot = footer or 'Space toggle · Enter confirm · Esc cancel'
+        sys.stdout.write(CLEAR_LINE + f'  {DIM}{foot}{RESET}\n')
+        rows += 1
+        return rows
+
+    def redraw():
+        nonlocal last_rows
+        if last_rows:
+            sys.stdout.write(CURSOR_UP_N.format(last_rows) + ERASE_DOWN)
+        last_rows = draw()
+        sys.stdout.flush()
+
+    sys.stdout.write(HIDE_CURSOR)
+    try:
+        redraw()
+        while True:
+            ch = msvcrt.getwch()
+            if ch in ('\xe0', '\x00'):
+                ext = msvcrt.getwch()
+                if ext == 'H':
+                    cursor = (cursor - 1) % len(items)
+                    redraw()
+                elif ext == 'P':
+                    cursor = (cursor + 1) % len(items)
+                    redraw()
+                continue
+            if ch == ' ':
+                checked[cursor] = not checked[cursor]
+                redraw()
+                continue
+            if ch == '\r':
+                return [i for i, c in enumerate(checked) if c]
+            if ch in ('\x1b', 'q', 'Q'):
+                return None
+            if ch.isdigit() and ch != '0':
+                n = int(ch)
+                if n <= len(items):
+                    checked[n - 1] = not checked[n - 1]
+                    redraw()
+    finally:
+        sys.stdout.write(SHOW_CURSOR)
+        sys.stdout.flush()
+
+
+def _config_menu(messages: list) -> str:
+    """Arrow-key /config menu: pick provider, model or mode without leaving chat.
+
+    Every actual switch is delegated to `/provider`, `/model` and `/mode`
+    (via a recursive `handle_slash_command` call), so this command carries no
+    switching logic of its own that could drift out of sync with theirs — it
+    is purely a picker sitting in front of commands that already work.
+    """
+    import provider_manager
+
+    while True:
+        active = provider_manager.get_active()
+        providers = provider_manager.list_providers()
+        mode = current_mode_name()
+
+        top_items = [
+            f'Provider   {active.name if active else "(none configured)"}',
+            f'Model      {_get_model()}',
+            f'Mode       {mode}',
+            'Close',
+        ]
+        top = _arrow_menu('TOMAS Config', top_items,
+                          footer='↑↓ move · Enter select · Esc close')
+        if top in (-1, 3):
+            return f'  {GREEN}✓{RESET} Config closed.'
+
+        if top == 0:  # ── Provider ──
+            if not providers:
+                print(f'  {DIM}No providers configured yet — use agent_cli.py to add one.{RESET}')
+                continue
+            labels = [
+                f'{"●" if active and p.name == active.name else "○"} {p.name}  '
+                f'{DIM}({p.type} · {p.model or "no model set"}){RESET}'
+                for p in providers
+            ] + ['◀ Back']
+            sel = _arrow_menu('Switch Provider', labels)
+            if sel in (-1, len(providers)):
+                continue
+            print(handle_slash_command(f'provider {providers[sel].name}', messages))
+
+        elif top == 1:  # ── Model ──
+            if active is None:
+                print(f'  {RED}No active provider — set one first.{RESET}')
+                continue
+            try:
+                models = provider_manager.available_models(active.name)
+            except Exception as e:
+                models = []
+                print(f'  {YELLOW}Could not fetch the model list: {e}{RESET}')
+            current = _get_model()
+            if models:
+                labels = [f'{"●" if m == current else "○"} {m}' for m in models]
+                labels += ['✎ Type a model name…', '◀ Back']
+                sel = _arrow_menu(f'Switch Model  ({active.name})', labels)
+                if sel in (-1, len(labels) - 1):
+                    continue
+                if sel == len(models):  # "type a model name" entry
+                    target = input(f'  {DIM}Model name:{RESET} ').strip()
+                    if not target:
+                        continue
+                else:
+                    target = models[sel]
+            else:
+                target = input(f'  {DIM}No model list from the endpoint — type a model '
+                                f'name (Enter to cancel):{RESET} ').strip()
+                if not target:
+                    continue
+            print(handle_slash_command(f'model {target}', messages))
+
+        elif top == 2:  # ── Mode ──
+            modes = ["auto", "default", "strict", "yolo", "bypass"]
+            labels = [f'{"●" if m == mode else "○"} {m}' for m in modes] + ['◀ Back']
+            sel = _arrow_menu('Switch Mode', labels)
+            if sel in (-1, len(modes)):
+                continue
+            print(handle_slash_command(f'mode {modes[sel]}', messages))
 
 
 def handle_slash_command(cmd_args: str, messages: list) -> str | None:
@@ -3362,8 +3910,48 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
         return '\n'.join(lines)
 
     if cmd == "model":
-        cw = _current_context_window
-        return f'  {CYAN}◎{RESET} {BOLD}Model:{RESET} {_get_model()} ({cw:,} token context)'
+        sub = parts[1].strip() if len(parts) > 1 else ""
+        if not sub:
+            cw = _current_context_window
+            return f'  {CYAN}◎{RESET} {BOLD}Model:{RESET} {_get_model()} ({cw:,} token context)'
+
+        if sub.lower() in ("list", "ls"):
+            import provider_manager
+            active = provider_manager.get_active()
+            if active is None:
+                return (f'  {DIM}No provider is configured. Use{RESET} '
+                        f'{CYAN}/provider list{RESET}{DIM} or agent_cli.py.{RESET}')
+            current = _get_model()
+            lines = [f'  {BOLD}Models on {active.name}{RESET}', f'  {DIM}{"─" * 46}{RESET}']
+            try:
+                models = provider_manager.available_models(active.name)
+            except Exception as e:
+                return f'  {RED}Could not list models: {e}{RESET}'
+            if not models:
+                lines.append(f'  {DIM}The endpoint did not report a model list.{RESET}')
+            else:
+                for m in models:
+                    marker = f'{GREEN}●{RESET}' if m == current else f'{DIM}○{RESET}'
+                    lines.append(f'    {marker} {m}')
+            lines.append('')
+            lines.append(f'  {DIM}Switch with{RESET} {CYAN}/model <name>{RESET}')
+            return '\n'.join(lines)
+
+        # ── Switch the model on the active provider, in place ──
+        import provider_manager
+        active = provider_manager.get_active()
+        if active is None:
+            return (f'  {RED}No active provider — configure one first '
+                    f'({RESET}{CYAN}/provider list{RESET}{RED}).{RESET}')
+        active.model = sub
+        provider_manager.save(active, activate_it=True)
+        provider_manager.apply_env("AGENT_MODEL", sub)
+        reinit_client()
+        cw = _refresh_context_window()
+        return (f'  {GREEN}✓{RESET} Switched model to {BOLD}{sub}{RESET} on {active.name} '
+                f'({cw:,} token context).\n'
+                f'  {DIM}Capabilities were measured for the previous model — run{RESET} '
+                f'{CYAN}/provider probe{RESET} {DIM}to re-measure if needed.{RESET}')
 
     if cmd == "mode":
         arg = parts[1].lower() if len(parts) > 1 else ""
@@ -3387,7 +3975,7 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
             for k in list(RISK_LEVELS.keys()):
                 if k not in ("read_file", "list_files", "search_code", "edit_file",
                              "write_file", "save_memory", "run_command", "fetch_url",
-                             "fetch_url_with_browser", "search_web"):
+                             "fetch_url_with_browser", "search_web", "ask_user_question"):
                     RISK_LEVELS[k] = "high"
             return (
                 f'  {GREEN}✓{RESET} Mode set to {BOLD}strict{RESET} — '
@@ -3435,6 +4023,9 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
         ]
         return '\n'.join(lines)
 
+    if cmd == "config":
+        return _config_menu(messages)
+
     if cmd == "compact":
         if not messages:
             return f'  {DIM}No conversation to compact.{RESET}'
@@ -3472,10 +4063,49 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
 
     if cmd == "provider":
         import provider_manager
+        sub_raw = parts[1].strip() if len(parts) > 1 else ""
+        sub = sub_raw.lower()
+
+        if sub in ("list", "ls"):
+            providers = provider_manager.list_providers()
+            if not providers:
+                return f'  {DIM}No provider is configured. Use{RESET} {CYAN}agent_cli.py{RESET}{DIM} to add one.{RESET}'
+            active_provider = provider_manager.get_active()
+            active_name = active_provider.name if active_provider else None
+            lines = [f'  {BOLD}Configured Providers{RESET}', f'  {DIM}{"─" * 46}{RESET}']
+            for p in providers:
+                marker = f'{GREEN}●{RESET}' if p.name == active_name else f'{DIM}○{RESET}'
+                lines.append(f'    {marker} {p.name} {DIM}({p.type} · {p.model or "no model set"}){RESET}')
+            lines.append('')
+            lines.append(f'  {DIM}Switch with{RESET} {CYAN}/provider <name>{RESET}')
+            return '\n'.join(lines)
+
+        # ── Switch to a different configured provider ──
+        if sub and sub != "probe":
+            names = [p.name for p in provider_manager.list_providers()]
+            exact = [n for n in names if n.lower() == sub]
+            partial = [n for n in names if sub in n.lower()]
+            target = exact[0] if exact else (partial[0] if len(partial) == 1 else None)
+            if target is None:
+                if len(partial) > 1:
+                    return (f'  {YELLOW}Multiple providers match "{sub_raw}":{RESET} '
+                            f'{", ".join(partial)}')
+                return (f'  {RED}No configured provider matches "{sub_raw}".{RESET}\n'
+                        f'  {DIM}Run{RESET} {CYAN}/provider list{RESET} '
+                        f'{DIM}to see what is configured.{RESET}')
+            current = provider_manager.get_active()
+            if current and target == current.name:
+                return f'  {DIM}{target} is already the active provider.{RESET}'
+            if not provider_manager.activate(target):
+                return f'  {RED}Failed to activate "{target}".{RESET}'
+            cw = _refresh_context_window()
+            switched = provider_manager.get_active()
+            return (f'  {GREEN}✓{RESET} Switched provider to {BOLD}{target}{RESET} — '
+                    f'model {switched.model or "(unset)"} ({cw:,} token context).')
+
         provider = provider_manager.get_active()
         if provider is None:
             return f'  {DIM}No provider is configured. Use{RESET} {CYAN}agent_cli.py{RESET}{DIM} to add one.{RESET}'
-        sub = parts[1].lower() if len(parts) > 1 else ""
         if sub == "probe":
             # A capability learned by degradation is sticky by design, so
             # there has to be a way to re-measure — a transient failure must
@@ -4695,8 +5325,7 @@ def main() -> int:
     _ensure_zen_proxy()
 
     # ── Fetch real context window for the current model ──
-    _current_context_window = _fetch_model_context_window()
-    CONTEXT_WINDOW = _current_context_window
+    _refresh_context_window()
 
     # ── Startup banner ──
     print()
@@ -4890,7 +5519,8 @@ def main() -> int:
             s = _session_tokens
             if s["calls"] > 0:
                 pct = (t["input"] + t["output"]) / CONTEXT_WINDOW * 100
-                print(f'  {DIM}┄  {t["input"]:,} in  {t["output"]:,} out  ·  total: {s["input"]:,} in  {s["output"]:,} out  ·  {pct:.1f}% of {CONTEXT_WINDOW:,} ctx{RESET}')
+                elapsed = _fmt_duration(_turn_timings[-1]) if _turn_timings else "?"
+                print(f'  {DIM}┄  {t["input"]:,} in  {t["output"]:,} out  ·  total: {s["input"]:,} in  {s["output"]:,} out  ·  {pct:.1f}% of {CONTEXT_WINDOW:,} ctx  ·  {elapsed}{RESET}')
             # ── Self-improvement analysis, after the reply so it never adds latency ──
             try:
                 self_improve.maybe_analyze_after_turn()

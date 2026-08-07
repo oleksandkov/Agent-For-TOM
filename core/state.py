@@ -110,13 +110,28 @@ class AgentState:
     # the slow one or which one failed.
     on_tool_call: Optional[Callable[[str, dict, str, int, bool], None]] = None
 
+    # "Stop as soon as it's safe to." The core has no keyboard access (see
+    # loop.py's module docstring) and cannot cancel a socket read mid-flight,
+    # so this is polled at checkpoints — before a new model call, between
+    # queued tool calls, per streamed chunk — rather than force-killing
+    # anything. An adapter's Esc-watcher thread is what makes it True.
+    interrupted: Callable[[], bool] = lambda: False
+
     def needs_permission(self, name: str, args: dict) -> bool:
         """True if this call must be put to the responder."""
         if self.yolo:
             return False
         if self.approvals.is_approved(name, args):
             return False
-        if self.risk_of(name, args) == "low" and self.auto_approve_low:
+        risk = self.risk_of(name, args)
+        # "none" is a tier below "low": a call with no side effects at all
+        # (e.g. asking the user a question) never needs approval, in any
+        # mode — unlike "low" it does not depend on auto_approve_low, because
+        # gating it on that would put a permission prompt in front of the
+        # interaction that *is* the human-in-the-loop control.
+        if risk == "none":
+            return False
+        if risk == "low" and self.auto_approve_low:
             return False
         return True
 

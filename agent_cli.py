@@ -2740,13 +2740,104 @@ def cmd_mcp_enable():
     print(f"✓ Server '{name}' enabled. It will be connected on next agent start.")
 
 
-def cmd_setup():
-    """Install default MCP servers and configure environment.
+#: Every server `cmd_setup` configures by default. All seven run with no
+#: API key and no account -- none needs a credential to enable, so none
+#: needs one to *work* immediately after install. A server that requires a
+#: key (Tavily search, GitHub, ...) is deliberately never in this list; add
+#: those yourself with `TOMAS mcp add` once you have the credential, so
+#: setup never writes a config that is enabled but broken.
+DEFAULT_MCP_SERVERS = (
+    "playwright", "context7", "word-docs", "sequential-thinking",
+    "fetch", "time", "excel", "pdf",
+)
 
-    Installs the default set of MCP servers for TOMAS:
-      - playwright: browser automation (npx @playwright/mcp)
+
+def _check_mcp_health(names, timeout: int = 45) -> dict[str, dict]:
+    """Actually connect to each named server and list its tools.
+
+    Writing a config entry only proves the JSON is well-formed -- it says
+    nothing about whether `npx`/`uvx` exist on PATH, whether the package
+    resolves, or whether the process speaks MCP once it starts. This is the
+    only way to tell "configured" from "working".
+
+    Bounded per server: a first run downloads the package fresh (npm/PyPI),
+    which can take a while but must not be able to hang setup forever. A
+    server that is still starting when its budget runs out is reported as
+    pending, not as broken -- the process is left running rather than
+    killed, since it may simply need more time to finish that first fetch.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import wait as futures_wait
+    from mcp_manager import MCPServer, read_mcp_servers
+
+    configs = read_mcp_servers()
+    results: dict[str, dict] = {}
+
+    def probe(name: str) -> dict:
+        cfg = configs.get(name)
+        if cfg is None:
+            return {"connected": False, "error": "not configured", "tool_count": 0}
+        try:
+            server = MCPServer(name, cfg)
+            ok = server.connect()
+            row = {"connected": ok,
+                   "error": None if ok else (server._last_error or "connect failed"),
+                   "tool_count": len(server.tools) if ok else 0}
+            if ok:
+                server.disconnect()
+            return row
+        except Exception as exc:
+            return {"connected": False, "error": str(exc), "tool_count": 0}
+
+    # `wait(timeout=...)` bounds the *overall* wait to one budget shared by
+    # every server running in parallel. A `with ThreadPoolExecutor(...)`
+    # block would not do that -- its exit calls `shutdown(wait=True)`,
+    # which blocks on every still-running probe regardless of the timeout
+    # already given up on, so the bound would exist in name only.
+    pool = ThreadPoolExecutor(max_workers=max(1, len(names)))
+    futures = {pool.submit(probe, name): name for name in names}
+    done, pending = futures_wait(futures, timeout=timeout)
+    for fut in done:
+        name = futures[fut]
+        try:
+            results[name] = fut.result()
+        except Exception as exc:
+            results[name] = {"connected": False, "error": str(exc), "tool_count": 0}
+    for fut in pending:
+        name = futures[fut]
+        results[name] = {
+            "connected": False,
+            "error": f"still starting after {timeout}s -- first run downloads "
+                     f"the package; try `TOMAS mcp list` again shortly",
+            "tool_count": 0,
+        }
+    # Leave any still-pending probe to finish (or fail) on its own rather
+    # than block here waiting for it a second time.
+    pool.shutdown(wait=False)
+    return results
+
+
+def cmd_setup():
+    """Install default MCP servers, verify each one actually starts, and
+    configure environment.
+
+    Installs the default set of MCP servers for TOMAS (see
+    DEFAULT_MCP_SERVERS) -- all eight run with no API key:
+      - playwright: browser automation, official server (npx @playwright/mcp)
       - context7: up-to-date library documentation search (npx)
       - word-docs: create/edit Microsoft Word (.docx) documents (uvx)
+      - sequential-thinking: structured step-by-step reasoning scaffold (npx)
+      - fetch: fetches a URL as clean markdown, not raw HTML (uvx mcp-server-fetch)
+      - time: current time / timezone conversion (uvx mcp-server-time)
+      - excel: create/edit Microsoft Excel (.xlsx) documents (npx)
+      - pdf: merge/split/rotate/OCR/tables/forms/annotations on existing
+        PDFs -- read_file already extracts plain text, this is everything
+        beyond that (uvx mcp-pdf)
+
+    After configuring them, connects to each one and lists its tools --
+    "configured" and "working" are different claims, and only the health
+    check can tell a server that starts and answers tools/list from one
+    whose command is merely spelled correctly.
     """
     from mcp_manager import read_mcp_servers, write_mcp_server
     import subprocess, sys
@@ -2759,44 +2850,66 @@ def cmd_setup():
     print(f"{BOLD}TOMAS Setup{RESET}")
     print("─" * 50)
 
-    # ── 1. playwright MCP (always ensure script + config) ──
-    print(f"  {YELLOW}⚙ Installing playwright MCP...{RESET}")
-    src_dir = TOMAS_DIR / "src"
-    src_dir.mkdir(parents=True, exist_ok=True)
-    server_script = src_dir / "playwright_mcp_server.py"
-    # Always (re)create the server script with the latest version
-    server_script.write_text(PLAYWRIGHT_MCP_SOURCE, encoding='utf-8')
-    write_mcp_server("playwright", {
-        "type": "stdio",
-        "command": str(python_exe),
-        "args": [str(server_script)],
-    })
-    print(f"  {GREEN}✓{RESET} playwright MCP configured")
-
-    # ── 2. context7 MCP ──
     existing = read_mcp_servers()
-    if "context7" in existing:
-        print(f"  {GREEN}✓{RESET} context7 MCP already configured")
-    else:
-        write_mcp_server("context7", {
-            "type": "stdio",
-            "command": "npx",
-            "args": ["-y", "@upstash/context7-mcp"],
-        })
-        print(f"  {GREEN}✓{RESET} context7 MCP configured")
 
-    # ── 3. word-docs MCP (Microsoft Word document creation/editing) ──
-    if "word-docs" in existing:
-        print(f"  {GREEN}✓{RESET} word-docs MCP already configured")
-    else:
-        write_mcp_server("word-docs", {
-            "type": "stdio",
-            "command": "uvx",
-            "args": ["--from", "office-word-mcp-server", "word_mcp_server"],
-        })
-        print(f"  {GREEN}✓{RESET} word-docs MCP configured")
+    def ensure(name: str, config: dict) -> None:
+        """Write a server's config unless it is already there -- setup must
+        never clobber a server the user configured or customised by hand."""
+        if name in existing:
+            print(f"  {GREEN}✓{RESET} {name} MCP already configured")
+            return
+        write_mcp_server(name, config)
+        print(f"  {GREEN}✓{RESET} {name} MCP configured")
 
-    # ── 4. Install Python deps ──
+    # ── playwright: upgrade TOMAS's own old bundled script to the official
+    #    server in place, but leave a hand-configured entry alone ──
+    old_playwright = existing.get("playwright") or {}
+    is_old_bundled_script = "playwright_mcp_server.py" in " ".join(
+        str(a) for a in old_playwright.get("args", []))
+    if not old_playwright or is_old_bundled_script:
+        write_mcp_server("playwright", {
+            "type": "stdio", "command": "npx", "args": ["-y", "@playwright/mcp"],
+        })
+        print(f"  {GREEN}✓{RESET} playwright MCP configured (official @playwright/mcp)")
+    else:
+        print(f"  {GREEN}✓{RESET} playwright MCP already configured")
+
+    ensure("context7", {
+        "type": "stdio", "command": "npx", "args": ["-y", "@upstash/context7-mcp"],
+    })
+    ensure("word-docs", {
+        "type": "stdio", "command": "uvx",
+        "args": ["--from", "office-word-mcp-server", "word_mcp_server"],
+    })
+    ensure("sequential-thinking", {
+        "type": "stdio", "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+    })
+    # mcp-server-fetch and mcp-server-time both import `McpError` from
+    # `mcp.shared.exceptions` -- renamed to `MCPError` in the `mcp` SDK's
+    # latest release, which `uvx` resolves by default. Both packages import-
+    # error out on startup against that release; pinning below it is the
+    # actual fix. An exact `==` pin, not a `<` range: `_connect_stdio` runs
+    # this through `cmd.exe` on Windows (`shell=True`), which parses a bare
+    # `<` as input redirection rather than part of the argument -- `uvx
+    # --with "mcp<1.10" ...` silently breaks there even though it works
+    # invoked directly from a shell that isn't cmd.exe.
+    ensure("fetch", {
+        "type": "stdio", "command": "uvx",
+        "args": ["--with", "mcp==1.9.4", "mcp-server-fetch"],
+    })
+    ensure("time", {
+        "type": "stdio", "command": "uvx",
+        "args": ["--with", "mcp==1.9.4", "mcp-server-time"],
+    })
+    ensure("excel", {
+        "type": "stdio", "command": "npx", "args": ["--yes", "@negokaz/excel-mcp-server"],
+    })
+    ensure("pdf", {
+        "type": "stdio", "command": "uvx", "args": ["mcp-pdf"],
+    })
+
+    # ── Install Python deps ──
     print()
     print(f"  {YELLOW}⚙ Checking Python dependencies...{RESET}")
     try:
@@ -2817,180 +2930,34 @@ def cmd_setup():
         print(f"  {YELLOW}⚠ playwright install skipped: {e}{RESET}")
         print(f"  {DIM}Run manually: pip install playwright && playwright install chromium{RESET}")
 
+    # ── Verify every default server actually starts and answers -- a
+    #    config written above proves nothing about whether it works ──
+    print()
+    print(f"  {YELLOW}⚙ Verifying MCP servers (first run may download packages)...{RESET}")
+    health = _check_mcp_health(DEFAULT_MCP_SERVERS)
+    healthy = 0
+    for name in DEFAULT_MCP_SERVERS:
+        row = health.get(name) or {"connected": False, "error": "not checked", "tool_count": 0}
+        if row["connected"]:
+            healthy += 1
+            print(f"  {GREEN}✓{RESET} {name:20s} {DIM}{row['tool_count']} tool(s){RESET}")
+        else:
+            print(f"  {RED}✗{RESET} {name:20s} {DIM}{row['error']}{RESET}")
+
+    print()
+    if healthy == len(DEFAULT_MCP_SERVERS):
+        print(f"  {GREEN}✓ All {healthy} MCP servers verified working.{RESET}")
+    else:
+        failed = len(DEFAULT_MCP_SERVERS) - healthy
+        print(f"  {YELLOW}⚠ {healthy}/{len(DEFAULT_MCP_SERVERS)} MCP servers verified -- "
+              f"{failed} failed to start.{RESET}")
+        print(f"  {DIM}This usually means Node.js (npx) or uv (uvx) is not installed / on PATH.{RESET}")
+        print(f"  {DIM}Re-run{RESET} {CYAN}TOMAS setup{RESET} {DIM}once that's fixed, or check{RESET} "
+              f"{CYAN}TOMAS mcp list{RESET}")
+
     print()
     print(f"  {GREEN}✓ Setup complete!{RESET}")
     print(f"  Run {CYAN}TOMAS --run{RESET} to start the agent.")
-
-
-# ── Playwright MCP server source (embedded) ──
-# Proper MCP protocol server using Playwright for browser automation.
-PLAYWRIGHT_MCP_SOURCE = r'''"""
-Playwright MCP Server — browser automation for TOMAS agent.
-Implements the Model Context Protocol (MCP) over stdio.
-"""
-import asyncio, json, sys
-from playwright.async_api import async_playwright
-
-browser = None
-page = None
-_request_id = 0
-
-
-def next_id():
-    global _request_id
-    _request_id += 1
-    return _request_id
-
-
-TOOLS = [
-    {
-        "name": "browser_navigate",
-        "description": "Navigate to a URL in the browser",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "The URL to navigate to"}
-            },
-            "required": ["url"]
-        }
-    },
-    {
-        "name": "browser_click",
-        "description": "Click an element on the page by CSS selector",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "selector": {"type": "string", "description": "CSS selector of the element to click"}
-            },
-            "required": ["selector"]
-        }
-    },
-    {
-        "name": "browser_type",
-        "description": "Type text into an input field",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "selector": {"type": "string", "description": "CSS selector of the input element"},
-                "text": {"type": "string", "description": "Text to type"}
-            },
-            "required": ["selector", "text"]
-        }
-    },
-    {
-        "name": "browser_snapshot",
-        "description": "Get the current page text content and title",
-        "inputSchema": {
-            "type": "object",
-            "properties": {}
-        }
-    },
-    {
-        "name": "browser_screenshot",
-        "description": "Take a screenshot of the current page",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Optional file path to save the screenshot"}
-            }
-        }
-    },
-    {
-        "name": "browser_evaluate",
-        "description": "Run JavaScript in the browser and return the result",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "expression": {"type": "string", "description": "JavaScript expression to evaluate"}
-            },
-            "required": ["expression"]
-        }
-    },
-]
-
-
-async def handle_request(request: dict) -> dict:
-    global page
-    req_id = request.get("id", 0)
-    method = request.get("method", "")
-    params = request.get("params", {})
-
-    try:
-        if method == "initialize":
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "serverInfo": {"name": "playwright-mcp", "version": "1.0.0"},
-                    "capabilities": {"tools": {}}
-                }
-            }
-        elif method == "notifications/initialized":
-            return None  # no response for notifications
-        elif method == "tools/list":
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {"tools": TOOLS}
-            }
-        elif method == "tools/call":
-            name = params.get("name", "")
-            args = params.get("arguments", {})
-            if not page:
-                p = await async_playwright().start()
-                browser = await p.chromium.launch(headless=True)
-                page = await browser.new_page()
-
-            if name == "browser_navigate":
-                await page.goto(args["url"])
-                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Navigated to {args['url']}"}]}}
-            elif name == "browser_click":
-                await page.click(args["selector"])
-                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "Clicked"}]}}
-            elif name == "browser_type":
-                await page.fill(args["selector"], args["text"])
-                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "Typed"}]}}
-            elif name == "browser_snapshot":
-                title = await page.title()
-                text = await page.evaluate("() => document.body.innerText")
-                url = page.url
-                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Title: {title}\nURL: {url}\n\n{text[:15000]}"}]}}
-            elif name == "browser_screenshot":
-                path = args.get("path")
-                await page.screenshot(path=path or None)
-                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "Screenshot taken"}]}}
-            elif name == "browser_evaluate":
-                result = await page.evaluate(args["expression"])
-                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": str(result)[:5000]}]}}
-            else:
-                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown tool: {name}"}}
-        else:
-            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown method: {method}"}}
-    except Exception as e:
-        return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": str(e)[:500]}}
-
-
-async def main():
-    loop = asyncio.get_event_loop()
-    while True:
-        line = await loop.run_in_executor(None, sys.stdin.readline)
-        if not line:
-            break
-        try:
-            request = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        response = await handle_request(request)
-        if response is not None:
-            resp_bytes = (json.dumps(response) + "\n").encode()
-            sys.stdout.buffer.write(resp_bytes)
-            sys.stdout.buffer.flush()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-'''
 
 
 def cmd_skill_list():
