@@ -20,6 +20,9 @@ from typing import Any, Optional
 
 TOMAS_DIR = Path.home() / ".tomas"
 NOTES_DIR = TOMAS_DIR / "self-notes"
+# Legacy constant kept for callers that patch it (tests, scratch harnesses).
+# Production I/O no longer reads it: the index path is resolved at call time
+# via _index_path(), so rebinding NOTES_DIR takes effect everywhere.
 NOTES_INDEX = NOTES_DIR / "index.json"
 
 MAX_NOTES = 200
@@ -56,12 +59,26 @@ def _generate_note_id() -> str:
 #  Index management
 # ═══════════════════════════════════════════════════════════════
 
+def _index_path() -> Path:
+    """The notes index file, resolved at call time.
+
+    Used to be a module constant (`NOTES_INDEX = NOTES_DIR / "index.json"`)
+    frozen at import. That split the store when NOTES_DIR was rebound — tests
+    redirected the .md bodies to a temp dir while every index read/write kept
+    hitting the real location, growing phantom entries in the user's store
+    (CF-1). Computing the path here means any NOTES_DIR rebinding (a test
+    redirection or a runtime relocation) takes effect for the index too.
+    """
+    return NOTES_DIR / "index.json"
+
+
 def _load_index() -> dict:
     """Load the notes index file."""
-    if not NOTES_INDEX.exists():
+    path = _index_path()
+    if not path.exists():
         return {"notes": []}
     try:
-        return json.loads(NOTES_INDEX.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {"notes": []}
 
@@ -69,7 +86,7 @@ def _load_index() -> dict:
 def _save_index(index: dict) -> None:
     """Save the notes index file."""
     _ensure_dirs()
-    NOTES_INDEX.write_text(
+    _index_path().write_text(
         json.dumps(index, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )

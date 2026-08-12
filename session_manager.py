@@ -258,6 +258,17 @@ def save_session(
         "summary": summary,
         "turn_metrics": telemetry.get("turn_metrics", {}),
         "tool_log": telemetry.get("tool_log", []),
+        # Explicitly listed keys, so anything session_telemetry() grows has to
+        # be added here too or it never reaches disk. context_events was
+        # produced correctly for a whole sweep and silently dropped at this
+        # line, which made compaction unobservable in exactly the reports it
+        # was added for.
+        "context_events": telemetry.get("context_events", []),
+        # Recorded whether or not the session is complete. Nesting this inside
+        # incomplete_reason meant a finished session threw away the fact that
+        # some of its turns produced nothing.
+        "failed_turns": failed_turns,
+        "low_content_turns": telemetry.get("low_content_turns", []),
         "messages": messages,
     }
     if not complete:

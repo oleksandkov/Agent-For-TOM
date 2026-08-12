@@ -38,6 +38,9 @@ import urllib.error
 from pathlib import Path
 from typing import Callable, Optional
 
+from core import context as core_context
+from core.context import ContextWindow
+
 # ── Windows console setup ──
 # The UI prints box-drawing and symbol glyphs (▌ ✧ ⚙ ⚡ ↳). On a console whose
 # codepage is not UTF-8 (cp1251, cp1252, cp437 — common on non-English Windows)
@@ -142,10 +145,29 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
 # nothing. Raise it when a long document or a reasoning model gets cut off.
 MAX_TOKENS = _env_int("AGENT_MAX_TOKENS", 8192, minimum=256)
 COMPACTION_THRESHOLD = 0.75  # compact when total budget (msg_tok + TOOL_TOKENS + MAX_TOKENS) exceeds this fraction of CONTEXT_WINDOW
-# Absolute ceiling, whatever the window. Past roughly this much conversation the
-# cost of re-reading it every turn outweighs what the extra history is worth,
-# and the model has usually stopped referring to the early part anyway.
-COMPACTION_CEILING = _env_int("AGENT_COMPACT_AT", 120_000, minimum=8_000)
+# Cost ceiling on top of the fit rule. Past roughly this much conversation the
+# cost of re-reading it every turn outweighs what the extra history is worth.
+#
+# It used to be a flat 120,000 combined with `min(...)`, which meant a model
+# with a 1,000,000-token window compacted as though it had 120,000 — the window
+# the user picked the model *for* was discarded silently, the same shape of bug
+# as the old `min(MAX_TOKENS, max_output_tokens)` clamp. The limit now scales
+# with the real window (see core.context.default_cost_limit); this reproduces
+# the old number exactly for every window up to 480,000.
+#
+#   unset  → derived from the window
+#   0      → cost rule off, only the fit rule applies
+#   N      → exactly N, as before
+COMPACTION_COST_LIMIT: Optional[int] = None
+_compact_at_raw = os.environ.get("AGENT_COMPACT_AT", "").strip()
+if _compact_at_raw:
+    try:
+        _compact_at = int(_compact_at_raw)
+        COMPACTION_COST_LIMIT = max(0, _compact_at)
+    except ValueError:
+        pass
+#: Retained because it is the floor the derived limit never goes below.
+COMPACTION_CEILING = core_context.COST_FLOOR
 DEFAULT_CONTEXT_WINDOW = 200_000  # fallback if API doesn't report context window (standard Claude tier)
 CONTEXT_WINDOW = DEFAULT_CONTEXT_WINDOW  # will be updated dynamically at startup
 
@@ -193,6 +215,10 @@ MODEL_CONTEXT_MAP: dict[str, int] = {
 
 # Will be updated at startup if we can fetch from API
 _current_context_window: int = DEFAULT_CONTEXT_WINDOW
+#: Where `_current_context_window` came from — see core.context.WINDOW_SOURCES.
+#: Displayed alongside the number so "measured 200,000" is distinguishable
+#: from "knew nothing and assumed 200,000".
+_current_context_source: str = "default"
 AUTO_APPROVE_LOW = os.environ.get("AGENT_AUTO_APPROVE", "1") == "1"
 YOLO_MODE = False  # when True, all tools are auto-approved without any prompt
 # Bypass mode: yolo, plus the turn is never stopped to ask whether to keep
@@ -278,6 +304,26 @@ _tool_log: list[dict] = []
 _session_started_at: float = time.time()
 # Turns that produced no assistant reply (e.g. retries exhausted on a 429).
 _failed_turns: list[dict] = []
+# Every compaction, with the arithmetic that triggered it. Compaction used to
+# print a line to stdout and nothing else, so a saved session could not
+# distinguish "compaction never ran" from "compaction ran and did not help" —
+# which is exactly the question the V3 token analysis could not answer.
+_context_log: list[dict] = []
+# Turns that finished cleanly and did nothing: no tool call, and a reply too
+# short to be an answer. `mimo-v2.5-free` replied "My Lord." — eight
+# characters, zero tools — to four consecutive "read this file" instructions
+# and every one was counted a success, because the only test applied was
+# `reply.strip()` being non-empty.
+#
+# Kept separate from _failed_turns on purpose: this is a heuristic, and a
+# heuristic must not be able to mark a good session incomplete. It reports,
+# it does not judge.
+_low_content_turns: list[dict] = []
+
+#: A reply shorter than this, with no tool call, did no work. Deliberately
+#: well under anything real: the shortest genuine reply in the V4 sweep was
+#: 19 output tokens, while the empty ones were 4.
+LOW_CONTENT_REPLY_CHARS = 24
 
 # The current turn's Esc-interrupt signal, if the adapter driving it exposes
 # one (see adapters.terminal.TerminalAdapter.esc_interrupt). Set by
@@ -296,8 +342,28 @@ def reset_session_state() -> None:
     _turn_timings.clear()
     _tool_log.clear()
     _failed_turns.clear()
+    _context_log.clear()
+    _low_content_turns.clear()
     _LAST_TOOL_SELECTION.clear()   # a new session starts with no sticky set
     _session_started_at = time.time()
+
+
+def _record_compaction(strategy: str, before: int, after: int,
+                       plan, error: Optional[str] = None) -> None:
+    """Record one compaction so the session file can show it happened."""
+    entry = {
+        "turn": len(_turn_timings) + 1,
+        "strategy": strategy,
+        "before_tokens": before,
+        "after_tokens": after,
+        "reclaimed_tokens": max(0, before - after),
+        "trigger": getattr(plan, "trigger", 0),
+        "reason": getattr(plan, "reason", ""),
+        "window": getattr(plan, "window", 0),
+    }
+    if error:
+        entry["error"] = error
+    _context_log.append(entry)
 
 
 def session_telemetry() -> dict:
@@ -312,6 +378,8 @@ def session_telemetry() -> dict:
         },
         "tool_log": list(_tool_log),
         "failed_turns": list(_failed_turns),
+        "context_events": list(_context_log),
+        "low_content_turns": list(_low_content_turns),
     }
 
 # ── Session continuation ──
@@ -395,14 +463,17 @@ def _ensure_zen_proxy():
             print(f'  {RED}✗{RESET}  Failed to start Zen proxy: {exc}')
 
 
-def _fetch_model_context_window() -> int:
-    """Query the API's /v1/models endpoint to get the real context window for the current model.
-    Falls back to MODEL_CONTEXT_MAP, then to DEFAULT_CONTEXT_WINDOW if the API is unreachable."""
-    model = _get_model()
+def _probe_models_endpoint(model: str) -> int:
+    """Ask the endpoint for this model's window. 0 when it does not say.
+
+    Split out of `_fetch_model_context_window` so the *probe* and the
+    *fallbacks* are separable: `resolve_context_window` needs to know which of
+    the two answered, and a function that silently substitutes a default
+    cannot report that.
+    """
     base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
     if not base_url:
-        # No API base URL — use fallback map
-        return MODEL_CONTEXT_MAP.get(model, DEFAULT_CONTEXT_WINDOW)
+        return 0
     try:
         models_url = base_url.rstrip("/") + "/v1/models"
         req = urllib.request.Request(models_url, method="GET")
@@ -428,8 +499,87 @@ def _fetch_model_context_window() -> int:
                     return int(cw)
     except Exception:
         pass
-    # Fallback to hardcoded map
-    return MODEL_CONTEXT_MAP.get(model, DEFAULT_CONTEXT_WINDOW)
+    return 0
+
+
+def _probed_capability_window(model: str) -> int:
+    """The window a completed provider probe measured, or 0.
+
+    `provider_manager` probes the same `/v1/models` data independently and
+    stores it on `Capabilities`. Consulting it here is what stops the two from
+    being separate truths: `/status` used to read one and `/provider` the
+    other, so the same model could be reported as 1,000,000 in one command and
+    200,000 in the next.
+    """
+    try:
+        import provider_manager
+        active = provider_manager.get_active()
+        if active is None or active.model != model:
+            return 0
+        caps = active.capabilities
+        if caps and caps.probed and caps.context_window:
+            return int(caps.context_window)
+    except Exception:
+        pass
+    return 0
+
+
+#: Resolved windows, keyed by model. Probing costs an HTTP round trip, so it
+#: happens once per model per session rather than on every status line.
+_context_window_cache: dict[str, ContextWindow] = {}
+
+
+def resolve_context_window(model: Optional[str] = None,
+                           refresh: bool = False) -> ContextWindow:
+    """The context window for `model`, with the provenance of the number.
+
+    Precedence runs from most to least trustworthy — an explicit override, a
+    measurement, a known value, then a guess. Previously the order depended on
+    whether `ANTHROPIC_BASE_URL` happened to be set, so an environment
+    variable decided which source won rather than how reliable it was.
+    """
+    model = model or _get_model() or ""
+    if not refresh and model in _context_window_cache:
+        return _context_window_cache[model]
+
+    override = _env_int("AGENT_CONTEXT_WINDOW", 0, minimum=1)
+    if override:
+        window = ContextWindow(override, "override", model)
+    else:
+        probed = _probed_capability_window(model) or _probe_models_endpoint(model)
+        if probed:
+            window = ContextWindow(probed, "probed", model)
+        elif model in MODEL_CONTEXT_MAP:
+            window = ContextWindow(MODEL_CONTEXT_MAP[model], "known", model)
+        else:
+            window = ContextWindow(DEFAULT_CONTEXT_WINDOW, "default", model)
+
+    _context_window_cache[model] = window
+    return window
+
+
+def context_window_divergence(model: Optional[str] = None) -> Optional[tuple]:
+    """`(known, probed)` when the table and the endpoint disagree, else None.
+
+    A stale `MODEL_CONTEXT_MAP` is worth knowing about: it is a hardcoded
+    table and it will rot. Silence would just mean trusting whichever source
+    happened to answer first.
+    """
+    model = model or _get_model() or ""
+    known = MODEL_CONTEXT_MAP.get(model)
+    probed = _probed_capability_window(model)
+    if known and probed and known != probed:
+        return (known, probed)
+    return None
+
+
+def _fetch_model_context_window() -> int:
+    """The active model's window as a plain int.
+
+    Kept as the historical entry point; the provenance-carrying answer is
+    `resolve_context_window()`.
+    """
+    return resolve_context_window().tokens
 
 
 def _refresh_context_window() -> int:
@@ -440,8 +590,12 @@ def _refresh_context_window() -> int:
     status line (`_current_context_window`) reflect the new model rather than
     the one the session started with.
     """
-    global _current_context_window, CONTEXT_WINDOW
-    _current_context_window = _fetch_model_context_window()
+    global _current_context_window, CONTEXT_WINDOW, _current_context_source
+    # A model switch invalidates the cached answer: the point of refreshing is
+    # to stop reporting the window of the model the session started with.
+    window = resolve_context_window(refresh=True)
+    _current_context_window = window.tokens
+    _current_context_source = window.source
     CONTEXT_WINDOW = _current_context_window
     return _current_context_window
 
@@ -1167,7 +1321,17 @@ MAX_READ_FILE_CHARS = 20000
 # ---------------------------------------------------------------------------
 
 def _resolve(path: str) -> Path:
-    p = Path(path)
+    # ~/.tomas is documented as readable, but Path() treats "~" as an ordinary
+    # directory name: "~/.tomas/memory/MEMORY.md" resolved to
+    # PROJECT_DIR/~/.tomas/... and came back "file not found", which the model
+    # only recovered from by guessing the absolute path.
+    # Only the home form is expanded. expanduser() maps "~weird" to
+    # C:\Users\weird without complaint, so a file genuinely named "~weird"
+    # must keep resolving inside the project.
+    s = str(path)
+    p = Path(s)
+    if s[:1] == "~" and (len(s) == 1 or s[1] in "/\\"):
+        p = p.expanduser()
     if not p.is_absolute():
         p = PROJECT_DIR / p
     return p.resolve()
@@ -1423,6 +1587,13 @@ def handle_list_files(params: dict) -> str:
         return _outside_project_error(path)
     if not path.exists():
         return f"Error: directory not found: {path}"
+    if not path.is_dir():
+        # Listing a file used to reach iterdir() and surface the raw OS error
+        # ("[WinError 267] The directory name is invalid"), which tells the
+        # model nothing it can act on. Naming the right tool ends the guessing
+        # in one call instead of two.
+        return (f"Error: {path} is a file, not a directory. "
+                f"Use read_file to read it.")
     entries = []
     for child in sorted(path.iterdir()):
         # skip noise
@@ -1538,11 +1709,25 @@ def _run_command_foreground(cmd: str, env: dict, timeout: int) -> str:
                 return "[exit -1 — interrupted] Command killed (Esc pressed)."
             if time.monotonic() >= deadline:
                 _kill_process_tree(proc)
+                # communicate() raised, so stdout/stderr are still "". Drain
+                # the pipes after the kill, or a 120 s test run reports the
+                # bare fact that time ran out and nothing it printed.
                 try:
-                    proc.wait(timeout=5)
+                    stdout, stderr = proc.communicate(timeout=5)
                 except Exception:
-                    pass
-                return f"Error: command timed out after {timeout}s"
+                    stdout = stderr = ""
+                timed_out = []
+                if (stdout or "").strip():
+                    timed_out.append(stdout.rstrip())
+                if (stderr or "").strip():
+                    timed_out.append(f"[stderr]\n{stderr.rstrip()}")
+                notice = f"Error: command timed out after {timeout}s"
+                if not timed_out:
+                    return notice
+                partial = "\n".join(timed_out)
+                if len(partial) > 30000:
+                    partial = partial[:15000] + "\n\n... [truncated] ...\n\n" + partial[-15000:]
+                return f"{notice} — output produced before the kill:\n{partial}"
 
     parts = []
     if (stdout or "").strip():
@@ -1579,6 +1764,19 @@ def handle_run_command(params: dict) -> str:
 
 SEARCH_PAGE_SIZE = 50
 
+#: Directories that never hold source worth grepping. Descending into them is
+#: what made one search_code call read 914 MB across 26,383 files — 244 s to
+#: return 16 matches. Pruning is measured relative to the *search root*, so
+#: pointing search_code into .venv on purpose still works; only incidental
+#: descent is skipped.
+SEARCH_IGNORE_DIRS = frozenset({
+    ".git", ".venv", "venv", "node_modules", "__pycache__", "site-packages",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".next", ".tox",
+    "dist", "build",
+})
+#: Past this a file is data, not code, and scanning it line-by-line is waste.
+SEARCH_MAX_FILE_BYTES = 1_000_000
+
 
 def handle_search_code(params: dict) -> str:
     pattern = params["pattern"]
@@ -1605,11 +1803,28 @@ def handle_search_code(params: dict) -> str:
 
     matches: list[str] = []
     total = 0
+    skipped = 0
     for file in candidates:
         if not file.is_file():
             continue
+        # Filtered here rather than in the glob so `file_glob` semantics are
+        # untouched. The walk itself costs ~1 s; the 244 s was read_text().
         try:
-            text = file.read_text(encoding="utf-8", errors="replace")
+            rel_dirs = set(file.relative_to(path).parts[:-1])
+        except ValueError:
+            rel_dirs = set()
+        if rel_dirs & SEARCH_IGNORE_DIRS:
+            skipped += 1
+            continue
+        try:
+            if file.stat().st_size > SEARCH_MAX_FILE_BYTES:
+                skipped += 1
+                continue
+            data = file.read_bytes()
+            if b"\0" in data[:8192]:   # binary: a "match" here is unusable
+                skipped += 1
+                continue
+            text = data.decode("utf-8", errors="replace")
         except Exception:
             continue
         for i, line in enumerate(text.splitlines(), 1):
@@ -1619,7 +1834,11 @@ def handle_search_code(params: dict) -> str:
                     matches.append(f"{file}:{i}: {line}")
 
     if total == 0:
-        return f"No matches for pattern: {pattern}"
+        # A silent skip is the same confident false negative the file-path
+        # branch above exists to prevent: say what was not searched.
+        note = (f" ({skipped} files skipped: vendored, binary or over "
+                f"{SEARCH_MAX_FILE_BYTES // 1000} KB)") if skipped else ""
+        return f"No matches for pattern: {pattern}{note}"
     header = f"{total} match{'' if total == 1 else 'es'}"
     shown = len(matches)
     if total > offset + shown:
@@ -1754,7 +1973,7 @@ def handle_fetch_url(params: dict) -> str:
 
     url = params["url"]
     timeout = int(params.get("timeout", 15))
-    max_size = int(params.get("max_size", 500_000))  # 500KB max for safety
+    max_size = int(params.get("max_size", 50000000))  # matches the schema (fetch_url_with_browser uses the same default)
 
     # Basic URL validation
     if not url.startswith(("http://", "https://")):
@@ -2744,10 +2963,15 @@ def prune_tool_results(messages: list,
 
 def maybe_prune(messages: list) -> list:
     """Prune if it is worth it, and say so. Mirrors `maybe_compact`'s shape."""
+    before = _estimate_tokens(messages)
     reclaimed = prune_tool_results(messages)
     if reclaimed > 0:
         print(f'  {DIM}[context] released {reclaimed:,} chars '
               f'(~{reclaimed // 4:,} tokens) of old tool results{RESET}')
+        # Recorded on the same footing as compaction: pruning is the cheap
+        # tier of the same job, and a session that pruned enough never to
+        # need a summary should be able to show that.
+        _record_compaction("prune", before, _estimate_tokens(messages), None)
     return messages
 
 
@@ -2758,18 +2982,21 @@ def maybe_compact(messages: list, system_prompt: str = "") -> list:
     """
     msg_tok = _estimate_tokens(messages)
     sys_tok = _estimate_system_prompt_tokens(system_prompt) if system_prompt else 0
-    # Total budget includes system prompt + tool definitions + max_tokens + messages
-    #
-    # Capped in absolute terms as well as proportionally. 75% of a million-token
-    # window is 750,000 tokens, so on a large-context model compaction simply
-    # never fired: a long session grew without limit and every turn paid to
-    # re-read all of it — slower and dearer each message, for history the model
-    # had long stopped using. The proportional rule still governs small windows,
-    # where 75% is the real constraint.
-    total_budget = min(CONTEXT_WINDOW * COMPACTION_THRESHOLD, COMPACTION_CEILING)
-    if msg_tok + sys_tok + TOOL_TOKENS + MAX_TOKENS < total_budget:
+    # The fit rule and the cost rule are asked separately (see
+    # core.context.compaction_plan): a 1,000,000-token window used to compact
+    # at 120,000 because one `min()` answered both questions with the smaller.
+    plan = core_context.compaction_plan(
+        used_tokens=msg_tok,
+        window_tokens=CONTEXT_WINDOW,
+        reserve_tokens=sys_tok + TOOL_TOKENS + MAX_TOKENS,
+        fit_fraction=COMPACTION_THRESHOLD,
+        cost_limit=COMPACTION_COST_LIMIT,
+    )
+    if not plan.needed:
         return messages
-    print(f'  {DIM}[context] compacting conversation...{RESET}')
+    before_tok = plan.used
+    print(f'  {DIM}[context] compacting conversation '
+          f'({plan.used:,} ≥ {plan.trigger:,} tokens, {plan.reason} limit)...{RESET}')
     try:
         resp = _get_client().messages.create(
             model=_get_model(),
@@ -2786,6 +3013,7 @@ def maybe_compact(messages: list, system_prompt: str = "") -> list:
             {"role": "assistant", "content": "I have the context from our previous conversation. What should I work on next?"},
         ]
         compacted.extend(messages[-4:])
+        _record_compaction("summary", before_tok, _estimate_tokens(compacted), plan)
         return compacted
     except Exception as e:
         print(f'  {RED}⚠{RESET} {DIM}compaction failed: {e}{RESET}')
@@ -2799,6 +3027,7 @@ def maybe_compact(messages: list, system_prompt: str = "") -> list:
             keep.insert(0, m)
             running = _estimate_tokens(keep)
         print(f'  {YELLOW}⚠{RESET} {DIM}truncated to {len(keep)} messages ({running} est. tokens){RESET}')
+        _record_compaction("truncate", before_tok, running, plan, error=str(e)[:200])
         return keep
 
 # ---------------------------------------------------------------------------
@@ -3402,6 +3631,10 @@ def agent_loop(system_prompt: str, messages: list) -> str:
     t0 = time.perf_counter()
     error: Optional[BaseException] = None
     reply = ""
+    # Snapshot rather than a counter: _tool_log is appended by the same
+    # callback every front end uses, so the difference is the tool count for
+    # this turn without threading anything new through the loop.
+    tools_before = len(_tool_log)
     try:
         # messages already carries the user's turn, so no user_message here.
         reply = adapter.run(state)
@@ -3446,6 +3679,14 @@ def agent_loop(system_prompt: str, messages: list) -> str:
                 "turn": turn_index,
                 "reason": reason,
                 "error": detail[:300],
+            })
+        elif (len(_tool_log) == tools_before
+              and len((reply or "").strip()) < LOW_CONTENT_REPLY_CHARS):
+            # Finished cleanly, called nothing, said almost nothing.
+            _low_content_turns.append({
+                "turn": turn_index,
+                "reply_chars": len((reply or "").strip()),
+                "reply": (reply or "").strip()[:80],
             })
     return reply
 
@@ -3880,13 +4121,22 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
 
     if cmd == "status":
         model_status = _get_model()
-        cw = _current_context_window
+        window = resolve_context_window()
+        cw = window.tokens
         mode = current_mode_name()
+        # What the *next* request will carry, not what the session has billed.
+        # The old line divided cumulative session tokens by the window, so a
+        # long session read "418% of 1,000,000 used" — two different
+        # quantities with the same unit.
+        live_tok = (_estimate_tokens(messages) + TOOL_TOKENS + MAX_TOKENS)
+        fill = (live_tok / cw * 100) if cw else 0.0
+        note = '' if window.trusted else f' {YELLOW}— not measured{RESET}'
         lines = [
             f'  {BOLD}TOMAS Status{RESET}',
             f'  {DIM}{"─" * 46}{RESET}',
             f'  {CYAN}◎{RESET}  Model:     {model_status}',
-            f'  {CYAN}▣{RESET}  Context:   {cw:,} tokens',
+            f'  {CYAN}▣{RESET}  Context:   {live_tok:,} / {cw:,} tokens '
+            f'({fill:.0f}%) {DIM}·{RESET} {window.source}{note}',
             f'  {CYAN}⚙{RESET}  Mode:      {mode_color(mode)}{mode}{RESET}',
             f'  {CYAN}✉{RESET}  Messages:  {len(messages)} in history',
         ]
@@ -3905,15 +4155,23 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
         # ── Token stats ──
         s = _session_tokens
         if s["calls"] > 0:
-            pct = (s["input"] + s["output"]) / cw * 100
-            lines.append(f'  {CYAN}≡{RESET}  Tokens:   {s["input"]:,} in · {s["output"]:,} out ({s["calls"]} calls) · {pct:.1f}% of {cw:,} used')
+            # Billed across the whole session — this accumulates and is not a
+            # fraction of anything. The window fill is on the Context line.
+            lines.append(f'  {CYAN}≡{RESET}  Billed:    {s["input"]:,} in · '
+                         f'{s["output"]:,} out ({s["calls"]} calls)')
+        if _context_log:
+            saved = sum(e.get("reclaimed_tokens", 0) for e in _context_log)
+            lines.append(f'  {CYAN}⇩{RESET}  Compacted: {len(_context_log)}× '
+                         f'{DIM}(~{saved:,} tokens released){RESET}')
         return '\n'.join(lines)
 
     if cmd == "model":
         sub = parts[1].strip() if len(parts) > 1 else ""
         if not sub:
-            cw = _current_context_window
-            return f'  {CYAN}◎{RESET} {BOLD}Model:{RESET} {_get_model()} ({cw:,} token context)'
+            window = resolve_context_window()
+            return (f'  {CYAN}◎{RESET} {BOLD}Model:{RESET} {_get_model()} '
+                    f'{DIM}·{RESET} {window.tokens:,} token context '
+                    f'{DIM}({window.source}){RESET}')
 
         if sub.lower() in ("list", "ls"):
             import provider_manager
@@ -3955,43 +4213,39 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
 
     if cmd == "mode":
         arg = parts[1].lower() if len(parts) > 1 else ""
-        if arg in ("auto", "automatic", "on", "1", "yes"):
-            AUTO_APPROVE_LOW = True
-            return (
-                f'  {GREEN}✓{RESET} Mode set to {BOLD}auto{RESET} — '
-                f'low-risk tools will be auto-approved.'
-            )
-        elif arg in ("default", "normal", "off", "0", "no"):
-            AUTO_APPROVE_LOW = False
-            return (
-                f'  {GREEN}✓{RESET} Mode set to {BOLD}default{RESET} — '
-                f'you will confirm each tool use.'
-            )
-        elif arg in ("strict",):
-            AUTO_APPROVE_LOW = False
-            YOLO_MODE = False
-            # Strict mode clears every approval granted via "always"
-            APPROVALS.clear()
-            for k in list(RISK_LEVELS.keys()):
-                if k not in ("read_file", "list_files", "search_code", "edit_file",
-                             "write_file", "save_memory", "run_command", "fetch_url",
-                             "fetch_url_with_browser", "search_web", "ask_user_question"):
-                    RISK_LEVELS[k] = "high"
-            return (
-                f'  {GREEN}✓{RESET} Mode set to {BOLD}strict{RESET} — '
-                f'all tools require confirmation, risk overrides cleared.'
-            )
-        elif arg in ("yolo", "YOLO"):
-            AUTO_APPROVE_LOW = True
-            YOLO_MODE = True
-            BYPASS_MODE = False
-            return (
-                f'  {BOLD}{RED}⚡ YOLO mode enabled!{RESET} {RED}All tools auto-approved.{RESET}'
-            )
-        elif arg in ("bypass", "bypass-permissions", "nonstop"):
-            AUTO_APPROVE_LOW = True
-            YOLO_MODE = True
-            BYPASS_MODE = True
+        # One writer for the flags: /mode must go through set_mode() exactly
+        # like the F5–F9 keys do. It used to write AUTO_APPROVE_LOW / YOLO_MODE
+        # / BYPASS_MODE directly, so "auto" and "default" silently left YOLO or
+        # BYPASS set — a safety reset that reported success while changing
+        # nothing. Aliases map onto the canonical names set_mode understands;
+        # unknown names fall through to the status display below.
+        alias = {
+            "automatic": "auto", "on": "auto", "1": "auto", "yes": "auto",
+            "normal": "default", "off": "default", "0": "default", "no": "default",
+            "bypass-permissions": "bypass", "nonstop": "bypass",
+        }
+        canonical = alias.get(arg, arg)
+        if canonical in ALL_MODES:
+            set_mode(canonical)
+            if canonical == "auto":
+                return (
+                    f'  {GREEN}✓{RESET} Mode set to {BOLD}auto{RESET} — '
+                    f'low-risk tools will be auto-approved.'
+                )
+            if canonical == "default":
+                return (
+                    f'  {GREEN}✓{RESET} Mode set to {BOLD}default{RESET} — '
+                    f'you will confirm each tool use.'
+                )
+            if canonical == "strict":
+                return (
+                    f'  {GREEN}✓{RESET} Mode set to {BOLD}strict{RESET} — '
+                    f'all tools require confirmation, risk overrides cleared.'
+                )
+            if canonical == "yolo":
+                return (
+                    f'  {BOLD}{RED}⚡ YOLO mode enabled!{RESET} {RED}All tools auto-approved.{RESET}'
+                )
             return (
                 f'  {BOLD}{RED}⇥ BYPASS mode enabled!{RESET} '
                 f'{RED}All tools auto-approved and the turn will not stop to '
@@ -4118,7 +4372,12 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
         when = ('never — using optimistic defaults' if not caps.probed
                 else time.strftime('%Y-%m-%d %H:%M', time.localtime(caps.probed_at)))
         yn = lambda v: f'{GREEN}yes{RESET}' if v else f'{YELLOW}no{RESET}'
-        return '\n'.join([
+        # Resolved through the same path as /status and /model. Reading
+        # caps.context_window straight off the provider is what let the two
+        # commands report different windows for one model.
+        window = resolve_context_window(provider.model, refresh=True)
+        ctx_line = f'  {DIM}Context window:{RESET} {window.describe()}'
+        out = [
             head,
             f'  {DIM}{"─" * 46}{RESET}',
             f'  {DIM}Model:{RESET}          {provider.model or "(unset)"}',
@@ -4128,11 +4387,22 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
             f'  {DIM}Streaming:{RESET}      {yn(caps.streaming)}',
             f'  {DIM}Tool use:{RESET}       {yn(caps.tool_use)}',
             f'  {DIM}System prompt:{RESET}  {yn(caps.system_prompt)}',
-            f'  {DIM}Context window:{RESET} {caps.context_window:,}',
+            ctx_line,
             f'  {DIM}Tool ceiling:{RESET}   {caps.max_tools}',
+        ]
+        # A stale MODEL_CONTEXT_MAP is worth saying out loud: it is a hardcoded
+        # table and it will rot. Silence means trusting whichever source
+        # happened to answer first.
+        diverged = context_window_divergence(provider.model)
+        if diverged:
+            known, probed = diverged
+            out.append(f'  {YELLOW}⚠{RESET}  {DIM}table says {known:,}, endpoint '
+                       f'says {probed:,} — MODEL_CONTEXT_MAP may be stale{RESET}')
+        out += [
             '',
             f'  {DIM}Run{RESET} {CYAN}/provider probe{RESET} {DIM}to re-measure against the endpoint.{RESET}',
-        ])
+        ]
+        return '\n'.join(out)
 
     if cmd in ("mcp-prompt", "mcp-prompts"):
         # Server-provided prompt templates, surfaced the same way skills are.
@@ -5393,7 +5663,9 @@ def main() -> int:
         if needs_auth or broken:
             names = sorted(needs_auth) + sorted(broken)
             shown = ', '.join(names[:4]) + ('…' if len(names) > 4 else '')
-            print(f'     {DIM}{shown} — /mcp for details{RESET}')
+            print(f'     {DIM}{shown} — MCP management is in the TUI '
+                  f'({RESET}agent_cli.py{RESET}{DIM}); {RESET}{CYAN}/mcp-resources{RESET} '
+                  f'{DIM}lists published resources{RESET}')
 
         # Resolve names once. Which tools are *sent* is decided per turn by
         # select_tools(), against what the user is actually asking for.

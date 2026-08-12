@@ -702,7 +702,14 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
             else:
                 try:
                     result = state.execute_tool(block.name, block.input)
-                    ok = True
+                    # Handlers signal soft failure by *returning* "Error: ..."
+                    # rather than raising, so "did not raise" is not success:
+                    # four command timeouts and an unreachable MCP server all
+                    # logged ok=True, and 116/116 OK became a tautology.
+                    # agent.py's _tool_log already reads this prefix the same
+                    # way; this makes `ok` agree with it.
+                    ok = not (isinstance(result, str)
+                              and result.lstrip().startswith("Error:"))
                 except Exception as e:  # a tool must never kill the turn
                     result = f"Error: tool raised {type(e).__name__}: {e}"
                     ok = False
@@ -722,11 +729,17 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
 
             yield ToolFinished(block.id, block.name, result, ms, ok=ok,
                                error=None if ok else result)
-            tool_results.append({
+            tool_result: dict = {
                 "type": "tool_result",
                 "tool_use_id": block.id,
                 "content": result,
-            })
+            }
+            if not ok:
+                # Without this the model has to notice failure by reading
+                # prose. OpenAI-format upstreams ignore the key (the adapter
+                # forwards only tool_use_id and content), so it is inert there.
+                tool_result["is_error"] = True
+            tool_results.append(tool_result)
 
         # The assistant's tool_use blocks MUST be in the transcript before the
         # tool results. OpenAI-format upstreams (everything behind zen_proxy)
