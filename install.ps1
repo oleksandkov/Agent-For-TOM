@@ -17,7 +17,10 @@
 param(
     [string]$InstallDir = "",
     [string]$RepoUrl = "https://github.com/oleksandkov/Agent-For-TOM/archive/main.zip",
-    [switch]$NoPrompt
+    [switch]$NoPrompt,
+    # Fetch the ~170 MB Playwright browser up front. Off by default -- see
+    # `Install-PlaywrightBrowser` for why it is not part of a plain install.
+    [switch]$WithBrowser
 )
 
 # -- Config ------------------------------------------------------------------
@@ -65,13 +68,78 @@ $isPiped = $MyInvocation.MyCommand.Name -eq "__remote_exec__" -or
            $MyInvocation.MyCommand.Path -eq "" -or
            [Console]::IsInputRedirected
 
+# Downloads are ~10x slower in Windows PowerShell with the progress bar on:
+# Invoke-WebRequest repaints it per chunk and blocks on the console while it
+# does. Costs nothing on pwsh 7, where it is already off.
+$ProgressPreference = 'SilentlyContinue'
+
+# -- Step counter ------------------------------------------------------------
+# One counter, so the numbers cannot disagree with each other. They did: the
+# steps ran [1/9] through [9/9] and then finished with [10/10], which is two
+# different claims about how long the install is, on screen, in the same run.
+$script:StepNo = 0
+$script:StepTotal = 11
+
+function Step {
+    param([string]$Text)
+    $script:StepNo++
+    Write-Host ""
+    Write-Host ("  [{0}/{1}] {2}" -f $script:StepNo, $script:StepTotal, $Text) -ForegroundColor Cyan
+}
+
+function StepOk   { param([string]$Text) Write-Host "        $Text" -ForegroundColor Green }
+function StepInfo { param([string]$Text) Write-Host "        $Text" -ForegroundColor DarkGray }
+
+function Install-PlaywrightBrowser {
+    <#
+      Chromium is ~170 MB and it is a *fallback*.
+
+      `web_search` prefers Playwright and drops to duckduckgo_search/ddgs when
+      it is unavailable, so the browser is a better-results upgrade, not a
+      dependency -- and downloading it unconditionally made it the single
+      longest part of the install, longer than everything else together on a
+      normal connection.
+
+      So: fetched when it is already on the machine (near-instant, keeps it
+      current), when -WithBrowser is passed, or when the user says yes. Skipped
+      by default in a piped/unattended run, where nobody is there to be asked
+      and a several-minute download is the least welcome surprise.
+    #>
+    $cached = Join-Path $env:LOCALAPPDATA "ms-playwright"
+    $alreadyHave = (Test-Path $cached) -and
+                   (Get-ChildItem $cached -Directory -Filter "chromium-*" `
+                        -ErrorAction SilentlyContinue).Count -gt 0
+
+    $want = $WithBrowser -or $alreadyHave
+    if (-not $want -and -not $NoPrompt -and -not $isPiped) {
+        Write-Host "        Download the Playwright browser for web search? " `
+                   -ForegroundColor Yellow -NoNewline
+        Write-Host "(~170 MB) [y/N] " -ForegroundColor DarkGray -NoNewline
+        $want = (Read-Host) -match '^[Yy]'
+    }
+
+    if (-not $want) {
+        StepInfo "Skipped the Playwright browser (~170 MB)."
+        StepInfo "Web search still works via duckduckgo; add it later with:"
+        StepInfo "  TOMAS browser"
+        return
+    }
+    try {
+        & $script:PythonExe -m playwright install chromium 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { StepOk "Playwright Chromium ready" }
+        else { StepInfo "Playwright browser not installed - run 'TOMAS browser' later" }
+    } catch {
+        StepInfo "Playwright browser not installed - run 'TOMAS browser' later"
+    }
+}
+
 Write-Host ""
-Write-Host "  ==========================================" -ForegroundColor Cyan
-Write-Host "       TOMAS Agent Installer v2.0" -ForegroundColor Cyan
-Write-Host "  ==========================================" -ForegroundColor Cyan
-Write-Host ""
+Write-Host "  TOMAS" -ForegroundColor Cyan -NoNewline
+Write-Host "  -  Terminal Operated Modular Agent System" -ForegroundColor DarkGray
+Write-Host "  $([string][char]0x2500 * 46)" -ForegroundColor DarkGray
 
 # -- Prerequisites -----------------------------------------------------------
+Step "Checking Python..."
 $pythonPath = ""
 
 # Helper: test a Python executable and return its path if >= 3.10
@@ -176,8 +244,7 @@ $pyDisplayVer = & $pythonPath -c "import sys; print(f'{sys.version_info.major}.{
 Write-Host "  [OK] Python $pyDisplayVer found at: $pythonPath" -ForegroundColor Green
 
 # -- Create directory structure ---------------------------------------------
-Write-Host ""
-Write-Host "  [2/9] Setting up directories..." -ForegroundColor Cyan
+Step "Setting up directories..."
 $null = New-Item -ItemType Directory -Path $BinDir -Force
 $null = New-Item -ItemType Directory -Path $SrcDir -Force
 $null = New-Item -ItemType Directory -Path (Join-Path $InstallDir "sessions") -Force
@@ -194,21 +261,52 @@ $hasLocalSource = $localSource -and (Test-Path (Join-Path $localSource "agent.py
 
 if ($hasLocalSource) {
     Write-Host ""
-    Write-Host "  [3/9] Copying local source..." -ForegroundColor Cyan
+    Step "Copying local source..."
     # Copy project files AND package directories. This used to be -File only,
     # which silently left out core/, adapters/ and learning/ - the install
     # completed "successfully" and then died on first run with
     # ModuleNotFoundError: No module named 'learning'.
+    # -- What the agent needs to run, named explicitly ---------------------
+    #
+    # An allowlist, not a denylist, and the difference is the whole point. A
+    # denylist means every new file in the repository leaks into every install
+    # until someone notices and adds another exclusion. It had been losing that
+    # race for a while: a real install contained eight simulation reports
+    # (`TOMAS_SIMULATION_REPORT_V4.md` and friends), `Kimi_K3_Report.docx`,
+    # `hello_world.html`, `image.png`, the whole test suite, `_scratch`, the
+    # `labwork` corpus, and `nextjs-site` — none of which the agent imports or
+    # reads at runtime.
+    #
+    # The module list is not guesswork: it is the transitive closure of
+    # `import` from `agent.py` and `agent_cli.py`. Anything not reachable from
+    # an entry point cannot be needed to start one.
+    #
+    # `install.ps1` is deliberately absent — `TOMAS-upgrade.cmd` fetches it
+    # from GitHub, so the copy in `src` was only ever a copy.
+    $runtimeModules = @(
+        'agent.py', 'agent_cli.py',
+        'instructions_manager.py', 'mcp_manager.py', 'net_probe.py',
+        'openai_adapter.py', 'pdf_report_skill.py', 'provider_manager.py',
+        'self_improve.py', 'self_notes.py', 'session_manager.py',
+        'skills_manager.py', 'text_display.py', 'zen_catalog.py',
+        'zen_proxy.py'
+    )
+    # Python packages the entry points import.
+    $runtimePackages = @('adapters', 'core', 'learning')
+    # Not imported, but read at runtime or by the installer itself.
+    $runtimeExtras   = @('skills')
+    $runtimeFiles    = $runtimeModules + @('requirements.txt')
+
     $exclude = @('.venv', '__pycache__', '.git', '.agent', '.claude', '.kilo',
                  '.github', '.pytest_cache', '.mypy_cache', 'node_modules')
     # `.env` must never be copied into $SrcDir. It holds API keys, and $SrcDir
-    # is deleted wholesale by `TOMAS update` — so copying it there both spreads
+    # is deleted wholesale by `TOMAS update` -- so copying it there both spreads
     # the secret and stages it for destruction. agent_cli then treats the copy
     # as a "legacy" env and migrates it back, which makes the round trip look
     # deliberate. The durable copy lives at ~/.tomas/.env and stays there.
     # `.env` and `providers.json` must never be copied into $SrcDir. They hold
     # API keys and provider setup, and $SrcDir is deleted wholesale by
-    # `TOMAS update` — so copying them there both spreads the secret and stages
+    # `TOMAS update` -- so copying them there both spreads the secret and stages
     # it for destruction. agent_cli then treats the copied .env as a "legacy"
     # file and migrates it back, which makes the round trip look deliberate.
     # The durable copies live in ~/.tomas/ and stay there.
@@ -217,18 +315,40 @@ if ($hasLocalSource) {
                              'simulation_results.json', 'cyrillic_results.json',
                              'session_audit_*.json')
 
-    Get-ChildItem -Path $localSource -File | Where-Object {
-        $skip = $false
-        foreach ($pat in ($exclude + $excludeFilePatterns)) {
-            if ($_.Name -like $pat) { $skip = $true; break }
+    # `$exclude` as one regex over a relative path, so a nested `node_modules`
+    # is skipped as surely as a top-level one. Built from the same list rather
+    # than a second hand-written pattern — two lists that must agree are two
+    # lists that will not.
+    # Built in two statements on purpose: `-join '|' + ')(\\|$)'` binds as
+    # `-join ('|' + ')(\\|$)')`, so the separator becomes the tail of the
+    # pattern and the result is an unbalanced regex that throws at match time.
+    $excludeNames = ($exclude + @('.next', '.turbo', 'dist', 'build', '.cache') |
+                     ForEach-Object { [regex]::Escape($_) }) -join '|'
+    $excludeDirPattern = '(^|\\)(' + $excludeNames + ')(\\|$)'
+
+    # Root files: exactly the runtime list, and a named failure for anything
+    # missing. A module that silently does not arrive becomes a
+    # ModuleNotFoundError on first run, three steps after the install said OK.
+    $missingModules = @()
+    foreach ($name in $runtimeFiles) {
+        $source = Join-Path $localSource $name
+        if (Test-Path -LiteralPath $source) {
+            Copy-Item -LiteralPath $source -Destination $SrcDir -Force
+        } elseif ($name -ne 'requirements.txt') {
+            $missingModules += $name
         }
-        -not $skip
-    } | Copy-Item -Destination $SrcDir -Force
+    }
+    if ($missingModules.Count -gt 0) {
+        Write-Host "  [FAIL] Source is missing runtime modules: $($missingModules -join ', ')" -ForegroundColor Red
+        Write-Host "         This is not a TOMAS checkout, or it is incomplete." -ForegroundColor Yellow
+        exit 1
+    }
 
     $dirCount = 0
     $copyErrors = @()
+    $wanted = $runtimePackages + $runtimeExtras
     foreach ($dir in (Get-ChildItem -Path $localSource -Directory)) {
-        if ($exclude -contains $dir.Name) { continue }
+        if ($wanted -notcontains $dir.Name) { continue }
         $dest = Join-Path $SrcDir $dir.Name
         if (Test-Path $dest) {
             Remove-Item -Path $dest -Recurse -Force -ErrorAction SilentlyContinue
@@ -242,7 +362,17 @@ if ($hasLocalSource) {
         $sourceRoot = $dir.FullName.TrimEnd('\')
         foreach ($item in (Get-ChildItem -Path $sourceRoot -Recurse -File -ErrorAction SilentlyContinue)) {
             $relative = $item.FullName.Substring($sourceRoot.Length).TrimStart('\')
-            if ($relative -match '(^|\\)(__pycache__|\.pytest_cache|\.mypy_cache)(\\|$)') { continue }
+            # $exclude is checked at *every* level, not only the top one. It was
+            # applied to `$dir.Name` alone, so a directory that is not itself
+            # excluded was descended into and everything under it copied —
+            # including the `node_modules` that the exclusion list names.
+            #
+            # Measured on this checkout: `nextjs-site` is not an excluded name,
+            # so the walk copied `nextjs-site\node_modules` — 479 MB in 15,607
+            # files — plus an 89 MB `.next` build, one Copy-Item per file, for
+            # a directory whose actual source is five files. That is the whole
+            # of the long wait at "[3/11] Copying local source".
+            if ($relative -match $excludeDirPattern) { continue }
             if ($item.Extension -eq '.pyc') { continue }
             $target = Join-Path $dest $relative
             $targetDir = Split-Path -Parent $target
@@ -281,7 +411,7 @@ if ($hasLocalSource) {
 }
 else {
     Write-Host ""
-    Write-Host "  [3/9] Downloading from GitHub..." -ForegroundColor Cyan
+    Step "Downloading from GitHub..."
     Write-Host "       URL: $RepoUrl" -ForegroundColor DarkGray
 
     $zipPath = Join-Path $env:TEMP "tomas-$(Get-Random).zip"
@@ -319,8 +449,7 @@ else {
 }
 
 # -- Create virtual environment ---------------------------------------------
-Write-Host ""
-Write-Host "  [4/9] Creating virtual environment..." -ForegroundColor Cyan
+Step "Creating virtual environment..."
 
 # Check if existing venv has a working Python executable (bin or Scripts)
 $existingPythonExe = Get-VenvPythonExe $VenvDir
@@ -386,8 +515,7 @@ if (-not $script:PipExe) {
 }
 
 # -- Install dependencies ---------------------------------------------------
-Write-Host ""
-Write-Host "  [5/9] Installing Python dependencies..." -ForegroundColor Cyan
+Step "Installing Python dependencies..."
 
 # Check that pip exists before using it; if not, run ensurepip
 if (-not $script:PipExe) {
@@ -420,9 +548,47 @@ if (-not $script:PipExe) {
     Write-Host "  [OK] pip installed in virtual environment" -ForegroundColor Green
 }
 
-& $script:PipExe install --quiet --upgrade pip setuptools wheel 2>&1 | Out-Null
+# uv, when it is here, does the same work about five times faster.
+#
+# Measured on this machine against the ten packages in requirements.txt, with
+# a warm wheel cache and a fresh venv both times:
+#
+#     pip   56.8 s
+#     uv    11.0 s
+#
+# The gap is wider on a cold cache, where pip's serial resolve-then-download
+# dominates. This is the single largest saving in the install that does not
+# involve skipping something.
+#
+# Never installed on the user's behalf: an installer that silently fetches a
+# second package manager to speed itself up has made a decision that is not
+# its to make. If uv is absent, pip does the job it always did.
+$script:UvExe = (Get-Command "uv" -ErrorAction SilentlyContinue).Source
+if ($script:UvExe) {
+    StepInfo "using uv ($script:UvExe)"
+} else {
+    & $script:PipExe install --quiet --upgrade pip setuptools wheel 2>&1 | Out-Null
+}
+
 $reqFile = Join-Path $SrcDir "requirements.txt"
-if (Test-Path $reqFile) {
+if ((Test-Path $reqFile) -and $script:UvExe) {
+    $env:VIRTUAL_ENV = $VenvDir
+    & $script:UvExe pip install --quiet --python $script:PythonExe -r $reqFile
+    if ($LASTEXITCODE -eq 0) {
+        StepOk "Dependencies installed"
+    } else {
+        Write-Host "  [WARN] uv failed; falling back to pip" -ForegroundColor Yellow
+        & $script:PipExe install --quiet -r $reqFile 2>&1 |
+            Where-Object { $_ -notmatch 'Cache entry deserialization failed' }
+        if ($LASTEXITCODE -eq 0) {
+            StepOk "Dependencies installed"
+        } else {
+            Write-Host "  [FAIL] Failed to install dependencies" -ForegroundColor Red
+            Write-Host "         Run manually: $script:PipExe install -r $reqFile" -ForegroundColor Yellow
+        }
+    }
+    Install-PlaywrightBrowser
+} elseif (Test-Path $reqFile) {
     # Drop one known-benign pip line, and only that line. "Cache entry
     # deserialization failed, entry ignored" is not a deserialization failure
     # and nothing is corrupt: pip's cachecontrol logs it whenever a cached
@@ -435,11 +601,8 @@ if (Test-Path $reqFile) {
     & $script:PipExe install --quiet -r $reqFile 2>&1 |
         Where-Object { $_ -notmatch 'Cache entry deserialization failed' }
     if ($LASTEXITCODE -eq 0) {
-        Write-Host "  [OK] Dependencies installed successfully" -ForegroundColor Green
-        try {
-            & $script:PythonExe -m playwright install chromium 2>&1 | Out-Null
-            Write-Host "  [OK] Playwright Chromium browser installed" -ForegroundColor Green
-        } catch {}
+        StepOk "Dependencies installed"
+        Install-PlaywrightBrowser
     } else {
         Write-Host "  [FAIL] Failed to install some dependencies" -ForegroundColor Red
         Write-Host "         Run manually: $script:PipExe install -r $reqFile" -ForegroundColor Yellow
@@ -455,7 +618,7 @@ if (Test-Path $reqFile) {
     # Reaching here means the source copy dropped it, so the install is broken
     # in exactly the way the next step is about to discover anyway.
     Write-Host "  [FAIL] No requirements.txt at $reqFile" -ForegroundColor Red
-    Write-Host "         The source copy is incomplete — dependencies cannot be" -ForegroundColor Yellow
+    Write-Host "         The source copy is incomplete -- dependencies cannot be" -ForegroundColor Yellow
     Write-Host "         installed and TOMAS will not start. Re-run the installer" -ForegroundColor Yellow
     Write-Host "         from a complete checkout with TOMAS closed." -ForegroundColor Yellow
     exit 1
@@ -465,8 +628,7 @@ if (Test-Path $reqFile) {
 # An installer that reports success and then dies on first run with
 # ModuleNotFoundError has not installed anything. Import the entry point here,
 # where the failure can still be explained and acted on.
-Write-Host ""
-Write-Host "  [5b/9] Verifying installation..." -ForegroundColor Cyan
+Step "Verifying installation..."
 $requiredPackages = @('core', 'adapters', 'learning')
 $missingPackages = @()
 foreach ($pkg in $requiredPackages) {
@@ -493,8 +655,7 @@ if ($LASTEXITCODE -ne 0 -or "$importCheck" -notmatch 'ok') {
 Write-Host "  [OK] TOMAS imports cleanly ($($requiredPackages.Count) packages present)" -ForegroundColor Green
 
 # -- Create launcher scripts ------------------------------------------------
-Write-Host ""
-Write-Host "  [6/9] Creating launcher scripts..." -ForegroundColor Cyan
+Step "Creating launcher scripts..."
 
 # [System.Text.Encoding]::UTF8 writes a BOM. cmd.exe treats a leading BOM as
 # literal characters on the first line, so "@echo off" becomes unrecognized
@@ -547,15 +708,14 @@ Write-Host "  [OK] $LauncherBat" -ForegroundColor Green
 $upgradeBat = Join-Path $BinDir "TOMAS-upgrade.cmd"
 $upgradeContent = @'
 @echo off
-echo   ==========================================
-echo       TOMAS Upgrade
-echo   ==========================================
 echo.
-echo   Upgrading TOMAS from GitHub...
+echo   TOMAS  -  updating from GitHub
 echo.
 powershell -ExecutionPolicy Bypass -c "iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/main/install.ps1)"
 if %ERRORLEVEL% neq 0 (
-    echo   Upgrade failed. See messages above.
+    echo.
+    echo   Update failed - see the messages above. Your existing install is
+    echo   untouched, so TOMAS still runs.
     pause
     exit /b %ERRORLEVEL%
 )
@@ -563,7 +723,7 @@ if %ERRORLEVEL% neq 0 (
 rem -- Refresh PATH so `tomas` works immediately in this session --
 set "PATH=%USERPROFILE%\.tomas\bin;%PATH%"
 echo.
-echo   Upgrade complete! You can now run: TOMAS
+echo   Updated. Your settings, sessions and instructions were kept.
 '@
 [System.IO.File]::WriteAllText($upgradeBat, $upgradeContent, $Utf8NoBom)
 Write-Host "  [OK] $upgradeBat" -ForegroundColor Green
@@ -572,15 +732,20 @@ Write-Host "  [OK] $upgradeBat" -ForegroundColor Green
 $uninstallBat = Join-Path $BinDir "TOMAS-uninstall.cmd"
 $uninstallContent = @'
 @echo off
-echo   ==========================================
-echo       TOMAS Uninstall
-echo   ==========================================
 echo.
-echo   This will remove TOMAS completely from your system.
+echo   TOMAS  -  uninstall
 echo.
+echo   This removes the program, and with it your sessions, saved
+echo   providers and agent instructions. There is no undo.
+echo.
+set /p "ok=  Type YES to remove TOMAS: "
+if /I not "%ok%"=="YES" (
+    echo   Cancelled - nothing was removed.
+    exit /b 0
+)
 powershell -ExecutionPolicy Bypass -File "{UninstallPs1}"
 if %ERRORLEVEL% neq 0 (
-    echo   Uninstall may have failed. See messages above.
+    echo   Uninstall may have failed. See the messages above.
     pause
 )
 '@ -replace '{UninstallPs1}', (Join-Path $BinDir "uninstall.ps1")
@@ -588,8 +753,7 @@ if %ERRORLEVEL% neq 0 (
 Write-Host "  [OK] $uninstallBat" -ForegroundColor Green
 
 # -- Create default instructions and sessions dir --------------------------
-Write-Host ""
-Write-Host "  [7/9] Setting up agent instructions..." -ForegroundColor Cyan
+Step "Setting up agent instructions..."
 
 $InstructionsDir = Join-Path $InstallDir "instructions"
 $ProjectsDir = Join-Path $InstructionsDir "project"
@@ -605,74 +769,44 @@ $null = New-Item -ItemType Directory -Path $MemoryDir -Force
 $null = New-Item -ItemType Directory -Path $SelfNotesDir -Force
 
 # Create default AGENT.md (local-level agent identity)
+#
+# Written by Python, not by this script.
+#
+# The template is Ukrainian, and a non-ASCII byte in a BOM-less .ps1 is fatal
+# on Windows PowerShell: it reads the file in the machine's ANSI codepage, so
+# on a cp1251 system the UTF-8 bytes of a Cyrillic letter (D0 92) decode to
+# `R` + U+2019 -- and PowerShell treats U+2019 as a string delimiter. That
+# opened a string which never closed, and the whole installer failed to parse
+# with 22 errors before running a single line. install.cmd invokes
+# `powershell` (5.1), so on any machine with a Cyrillic codepage -- which is
+# every machine this template is written for -- the installer installed
+# nothing at all.
+#
+# `instructions_manager.DEFAULT_AGENT_INSTRUCTIONS` already held this text, so
+# the here-string was a second copy of it as well. One source, written through
+# Python, which has no such encoding problem.
 $agentInstrFile = Join-Path $InstructionsDir "AGENT.md"
 if (-not (Test-Path $agentInstrFile)) {
-    @"
-# Agent Identity
-
-- Your name is TOMAS agent.
-- Each report must be ended with My Lord.
-
-# Education Focus
-
-You work with students and teachers most of the time. Keep every default
-below in mind, but a specific project's AGENTS.md or a direct request from
-the user always overrides it.
-
-## Audience and language
-
-- Default response language is Ukrainian. Mirror the user's own language
-  instead when they write in Russian, English, or anything else -- match
-  them, don't force Ukrainian on them.
-- With a student, teach: explain the reasoning, not just the final answer.
-  With a teacher, act as a co-author: be efficient, precise, and ready to
-  hand over finished material.
-
-## Primary goal: lab-work guides (методичні вказівки / методичка)
-
-- One of your main jobs is producing методичні вказівки (methodichka) --
-  structured lab-work guides -- for programming/CS, engineering/physics, and
-  general courses.
-- Follow the conventional Ukrainian technical-education structure for each
-  lab: a title ("ЛАБОРАТОРНА РОБОТА №N" plus topic), Мета роботи (goal),
-  theoretical background (Загальні відомості / Методичні вказівки),
-  Контрольні запитання (control questions), Завдання (tasks -- include a
-  Варіанти table when the group needs individual variants), an optional
-  Зауваження (remark), recommended tools (мова програмування / середовище
-  програмування / тип проекту for programming labs, or equipment/instruments
-  for engineering and physics labs), Зміст звіту (report contents) where
-  relevant, and a numbered Література (references) list reused consistently
-  across the labs of one course.
-- When producing more than one lab work for the same course, keep numbering,
-  terminology, and cross-references between labs consistent -- a later lab
-  may reuse a module built in an earlier one, exactly as a real methodichka
-  does.
-- If something essential is genuinely missing (subject, number of labs,
-  language, tooling), ask once -- one message listing everything you need --
-  and then build. Do not ask again once the user has answered or told you to
-  go ahead: choose sensible defaults, say in one line which you chose, and
-  produce the document. "Just do it", "yes, correct" and a bare number are
-  instructions to act, not invitations to confirm again. Asking twice about
-  the same thing wastes the user's turn.
-
-## Self-improving toward this specific user
-
-- The built-in learning system (/self-improve) is not just a log -- it is
-  how you get useful for this particular user faster. Use it to build a
-  working profile of them: the terminology, syntax and phrasing habits they
-  use in their own language, formatting conventions, and any corrections or
-  preferences they've given you.
-- Before producing material for a returning user -- a methodichka, a report,
-  a message -- recall what you've learned about their style and apply it.
-  Write the way they write and use the terms they use, instead of a generic
-  default.
-- Stay tied to the user's actual stated goal on every turn. Don't wander
-  into unrelated territory, and check with them before assuming a large
-  amount of structure or content they haven't described.
-"@ | Out-File -FilePath $agentInstrFile -Encoding utf8
-    Write-Host "  [OK] Created agent identity: $agentInstrFile" -ForegroundColor Green
+    # Single quotes inside the Python, deliberately. PowerShell strips double
+    # quotes when it hands an argument to a native command, so `encoding="utf-8"`
+    # arrived at Python as `encoding=utf-8` and died with
+    # `NameError: name 'utf' is not defined` -- after reporting the step as done,
+    # because the failure was in the child process.
+    $writeDefaults = @'
+import sys, pathlib
+sys.path.insert(0, sys.argv[1])
+import instructions_manager as im
+pathlib.Path(sys.argv[2]).write_text(
+    im.DEFAULT_AGENT_INSTRUCTIONS, encoding='utf-8')
+'@
+    & $script:PythonExe -c $writeDefaults $SrcDir $agentInstrFile
+    if (Test-Path $agentInstrFile) {
+        StepOk "Default instructions: $agentInstrFile"
+    } else {
+        StepInfo "Could not write default instructions - edit $agentInstrFile by hand"
+    }
 } else {
-    Write-Host "  [OK] Agent identity file already exists (keeping existing)" -ForegroundColor Green
+    StepOk "Kept your existing $agentInstrFile"
 }
 
 # Create README for the instructions folder
@@ -717,8 +851,7 @@ if (-not (Test-Path $gitkeep)) {
 Write-Host "  [OK] Sessions directory: $SessionsDir" -ForegroundColor Green
 
 # -- Set up .env -------------------------------------------------------------
-Write-Host ""
-Write-Host "  [8/9] Configuring environment..." -ForegroundColor Cyan
+Step "Configuring environment..."
 
 # Back up before touching anything, always. These files are the only copy of
 # the user's API keys and provider setup, and an installer that loses them has
@@ -739,7 +872,7 @@ foreach ($precious in @($EnvFile, (Join-Path $InstallDir "providers.json"))) {
 
 if (-not (Test-Path $EnvFile)) {
     # If a backup from an earlier run exists, say so rather than silently
-    # handing back an empty template — a missing .env on a machine that has run
+    # handing back an empty template -- a missing .env on a machine that has run
     # TOMAS before means something removed it, and the keys are recoverable.
     $priorBackups = @(Get-ChildItem -Path $InstallDir -Filter ".env.backup-*" -Force -ErrorAction SilentlyContinue |
                       Sort-Object LastWriteTime -Descending)
@@ -786,8 +919,7 @@ if (-not $NoPrompt -and $host.Name -ne 'Default Host' -and -not $isPiped) {
 }
 
 # --- Add to PATH --------------------------------------------------------------
-Write-Host ""
-Write-Host "  [9/9] Finalizing setup..." -ForegroundColor Cyan
+Step "Finalizing setup..."
 Write-Host "       Adding to system PATH..." -ForegroundColor DarkGray
 
 $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -810,45 +942,148 @@ $uninstallScript = Join-Path $BinDir "uninstall.ps1"
 $uninstallContent = @'
 <#
 .SYNOPSIS
-    Uninstall TOMAS Agent completely.
+    Uninstall TOMAS Agent.
+
+.NOTES
+    Two defects this replaces, both observed on a real uninstall:
+
+    1. It announced the removal before attempting it. "$tomasDir deleted" and
+       "TOMAS is gone." were printed immediately after *launching* a background
+       cleanup script, so the words were a prediction. The run that prompted
+       this rewrite printed both, and left the directory in place.
+
+    2. The background script could not terminate. It was
+
+           :retry
+           rmdir /s /q "<dir>"
+           if not exist "<dir>" goto done
+           ping ... & goto retry
+
+       with no attempt limit. Windows will not delete a running executable, and
+       a leftover TOMAS process was holding
+       `.tomas\.venv\Scripts\python.exe` — so `rmdir` removed every unlocked
+       file (all the user's sessions, providers and instructions) and the
+       directory never disappeared. The loop then spun once a second forever in
+       a console window that could not be closed, which is exactly what the
+       user reported.
+
+    So: stop the processes that cause it, act before reporting, bound the
+    retry, and when something survives say which file and which process rather
+    than claiming success.
 #>
 Write-Host ""
-Write-Host "  Removing TOMAS..." -ForegroundColor Cyan
+Write-Host "  TOMAS  -  removing" -ForegroundColor Cyan
 
 $tomasDir = "{InstallDir}"
 $binDir = Join-Path $tomasDir "bin"
-$venvDir = Join-Path $tomasDir ".venv"
 
-# Remove from PATH
+# -- PATH first: it is the one step that always succeeds, and leaving a stale
+#    entry behind is the failure the user notices months later.
 $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
 $paths = $currentPath -split ';' | Where-Object { $_ -and $_ -ne $binDir }
 [Environment]::SetEnvironmentVariable("Path", ($paths -join ';'), "User")
-Write-Host "  [OK] Removed $binDir from PATH" -ForegroundColor Green
+Write-Host "    PATH entry removed" -ForegroundColor DarkGray
 
-# Create a self-deleting background cleanup script in TEMP
-$cleanBat = Join-Path $env:TEMP "tomas-uninstall-clean.cmd"
-$cleanContent = "@echo off`r`nping 127.0.0.1 -n 3 >nul`r`n:retry`r`nrmdir /s /q `"{InstallDir}`" 2>nul`r`nif not exist `"{InstallDir}`" goto done`r`nping 127.0.0.1 -n 2 >nul`r`ngoto retry`r`n:done`r`ndel `"%~f0`" 2>nul".Replace('{InstallDir}', $tomasDir)
-[System.IO.File]::WriteAllText($cleanBat, $cleanContent)
-
-# Launch background process decoupled from job object
+# -- Stop what is holding the files open ---------------------------------
+# The interpreter inside the install directory is the usual culprit, and it is
+# also the only thing that makes the delete impossible rather than merely slow.
+$running = @()
 try {
-    [void](Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine = "cmd.exe /c `"$cleanBat`""})
-} catch {
-    Start-Process -FilePath "$cleanBat" -WindowStyle Hidden
-}
-Write-Host "  [OK] Deleted $tomasDir" -ForegroundColor Green
+    $running = @(Get-Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Path -and $_.Path.StartsWith($tomasDir, [StringComparison]::OrdinalIgnoreCase)
+        })
+} catch { }
 
+if ($running.Count -gt 0) {
+    Write-Host "    $($running.Count) TOMAS process(es) still running - stopping them" -ForegroundColor Yellow
+    foreach ($proc in $running) {
+        try {
+            Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+            Write-Host "      stopped PID $($proc.Id)" -ForegroundColor DarkGray
+        } catch {
+            Write-Host "      could not stop PID $($proc.Id): $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+    Start-Sleep -Milliseconds 700
+}
+
+# -- Delete everything we can from here ----------------------------------
+# `bin` is skipped: this script is running from it, so PowerShell holds it
+# open. Everything else goes now, synchronously, so the result is known before
+# anything is printed about it.
+foreach ($child in (Get-ChildItem -LiteralPath $tomasDir -Force -ErrorAction SilentlyContinue)) {
+    if ($child.FullName -ieq $binDir) { continue }
+    try {
+        Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop
+    } catch {
+        Write-Host "    still in use: $($child.Name)" -ForegroundColor Yellow
+    }
+}
+
+# -- Hand the last of it to a bounded background pass ---------------------
+# Bounded, hidden, and it leaves a note rather than a spinning window. The
+# window is what made the old one impossible to ignore; the note is what makes
+# this one possible to act on.
+$cleanPs1 = Join-Path $env:TEMP "tomas-uninstall-clean.ps1"
+$noteFile = Join-Path $env:TEMP "tomas-uninstall-incomplete.txt"
+$cleanBody = @"
+`$target = '{InstallDir}'
+`$note   = '$noteFile'
+Remove-Item -LiteralPath `$note -Force -ErrorAction SilentlyContinue
+for (`$i = 0; `$i -lt 30; `$i++) {
+    Start-Sleep -Milliseconds 500
+    Remove-Item -LiteralPath `$target -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path -LiteralPath `$target)) { break }
+}
+if (Test-Path -LiteralPath `$target) {
+    `$left = (Get-ChildItem -LiteralPath `$target -Recurse -Force -ErrorAction SilentlyContinue |
+              Select-Object -First 20 -ExpandProperty FullName) -join [Environment]::NewLine
+    @(
+      'TOMAS could not be fully removed.'
+      ''
+      "Left behind in `$target :"
+      `$left
+      ''
+      'Something still had these files open. Close any terminal running TOMAS,'
+      'then delete the folder by hand:'
+      "    Remove-Item -LiteralPath '`$target' -Recurse -Force"
+    ) | Set-Content -LiteralPath `$note -Encoding UTF8
+}
+Remove-Item -LiteralPath `$MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+"@
+[System.IO.File]::WriteAllText($cleanPs1, $cleanBody)
+
+try {
+    Start-Process -FilePath "powershell.exe" `
+        -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", $cleanPs1) `
+        -WindowStyle Hidden | Out-Null
+} catch {
+    Write-Host "    background cleanup could not start: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+# -- Say what actually happened ------------------------------------------
+$leftover = @(Get-ChildItem -LiteralPath $tomasDir -Force -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -ine $binDir })
 Write-Host ""
-Write-Host "  TOMAS has been uninstalled." -ForegroundColor Green
-Write-Host "  Close and reopen your terminal for PATH changes to take effect."
+if ($leftover.Count -eq 0) {
+    Write-Host "  TOMAS is gone." -ForegroundColor Green
+    Write-Host "  A background pass removes the last folder in a few seconds." -ForegroundColor DarkGray
+} else {
+    Write-Host "  TOMAS is mostly removed." -ForegroundColor Yellow
+    Write-Host "  Still present: $($leftover.Name -join ', ')" -ForegroundColor DarkGray
+    Write-Host "  A background pass retries for 15s; if it cannot finish it writes" -ForegroundColor DarkGray
+    Write-Host "    $noteFile" -ForegroundColor DarkGray
+}
+Write-Host "  Open a new terminal for the PATH change to take effect." -ForegroundColor DarkGray
+Write-Host "  Reinstall any time with install.ps1 - nothing here blocks it." -ForegroundColor DarkGray
 '@ -replace '{InstallDir}', $InstallDir
 
 [System.IO.File]::WriteAllText($uninstallScript, $uninstallContent, $Utf8NoBom)
 Write-Host "  [OK] Created uninstaller: $uninstallScript" -ForegroundColor Green
 
 # -- Run setup to install default MCPs --
-Write-Host ""
-Write-Host "  [10/10] Running TOMAS setup (default MCPs)..." -ForegroundColor Cyan
+Step "Configuring default MCP servers..."
 try {
     & $script:PythonExe "$SrcDir\agent_cli.py" setup
     Write-Host "  [OK] Default MCPs configured" -ForegroundColor Green
@@ -858,36 +1093,36 @@ try {
 }
 
 # -- Done --------------------------------------------------------------------
+# Six lines, not thirty.
+#
+# The old summary listed six install paths, three commands, three "new
+# features", two ways to fix PATH and the .env location -- everything the
+# installer knew, at equal weight, so the one line that matters ("type TOMAS")
+# sat in the middle of a wall the reader scrolls past. What a person needs on
+# finishing an install is: did it work, what do I type, where does it live.
+$rule = [string][char]0x2500 * 46
 Write-Host ""
-Write-Host "  ==========================================" -ForegroundColor Cyan
-Write-Host "         Installation Complete!" -ForegroundColor Cyan
-Write-Host "  ==========================================" -ForegroundColor Cyan
+Write-Host "  $rule" -ForegroundColor DarkGray
+Write-Host "  TOMAS is installed." -ForegroundColor Green
 Write-Host ""
-Write-Host "    Installed to:  $InstallDir" -ForegroundColor White
-Write-Host "    Source code:   $SrcDir" -ForegroundColor White
-Write-Host "    Python venv:   $VenvDir" -ForegroundColor White
-Write-Host "    Launchers:     $BinDir" -ForegroundColor White
-Write-Host "    Instructions:  $(Join-Path $InstallDir 'instructions')" -ForegroundColor White
-Write-Host "    Sessions:      $(Join-Path $InstallDir 'sessions')" -ForegroundColor White
+Write-Host "    Type " -ForegroundColor White -NoNewline
+Write-Host "TOMAS" -ForegroundColor Cyan -NoNewline
+Write-Host " in a new terminal to start." -ForegroundColor White
+Write-Host "    $InstallDir" -ForegroundColor DarkGray
 Write-Host ""
-Write-Host "  Commands:" -ForegroundColor Yellow
-Write-Host "    TOMAS              Run the agent" -ForegroundColor Cyan
-Write-Host "    TOMAS-upgrade      Update TOMAS from GitHub" -ForegroundColor Cyan
-Write-Host "    TOMAS-uninstall    Remove TOMAS completely" -ForegroundColor Cyan
+Write-Host "    TOMAS-upgrade" -ForegroundColor DarkGray -NoNewline
+Write-Host "  update   " -ForegroundColor DarkGray -NoNewline
+Write-Host "TOMAS-uninstall" -ForegroundColor DarkGray -NoNewline
+Write-Host "  remove   " -ForegroundColor DarkGray -NoNewline
+Write-Host "TOMAS browser" -ForegroundColor DarkGray -NoNewline
+Write-Host "  web search" -ForegroundColor DarkGray
+Write-Host "  $rule" -ForegroundColor DarkGray
 Write-Host ""
-Write-Host "  New features:" -ForegroundColor Yellow
-Write-Host "    [Sessions]      Auto-saved on exit. Browse/continue from menu." -ForegroundColor Cyan
-Write-Host "    [Instructions]  Edit ~/.tomas/instructions/ for global agent rules." -ForegroundColor Cyan
-Write-Host "    [Project config] Put AGENT.md in your project root for per-project rules." -ForegroundColor Cyan
-Write-Host ""
-Write-Host "  To use TOMAS in this terminal, run:" -ForegroundColor White
-Write-Host "    `$env:Path = '$BinDir;' + `$env:Path; tomas" -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "  Or if you ran from cmd.exe with install.cmd" -ForegroundColor White
-Write-Host "  the PATH is already updated -- just type: TOMAS" -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "  (New terminals will find TOMAS automatically.)" -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "  First time? Edit your API key in:" -ForegroundColor White
-Write-Host "    $EnvFile" -ForegroundColor DarkGray
-Write-Host ""
+if (-not $env:ANTHROPIC_API_KEY -and -not (Select-String -Path $EnvFile -Pattern '^\s*ANTHROPIC_API_KEY\s*=\s*\S' -Quiet -ErrorAction SilentlyContinue)) {
+    # Only when there is genuinely nothing configured. TOMAS falls back to the
+    # OpenCode Zen free tier on first run, so this is a note, not a blocker --
+    # printing it unconditionally taught people to ignore it.
+    Write-Host "  No API key yet -- TOMAS will start on the free tier." -ForegroundColor DarkGray
+    Write-Host "  Connect your own provider from the menu, or edit $EnvFile" -ForegroundColor DarkGray
+    Write-Host ""
+}

@@ -36,8 +36,10 @@ import subprocess
 import urllib.request
 import urllib.error
 from pathlib import Path
-from typing import Callable, Optional
+import dataclasses
+from typing import Any, Callable, Optional
 
+from core import budget as core_budget
 from core import context as core_context
 from core.context import ContextWindow
 
@@ -144,7 +146,26 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
 # writes anything, so a limit that is generous for a chat model truncates it to
 # nothing. Raise it when a long document or a reasoning model gets cut off.
 MAX_TOKENS = _env_int("AGENT_MAX_TOKENS", 8192, minimum=256)
-COMPACTION_THRESHOLD = 0.75  # compact when total budget (msg_tok + TOOL_TOKENS + MAX_TOKENS) exceeds this fraction of CONTEXT_WINDOW
+# When automatic compaction fires, as a fraction of CONTEXT_WINDOW — or None
+# for "never, only /compact". Read from the persisted budget settings so the
+# choice survives a restart and is made in one place (the Context Budget page
+# and /budget both write it); `AGENT_COMPACT_FIT` overrides it for a single
+# run, the way every other budget knob here can be overridden.
+def _compaction_threshold() -> Optional[float]:
+    raw = os.environ.get("AGENT_COMPACT_FIT", "").strip()
+    if raw:
+        try:
+            return core_context.fit_fraction_from_percent(int(raw))
+        except ValueError:
+            pass
+    try:
+        import core.budget as _budget
+        return _budget.compaction_fit_fraction(_budget.load_settings())
+    except Exception:
+        return core_context.DEFAULT_FIT_FRACTION
+
+
+COMPACTION_THRESHOLD: Optional[float] = _compaction_threshold()
 # Cost ceiling on top of the fit rule. Past roughly this much conversation the
 # cost of re-reading it every turn outweighs what the extra history is worth.
 #
@@ -187,18 +208,39 @@ CONTEXT_WINDOW = DEFAULT_CONTEXT_WINDOW  # will be updated dynamically at startu
 CHARS_PER_TOKEN_PROSE = 4
 CHARS_PER_TOKEN_JSON = 3.5
 
-# Known model context windows (fallback when API is not reachable)
+# Known model context windows — the *last* fallback, consulted only when the
+# endpoint could not be probed and the fetched catalogue is not on disk.
+#
+# **A hand-maintained table of numbers rots, and this one had.** Checked
+# against the live catalogue on 2026-08-13, seven of eighteen entries were
+# wrong, in both directions: `deepseek-v4-flash-free` said 1,000,000 and serves
+# 200,000 (the *paid* model's window, copied onto the free one), while
+# `claude-opus-5` said 200,000 and serves 1,000,000. A model told it has five
+# times the window it has will not compact until far too late; one told it has
+# a fifth will compact constantly for nothing.
+#
+# The entries below are corrected, but correcting them is not the fix — they
+# will rot again. `resolve_context_window` now asks `zen_catalog` first, which
+# is fetched rather than typed. Prefer adding nothing here; if a model needs a
+# number, it needs it in the catalogue.
 MODEL_CONTEXT_MAP: dict[str, int] = {
     # Zen models
-    "deepseek-v4-flash-free": 1_000_000,
-    "big-pickle": 128_000,
+    "deepseek-v4-flash-free": 200_000,     # was 1_000_000 — the paid model's
+    "deepseek-v4-flash": 1_000_000,
+    "big-pickle": 200_000,                 # was 128_000
+    "nemotron-3.5-lightning-free": 262_144,
+    "nemotron-3-ultra-free": 1_000_000,
+    "laguna-s-2.1-free": 256_000,
+    "mimo-v2.5-free": 200_000,
+    "hy3-free": 190_000,
     # Anthropic
-    "claude-fable-5": 200_000,
-    "claude-opus-5": 200_000,
-    "claude-sonnet-5": 200_000,
+    "claude-fable-5": 1_000_000,           # was 200_000
+    "claude-opus-5": 1_000_000,            # was 200_000
+    "claude-sonnet-5": 1_000_000,          # was 200_000
     "claude-haiku-4-5-20251001": 200_000,
-    "claude-sonnet-4-5": 200_000,
-    "claude-sonnet-4": 200_000,
+    "claude-haiku-4-5": 200_000,
+    "claude-sonnet-4-5": 1_000_000,        # was 200_000
+    "claude-sonnet-4": 1_000_000,          # was 200_000
     "claude-3-5-sonnet-20241022": 200_000,
     "claude-3-haiku-20240307": 200_000,
     "claude-opus-4-5": 200_000,
@@ -293,8 +335,13 @@ def set_mode(name: str) -> None:
 # Per-session, not per-process. These used to accumulate for the life of the
 # interpreter, so two sessions run back to back reported byte-identical usage
 # and a session that did no work still claimed 1.6M input tokens.
-_session_tokens = {"input": 0, "output": 0, "calls": 0}
-_last_turn_usage = {"input": 0, "output": 0}
+_session_tokens = {"input": 0, "output": 0, "calls": 0, "cached_input": 0,
+                   # Measurement, not billing: what the streamed calls cost
+                   # before being discarded and re-issued non-streamed, and how
+                   # many of those re-issues bought nothing.
+                   "duplicate_input": 0, "duplicate_calls": 0,
+                   "would_have_served": 0, "stream_malformed_tool_args": 0}
+_last_turn_usage = {"input": 0, "output": 0, "cached_input": 0}
 
 # ── Session telemetry (P6-8) ──
 # Per-turn wall clock and per-tool-call outcome, so a saved session can say
@@ -337,8 +384,11 @@ def reset_session_state() -> None:
     """Start a fresh session's accounting. Called when a session begins or
     when /clear discards the conversation."""
     global _session_started_at
-    _session_tokens.update({"input": 0, "output": 0, "calls": 0})
-    _last_turn_usage.update({"input": 0, "output": 0})
+    # Every key, including ones added since this dict was created. Naming them
+    # here meant a counter added later survived the session boundary — the
+    # exact bug TestSessionTokenIsolation exists to catch.
+    _session_tokens.update(dict.fromkeys(_session_tokens, 0))
+    _last_turn_usage.update(dict.fromkeys(_last_turn_usage, 0))
     _turn_timings.clear()
     _tool_log.clear()
     _failed_turns.clear()
@@ -529,6 +579,35 @@ def _probed_capability_window(model: str) -> int:
 _context_window_cache: dict[str, ContextWindow] = {}
 
 
+def _catalog_window(model: str) -> int:
+    """The window `zen_catalog` has on disk for `model`, or 0.
+
+    Sits between a probe and `MODEL_CONTEXT_MAP` in `resolve_context_window`:
+    it is fetched rather than typed, so it does not rot the way the table did,
+    but it is still not a measurement of *this* endpoint, so a probe outranks
+    it.
+
+    **Cache only — never the network.** This runs while a turn is being sized
+    and while the status line is drawn, and `catalog()` will otherwise spend up
+    to eight seconds on an availability request. A cold cache simply falls
+    through to the table, which is the behaviour that exists today; the cache is
+    filled by the model picker and by any earlier catalogue read.
+
+    `context_known` matters: `zen_catalog` reports an assumed 128,000 for
+    models `models.dev` has never described, and adopting an assumption as a
+    measured window is the exact failure this whole change is about.
+    """
+    if not model:
+        return 0
+    try:
+        import zen_catalog
+
+        entry = zen_catalog.catalog(allow_network=False).get(model)
+    except Exception:
+        return 0
+    return int(entry.context) if entry and entry.context_known else 0
+
+
 def resolve_context_window(model: Optional[str] = None,
                            refresh: bool = False) -> ContextWindow:
     """The context window for `model`, with the provenance of the number.
@@ -547,8 +626,11 @@ def resolve_context_window(model: Optional[str] = None,
         window = ContextWindow(override, "override", model)
     else:
         probed = _probed_capability_window(model) or _probe_models_endpoint(model)
+        catalogued = 0 if probed else _catalog_window(model)
         if probed:
             window = ContextWindow(probed, "probed", model)
+        elif catalogued:
+            window = ContextWindow(catalogued, "catalog", model)
         elif model in MODEL_CONTEXT_MAP:
             window = ContextWindow(MODEL_CONTEXT_MAP[model], "known", model)
         else:
@@ -608,6 +690,9 @@ COMBINED_TOOLS: list[dict] = []
 # select_tools() picks that subset per turn from this list.
 ALL_TOOLS: list[dict] = []
 TOOL_TOKENS: int = 0  # estimated token count for tool definitions
+#: One-shot latch for the "overhead leaves no room" warning — a configuration
+#: problem deserves one clear message, not one per turn.
+_warned_overhead: bool = False
 MCP_TOOL_NAME_MAP: dict[str, str] = {}  # renamed_name -> original_name for conflicting MCP tools
 
 
@@ -682,6 +767,27 @@ def tool_relevance(tool: dict, query_keywords: set) -> float:
     return score
 
 
+def tool_name_matches(tool: dict, query_keywords: set) -> int:
+    """How many of the user's words appear in the tool's *name*.
+
+    Separated from `tool_relevance` because the two are used for different
+    decisions. A description hit is weak evidence — every browser tool mentions
+    "time" in a timeout note — while a name hit means the request said what the
+    tool is called. `SERVER_CORE_QUOTA` commits eight slots to one server, so
+    it asks the stronger question.
+
+    Measured: "remember that I prefer Ukrainian" matched `fill_form` at 2.0
+    purely through its description, which was enough to make chrome-devtools
+    the turn's primary server and hand it eight slots for a request about
+    remembering a preference.
+    """
+    if not query_keywords:
+        return 0
+    from learning.text import extract_keywords
+    name = (tool.get("name") or "").replace("_", " ").replace("-", " ")
+    return len(query_keywords & set(extract_keywords(name, max_keywords=8)))
+
+
 def _server_of(name: str) -> Optional[str]:
     """Which MCP server owns this tool. None for built-ins or when no manager
     is connected — callers must treat None as "ungrouped", not as an error."""
@@ -719,6 +825,46 @@ SERVER_CORE_QUOTA = 8
 # whatever is left — `set_table_cell_alternating_shading` and friends — after
 # the real working set runs out, and spends budget other servers could use.
 CORE_NAME_SIMPLICITY = 0.5
+
+# How many tools carried over from last turn may keep their slot without
+# scoring on *this* message.
+#
+# Follow-ups are why this is not zero: "yes, do that" and "now the same for the
+# other file" score nothing at all, and dropping the working set on them would
+# make every second turn re-fetch its tools. Bounded because the alternative is
+# accumulation — each new topic adds its tools and none of the old ones ever
+# leave, so after a few pivots the payload is full again and "selected by
+# relevance" has quietly become "everything, eventually".
+STICKY_CARRY_OVER = 8
+
+# A score is only meaningful next to the best score on the same message.
+#
+# `tool_relevance` gives 2.0 per name-word hit and 1.0 per description-word
+# hit, so a single incidental word in a description earns 1.0 and, on a
+# fixed threshold, a slot. Measured against the live pool:
+#
+#   "take a screenshot of example.com"   6.5  browser_take_screenshot
+#                                        0.5  resolve-library-id, query-docs
+#   "what time is it in Tokyo"           3.0  get_current_time, convert_time
+#                                        1.0  bulk_fetch, browser_wait_for
+#                                             (their descriptions say "timeout")
+#
+# In both cases the gap between the tools the turn is about and the ones that
+# merely share a word is large and obvious — but only relative to that turn.
+# A fixed cut-off tuned for the first would discard everything in the second.
+RELEVANCE_FLOOR_SHARE = 0.35
+
+# …and never below this, or a message whose best match is itself incidental
+# fills the payload with a dozen equally incidental ones.
+MIN_RELEVANCE = 1.0
+
+
+def relevance_floor(scores) -> float:
+    """The score a tool must reach on this message to earn a slot on merit."""
+    best = max(scores, default=0.0)
+    if best <= 0:
+        return MIN_RELEVANCE
+    return max(MIN_RELEVANCE, best * RELEVANCE_FLOOR_SHARE)
 
 
 # The MCP tools sent last turn. Used only as a tie-breaker, so it can never
@@ -828,9 +974,15 @@ def select_tools(all_tools: list[dict], context: str, budget: int,
         return (-scores[i], 0 if name in sticky else 1,
                 -tool_simplicity(name), i)
 
+    # A server only becomes "the turn's server" if the request named one of its
+    # tools. Summed description hits used to be enough, and eight slots is far
+    # too large a commitment to make on that evidence — see `tool_name_matches`.
+    named_servers = {srv for srv, tool in zip(servers, mcp)
+                     if srv is not None and tool_name_matches(tool, query_keywords)}
+
     taken: set[int] = set()
     primary = max(server_totals, key=lambda s: (server_totals[s], s), default=None)
-    if primary is not None and server_totals[primary] > 0:
+    if primary is not None and primary in named_servers:
         core = sorted(
             (i for i, s in enumerate(servers)
              if s == primary
@@ -839,10 +991,47 @@ def select_tools(all_tools: list[dict], context: str, budget: int,
             key=rank)
         taken.update(core[:min(SERVER_CORE_QUOTA, remaining)])
 
+    # An empty slot is cheaper than a wrong tool.
+    #
+    # This loop used to fill the budget to the brim from whatever was left,
+    # which meant that once the tools the turn actually scored ran out, the
+    # rest of the payload was decided by name length and list order. Measured
+    # against the live 257-tool pool at a 36-slot budget:
+    #
+    #   "what time is it in Tokyo"      21 of 36 slots went to the pdf server
+    #   "hello"                         36 tools, none of them scoring at all
+    #
+    # At ~125 tokens per schema that is ~4,500 tokens per turn spent on tools
+    # chosen by accident, and the model reads every one of them. So a slot is
+    # now spent only on a tool that earned it: one this message scored, or one
+    # already in hand from the last (bounded by STICKY_CARRY_OVER). The
+    # primary server's core quota above is unaffected — that is the deliberate
+    # exception, and the reason `add_heading` still ships with `create_document`
+    # despite scoring zero.
+    #
+    # Under-filling is safe because it is *visible*: `withheld_tools_notice`
+    # names what is not loaded, so a gap the model needs to close is one it can
+    # see, which was never true of a gap hidden behind 36 irrelevant schemas.
+    floor = relevance_floor(scores)
+    # Carry the last set over only when *this* message has no direction of its
+    # own. "yes, do that" scores nothing and needs the working set; "extract
+    # the tables from this PDF" scores plenty and does not need the browser
+    # tools left over from two turns ago. Carrying unconditionally is how the
+    # payload silently refilled: 8 stale slots on every turn, whatever it was
+    # about.
+    carry_allowed = STICKY_CARRY_OVER if max(scores, default=0.0) <= 0 else 0
+    carried = 0
     for i in sorted(range(len(mcp)), key=rank):
         if len(taken) >= remaining:
             break
-        taken.add(i)
+        if i in taken:
+            continue
+        if scores[i] >= floor:
+            taken.add(i)
+        elif (carried < carry_allowed
+              and mcp[i].get("name", "") in sticky):
+            taken.add(i)
+            carried += 1
 
     # Serialise by name, not by score. Selection is already decided by this
     # point and the model does not care about the order — but the byte stream
@@ -956,6 +1145,46 @@ def _max_tokens_was_set() -> bool:
     return bool(os.environ.get("AGENT_MAX_TOKENS", "").strip())
 
 
+#: Default sampling temperature. Low because this agent's output is documents,
+#: code and tool arguments, none of which benefit from creative sampling — and
+#: because the provider default it replaces is 1.0, which is what shook a small
+#: free model apart mid-document (see `AgentState.temperature`). Not zero: some
+#: endpoints treat 0 as "unset", and a model that repeats itself verbatim when
+#: a tool call fails is its own failure mode.
+DEFAULT_TEMPERATURE = 0.3
+
+#: Wall-clock ceiling for one turn, seconds. `AGENT_MAX_TURN_SECONDS=0` removes
+#: it.
+#:
+#: 15 minutes is chosen from measurement, not taste. Across the labwork sweep
+#: the slowest turn that *finished usefully* was 463 s; the two pathological
+#: ones were 1,986 s (89 tool calls on one instruction) and a 75-minute stall
+#: that produced nothing at all and had to be killed by hand. The ceiling sits
+#: well above real work and well below both failures.
+MAX_TURN_SECONDS = _env_int("AGENT_MAX_TURN_SECONDS", 900, minimum=0)
+
+
+def effective_temperature() -> Optional[float]:
+    """The sampling temperature for this turn, or None to send nothing.
+
+    `AGENT_TEMPERATURE=` (empty) or `off` opts out entirely and restores the
+    old behaviour of accepting whatever the endpoint does — kept reachable
+    because a provider that rejects the parameter must remain usable, and
+    because "the agent stopped sending a field it used to send" needs to be
+    something a user can undo without editing source.
+    """
+    raw = os.environ.get("AGENT_TEMPERATURE")
+    if raw is None:
+        return DEFAULT_TEMPERATURE
+    raw = raw.strip().lower()
+    if raw in ("", "off", "none", "provider", "default"):
+        return None
+    try:
+        return max(0.0, min(2.0, float(raw)))
+    except ValueError:
+        return DEFAULT_TEMPERATURE
+
+
 def effective_max_tokens(caps) -> int:
     """This turn's output budget, honouring an explicit setting.
 
@@ -978,8 +1207,13 @@ def effective_max_tokens(caps) -> int:
     """
     if _max_tokens_was_set():
         return MAX_TOKENS
-    ceiling = getattr(caps, "max_output_tokens", 0) or MAX_TOKENS
-    return min(MAX_TOKENS, ceiling) or MAX_TOKENS
+    # Otherwise the context budget decides, because the right reserve depends
+    # on the window and 8192 was chosen when every window was assumed to be
+    # 200,000. `output_reserve()` returns MAX_TOKENS if the budget is
+    # unavailable, so the old behaviour is still the fallback.
+    reserve = output_reserve()
+    ceiling = getattr(caps, "max_output_tokens", 0) or reserve
+    return min(reserve, ceiling) or reserve
 
 
 def _active_capabilities():
@@ -1021,7 +1255,7 @@ def degrade_capability(field: str, reason: str = "") -> None:
         pass
 
 
-def tool_ceiling() -> int:
+def provider_tool_ceiling() -> int:
     """How many tools this endpoint will accept.
 
     Read from the active provider's probed capabilities. It used to be
@@ -1029,12 +1263,322 @@ def tool_ceiling() -> int:
     which cut a model called `my-free-model` to a quarter of its budget for
     its name, and gave a self-hosted endpoint the cloud default it could not
     honour.
+
+    This is the *endpoint's* limit. What the window can afford is a separate
+    and usually smaller question — see `tool_ceiling`.
     """
     try:
         import provider_manager
         return max(1, int(provider_manager.capabilities_for_active().max_tools))
     except Exception:
         return 128
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Context budget — what may occupy the window
+# ══════════════════════════════════════════════════════════════════════
+#
+# The endpoint's tool ceiling answers "how many tools will this API accept?".
+# It was being used to answer "how many tools should we send?", which is a
+# different question with a different answer: 64 tools is fine for a 200,000
+# token window and catastrophic for a 32,768 one, where measurement put the
+# tool block at 18,079 tokens — 61% of everything, before the user typed. The
+# policy lives in `core.budget`; this section is the wiring.
+
+_budget_settings: Optional[Any] = None
+_budget_cache: Optional[tuple] = None
+
+
+def budget_settings(refresh: bool = False):
+    """The user's stored budget choices, read once per session."""
+    global _budget_settings
+    if _budget_settings is None or refresh:
+        _budget_settings = core_budget.load_settings()
+    return _budget_settings
+
+
+def save_budget_settings(settings) -> None:
+    """Persist new choices and make them take effect immediately.
+
+    The prompt cache is invalidated because two of the toggles (instructions,
+    skills catalogue) live in the *stable* half of the system prompt, which is
+    memoised on a filesystem fingerprint that no setting change would move.
+    Without this a user could switch the catalogue off and watch the token
+    count refuse to budge until they restarted.
+    """
+    global _budget_settings, _budget_cache
+    core_budget.save_settings(settings)
+    _budget_settings = settings
+    _budget_cache = None
+    invalidate_prompt_cache()
+    _refresh_tool_tokens()
+
+
+def _avg_tool_tokens() -> int:
+    """What one tool in the *current* pool actually costs.
+
+    Passing a measured figure to `core.budget.resolve` is what lets a share
+    mean what it says: 20% of the window is 20% whether the connected servers
+    publish terse schemas or verbose ones.
+    """
+    pool = ALL_TOOLS or COMBINED_TOOLS or TOOLS
+    if not pool:
+        return 0
+    return max(1, estimate_tool_tokens(pool) // len(pool))
+
+
+def active_budget():
+    """The resolved budget for the current model and settings.
+
+    Cached on everything that can change it, because this is read on the hot
+    path — once per turn by the prompt builder and again by the tool selector.
+    """
+    global _budget_cache
+    settings = budget_settings()
+    window = CONTEXT_WINDOW or DEFAULT_CONTEXT_WINDOW
+    ceiling = provider_tool_ceiling()
+    per_tool = _avg_tool_tokens()
+    key = (window, ceiling, per_tool, json.dumps(settings.to_dict(), sort_keys=True))
+    if _budget_cache is not None and _budget_cache[0] == key:
+        return _budget_cache[1]
+    resolved = core_budget.resolve(settings, window, ceiling, per_tool)
+    _budget_cache = (key, resolved)
+    return resolved
+
+
+def tool_ceiling() -> int:
+    """How many tools this turn may send — the window's answer, not the API's."""
+    try:
+        return max(1, active_budget().tool_ceiling)
+    except Exception:
+        return provider_tool_ceiling()
+
+
+def output_reserve() -> int:
+    """Tokens held back for the reply.
+
+    An explicit `AGENT_MAX_TOKENS` still wins, for the reason documented on
+    `effective_max_tokens`: it is the escape hatch a reasoning model needs, and
+    a budget share that silently overrode it would reinstate exactly the clamp
+    that was removed. Absent that, the budget decides — 8,192 was 25% of a
+    32,768-token window and nobody chose it.
+    """
+    if _max_tokens_was_set():
+        return MAX_TOKENS
+    try:
+        return active_budget().output_reserve
+    except Exception:
+        return MAX_TOKENS
+
+
+def enabled_tools(pool: Optional[list] = None) -> list:
+    """The tool pool with anything the user switched off removed.
+
+    Filtered here, at the pool, rather than at selection: a disabled tool left
+    in `ALL_TOOLS` is still counted by `estimate_tool_tokens`, so the saving
+    promised on the budget screen would appear nowhere in the numbers — and
+    the tool would still reach the model on any turn selection ranked it well.
+    """
+    source = pool if pool is not None else (ALL_TOOLS or COMBINED_TOOLS or TOOLS)
+    try:
+        return core_budget.filter_tools(source, active_budget(), _server_of)
+    except Exception:
+        return list(source)
+
+
+def _cap_pool(pool: list, ceiling: int) -> list:
+    """The tools a turn would send from `pool`, given a ceiling.
+
+    Not `apply_tool_cap`: that one takes *MCP* tools and prepends the built-ins
+    itself, so handing it a pool that already contains them counts every
+    built-in twice — which is how the budget screen first reported "18 of 12
+    tools sent".
+    """
+    builtin_names = {t.get("name") for t in TOOLS}
+    mcp_only = [t for t in pool if t.get("name") not in builtin_names]
+    kept_builtins = [t for t in pool if t.get("name") in builtin_names]
+    room = max(0, ceiling - len(kept_builtins))
+    return kept_builtins + mcp_only[:room]
+
+
+def _refresh_tool_tokens() -> int:
+    """Recompute the tool-block estimate the compaction budget reserves.
+
+    `TOOL_TOKENS` was measured once at startup from every discovered tool, so
+    it neither shrank when the ceiling did nor when the user disabled a server
+    — the compaction budget went on reserving for tools that were no longer
+    being sent.
+    """
+    global TOOL_TOKENS
+    try:
+        sent = _cap_pool(enabled_tools(), tool_ceiling())
+        TOOL_TOKENS = estimate_tool_tokens(compact_tool_schemas(sent))
+    except Exception:
+        pass
+    return TOOL_TOKENS
+
+
+def render_budget(breakdown, width: int = 22) -> list[str]:
+    """The budget as lines of text. Shared by /budget and the TUI page.
+
+    One renderer, because the two views drifting apart is how a user ends up
+    being told two different numbers for the same thing — the bug that
+    `_probed_capability_window` was written to stop between /status and
+    /provider.
+    """
+    total = max(1, breakdown.window)
+    lines = []
+    for line in breakdown.lines:
+        shown = line.tokens if line.enabled else 0
+        filled = int(round(width * shown / total))
+        bar = "█" * filled + "░" * (width - filled)
+        if not line.enabled:
+            state = f'{DIM}off{RESET}'
+            bar = f'{DIM}{bar}{RESET}'
+        elif line.protected:
+            state = f'{GREEN}on{RESET}'
+        else:
+            state = 'on ' if line.toggleable else f'{DIM}—{RESET}  '
+        pct = shown / total * 100
+        lines.append(f'    {line.label:<22}{shown:>7,} {bar} {pct:>4.1f}%  {state}')
+    filled = int(round(width * breakdown.output_reserve / total))
+    lines.append(f'    {"Output reserve":<22}{breakdown.output_reserve:>7,} '
+                 f'{"█" * filled + "░" * (width - filled)} '
+                 f'{breakdown.output_reserve / total * 100:>4.1f}%')
+    lines.append(f'    {DIM}{"─" * 58}{RESET}')
+    room = breakdown.conversation_room
+    colour = GREEN if breakdown.fits else RED
+    lines.append(f'    {"Left for conversation":<22}{colour}{room:>7,}{RESET}'
+                 f'  {room / total * 100:>4.1f}%')
+    if breakdown.tools_sent and breakdown.tools_sent > tool_ceiling():
+        # Not a miscount: `apply_tool_cap` keeps every built-in whatever the
+        # ceiling says, because read/write/edit/run are what the agent is. A
+        # ceiling below their number is therefore honoured for MCP tools only,
+        # and saying so beats letting the two numbers look broken.
+        lines.append(f'    {DIM}Ceiling is below the {len(TOOLS)} built-in tools, '
+                     f'which are always kept.{RESET}')
+    if not breakdown.fits:
+        lines.append('')
+        lines.append(f'  {RED}⚠{RESET}  The fixed overhead does not leave room for a '
+                     f'reply. Compaction cannot')
+        lines.append(f'     help — it only shrinks the conversation. Lower the tool '
+                     f'ceiling or')
+        lines.append(f'     switch to the economy profile.')
+    return lines
+
+
+def _budget_command(arg: str) -> str:
+    """`/budget` — show the breakdown, or change one thing about it."""
+    settings = budget_settings()
+    words = arg.split()
+
+    if words:
+        head = words[0].lower()
+        try:
+            if head in ("auto", *core_budget.PRESETS):
+                settings = dataclasses.replace(settings, profile=head)
+            elif head == "tools" and len(words) > 1:
+                value = None if words[1] == "auto" else max(0, int(words[1]))
+                settings = dataclasses.replace(settings, tool_ceiling=value)
+            elif head == "output" and len(words) > 1:
+                value = None if words[1] == "auto" else max(1, int(words[1]))
+                settings = dataclasses.replace(settings, output_reserve=value)
+            elif head in ("on", "off") and len(words) > 1:
+                key = words[1].replace("-", "_")
+                if key not in core_budget.SECTION_KEYS:
+                    return (f'  {RED}Unknown section {words[1]!r}.{RESET} '
+                            f'{DIM}One of: {", ".join(core_budget.SECTION_KEYS)}{RESET}')
+                sections = dict(settings.sections or {})
+                sections[key] = (head == "on")
+                settings = dataclasses.replace(settings, sections=sections)
+            else:
+                return (f'  {RED}Unrecognised: {arg!r}{RESET}\n'
+                        f'  {DIM}/budget [auto|economy|balanced|full] · '
+                        f'/budget tools <N|auto> · /budget output <N|auto> ·\n'
+                        f'  /budget on|off <section>{RESET}')
+        except ValueError:
+            return f'  {RED}Expected a number: {arg!r}{RESET}'
+        save_budget_settings(settings)
+
+    breakdown = budget_breakdown()
+    budget = active_budget()
+    auto = " (auto)" if settings.profile not in core_budget.PRESETS else ""
+    out = [
+        f'  {BOLD}Context budget{RESET} {DIM}·{RESET} {budget.profile.label}{auto} '
+        f'{DIM}·{RESET} {breakdown.window:,} token window',
+        f'  {DIM}{budget.profile.summary}{RESET}',
+        f'  {DIM}{"─" * 58}{RESET}',
+    ]
+    out += render_budget(breakdown)
+    out += [
+        '',
+        f'  {DIM}Tools:{RESET} {breakdown.tools_sent} of {breakdown.tools_available} '
+        f'sent per turn'
+        + (f' {DIM}(ceiling set by hand){RESET}' if budget.tool_ceiling_is_manual
+           else f' {DIM}(ceiling derived from the window){RESET}'),
+    ]
+    if budget.disabled_tools or budget.disabled_servers:
+        out.append(f'  {DIM}Disabled:{RESET} '
+                   f'{len(budget.disabled_tools)} tool(s), '
+                   f'{len(budget.disabled_servers)} server(s)')
+    out.append(f'  {DIM}Change with{RESET} {CYAN}/budget economy{RESET}{DIM},{RESET} '
+               f'{CYAN}/budget tools 12{RESET}{DIM},{RESET} '
+               f'{CYAN}/budget off skills_catalogue{RESET}')
+    return '\n'.join(out)
+
+
+def budget_breakdown(user_message: str = ""):
+    """Measure where this turn's window actually goes.
+
+    Every number is taken from the same functions the turn itself uses — the
+    prompt builder, the tool selector, the compaction planner — rather than
+    re-derived. A budget screen that estimated independently would drift from
+    what is really sent, and then be worse than no screen at all.
+    """
+    window = CONTEXT_WINDOW or DEFAULT_CONTEXT_WINDOW
+    budget = active_budget()
+    prose = CHARS_PER_TOKEN_PROSE
+
+    pool = enabled_tools()
+    sent = _cap_pool(pool, tool_ceiling())
+    tool_tokens = estimate_tool_tokens(compact_tool_schemas(sent))
+
+    def _tok(text: str) -> int:
+        return int(len(text or "") / prose)
+
+    sections: dict = {}
+    if budget.allows("instructions"):
+        sections["instructions"] = _tok(build_instructions_section(PROJECT_DIR))
+    if budget.allows("skills_catalogue"):
+        sections["skills_catalogue"] = _tok(
+            build_skills_section(max_chars=MAX_SKILLS_CHARS))
+    for key, produce in (
+        ("standing_rules", lambda: learning.directives_for_prompt()),
+        ("learned_facts", lambda: learning.recall(user_message, k=5)),
+        ("triggered_skills", lambda: build_triggered_skills(
+            user_message, MAX_TRIGGERED_SKILL_CHARS)),
+    ):
+        if not budget.allows(key):
+            continue
+        try:
+            sections[key] = _tok(produce())
+        except Exception:
+            sections[key] = 0
+
+    plan = core_context.compaction_plan(
+        used_tokens=0, window_tokens=window,
+        reserve_tokens=0, fit_fraction=COMPACTION_THRESHOLD,
+        cost_limit=COMPACTION_COST_LIMIT)
+
+    return core_budget.build_breakdown(
+        window, budget,
+        base_tokens=_tok(BASE_PROMPT),
+        environment_tokens=_tok(_environment_section()),
+        section_tokens=sections,
+        tool_tokens=tool_tokens,
+        tools_sent=len(sent),
+        tools_available=len(ALL_TOOLS or COMBINED_TOOLS or TOOLS),
+        compaction_trigger=plan.trigger)
 
 
 # ── ANSI color constants for the chat UI ──
@@ -1273,6 +1817,40 @@ RISK_LEVELS: dict[str, str] = {
     # human-in-the-loop control. See AgentState.needs_permission.
     "ask_user_question": "none",
 }
+
+#: Built-in tools that may run concurrently with one another.
+#:
+#: An allowlist, not a risk tier, because the two questions are different: a
+#: call can be perfectly safe to *approve* and still unsafe to run twice at
+#: once. Everything here reads and returns; nothing here shares a handle.
+#:
+#: Deliberately excluded, each for its own reason:
+#:   run_command   — classified `low` for read-only commands, but it routes
+#:                   multi-line payloads through a temp dir and reads the
+#:                   module-level interrupt; two at once share both.
+#:   search_web    — drives a headless browser. Two launches is two Chromes.
+#:   read_mcp_resource — one stdio pipe per server carrying JSON-RPC; two
+#:                   concurrent calls would interleave frames on it.
+#:   save_memory   — writes.
+#:   ask_user_question — is a conversation, and those are sequential.
+PARALLEL_SAFE_TOOLS = frozenset({
+    "read_file", "list_files", "search_code", "fetch_url",
+})
+
+#: Escape hatch. Set TOMAS_PARALLEL_TOOLS=0 to go back to strictly sequential
+#: execution without editing anything.
+PARALLEL_TOOLS_ENABLED = os.environ.get("TOMAS_PARALLEL_TOOLS", "1") != "0"
+
+
+def parallel_safe(name: str, params: Optional[dict] = None) -> bool:
+    """May this call overlap with the others in its batch?
+
+    Takes the params for the same reason `risk_for` does — so a future tool
+    whose safety depends on its arguments has somewhere to say so — and
+    ignores them for the current allowlist, which is safe by tool identity.
+    """
+    return PARALLEL_TOOLS_ENABLED and name in PARALLEL_SAFE_TOOLS
+
 
 #: The tools whose risk tier strict mode leaves alone — they are this agent's
 #: own, and their tiers are deliberate. Everything else (i.e. MCP) is reset to
@@ -1602,34 +2180,84 @@ def handle_list_files(params: dict) -> str:
         entries.append(f"{'[dir] ' if child.is_dir() else '      '}{child.name}")
     return "\n".join(entries) if entries else "(empty)"
 
+# An interpreter token: `python`, `python3`, `python.exe`, or any of those with
+# a directory in front of it — `.venv\Scripts\python.exe`, `/usr/bin/python3` —
+# optionally quoted.
+#
+# **The prefix is part of the token, and leaving it out corrupted the command.**
+# `_PYTHON_INLINE_RE` used to start matching at the word `python`, so the
+# rewrite below spliced the replacement in *after* any leading path and left it
+# dangling:
+#
+#     .venv\Scripts\python.exe -c "print('hi')"
+#         →  .venv\Scripts\"C:\...\.venv\Scripts\python.exe" -u "…\_exec.py"
+#         →  cmd.exe: The filename, directory name, or volume label syntax is
+#            incorrect.
+#
+# The agent's own system prompt tells the model to run
+# `C:\...\.venv\Scripts\python.exe`, so this broke the exact command shape the
+# prompt asks for. One measured session spent 64 of its 117 `run_command`
+# calls failing, most of them here.
+#
+# The directory part is optional but, when present, must be consumed: `[^\s"|&<>]*`
+# stops at a shell separator so `cd X && python -c …` still matches only the
+# interpreter.
+_PY_EXE = (r'(?:"(?:[^"\n]*[\\/])?python3?(?:\.exe)?"'
+           r'|(?:[^\s"|&<>]*[\\/])?python3?(?:\.exe)?)')
+
 # Matches a `python -c "..."` payload at the end of a command line. cmd.exe
 # cannot carry newlines or nested quotes through such a payload, so it is
 # round-tripped via a temporary script file instead.
 _PYTHON_INLINE_RE = re.compile(
-    r'python(?:\.exe)?\s+(?:-u\s+)?-c\s+"(.*)"\s*$', re.S | re.I
+    rf'(?P<exe>{_PY_EXE})\s+(?:-u\s+)?-c\s+"(?P<code>.*)"\s*$', re.S | re.I
 )
 # `python -c` without -u: cmd.exe swallows stdout of short-lived processes.
-_PYTHON_DASH_C_RE = re.compile(r'\bpython(\.exe)?\s+-c\b', re.I)
+_PYTHON_DASH_C_RE = re.compile(rf'(?P<exe>{_PY_EXE})\s+-c\b', re.I)
+
+# A bare `python3` on Windows is never the interpreter this project means.
+# `.venv\Scripts` ships `python.exe` and `pythonw.exe` and no `python3.exe`, so
+# `python3` falls through PATH to whatever shim answers first — here an msys64
+# build with none of the project's packages, which is why a measured session
+# saw `python3 analyze.py` return `ModuleNotFoundError: No module named 'fitz'`
+# from a venv that has PyMuPDF installed. Models reach for `python3` out of
+# POSIX habit and have no way to see that it resolves elsewhere.
+_BARE_PYTHON3_RE = re.compile(r'(?<![\w\\/.-])python3(?!\.exe)\b', re.I)
 
 
 def _normalise_windows_command(cmd: str) -> tuple[str, Optional[str]]:
-    """Work around two cmd.exe defects around inline python payloads.
+    """Work around three cmd.exe/Windows defects around python invocations.
 
     Returns (command, temp_dir_to_clean). The temp directory is created
     outside the project so scratch files never land in the source tree and
     never collide with `unittest discover`.
+
+    Each rewrite preserves what the caller named wherever it can. An
+    interpreter given with a path is honoured, not replaced: a caller who
+    types `C:\\Python313\\python.exe` has chosen an interpreter, and silently
+    substituting the venv's would be a different bug from the one being fixed.
+    Only a *bare* name is resolved, because a bare name on Windows resolves to
+    whatever PATH answers with and the agent cannot see what that is.
     """
     if sys.platform != "win32":
         return cmd, None
-    # 1. Force unbuffered output.
-    cmd = _PYTHON_DASH_C_RE.sub(lambda m: f"python{m.group(1) or ''} -u -c", cmd)
-    # 2. Multi-line or nested-quote payloads cannot survive cmd.exe tokenising.
+
+    # 1. `python3` → the interpreter this process is running. See
+    #    _BARE_PYTHON3_RE: there is no python3.exe in a Windows venv.
+    cmd = _BARE_PYTHON3_RE.sub(lambda _: f'"{sys.executable}"', cmd)
+
+    # 2. Force unbuffered output, keeping the interpreter the caller named.
+    cmd = _PYTHON_DASH_C_RE.sub(lambda m: f"{m.group('exe')} -u -c", cmd)
+
+    # 3. Multi-line or nested-quote payloads cannot survive cmd.exe tokenising.
     m = _PYTHON_INLINE_RE.search(cmd)
-    if m and ("\n" in m.group(1) or "'" in m.group(1)):
+    if m and ("\n" in m.group("code") or "'" in m.group("code")):
         temp_dir = tempfile.mkdtemp(prefix="tomas_exec_")
         script = Path(temp_dir) / "_exec.py"
-        script.write_text(m.group(1), encoding="utf-8")
-        cmd = cmd[:m.start()] + f'"{sys.executable}" -u "{script}"'
+        script.write_text(m.group("code"), encoding="utf-8")
+        named = m.group("exe").strip('"')
+        # A pathed interpreter is a choice; a bare one is a guess we can improve.
+        exe = named if ("\\" in named or "/" in named) else sys.executable
+        cmd = (cmd[:m.start()] + f'"{exe}" -u "{script}"' + cmd[m.end():])
         return cmd, temp_dir
     return cmd, None
 
@@ -1850,7 +2478,29 @@ def handle_search_code(params: dict) -> str:
         header += f" — showing {offset + 1}-{offset + shown}"
     return header + "\n" + "\n".join(matches)
 
+#: What `save_memory` needs, in the order the schema declares it.
+_SAVE_MEMORY_FIELDS = ("key", "description", "content")
+
+
 def handle_save_memory(params: dict) -> str:
+    """Store a memory, or say what is missing.
+
+    Indexing `params` directly raised `KeyError: 'key'` straight out of the
+    handler, and the tool-call machinery handed the model the string `'key'` as
+    the result — no tool name, no field list, no hint that anything was missing.
+    A measured session called `save_memory({"content": ...})`, got back `'key'`,
+    and never retried.
+
+    Every other handler here returns `Error: …` for bad input. This one is the
+    outlier, and the cost of the inconsistency is a lost memory write on the
+    one turn of the corpus whose whole purpose is storing a rule.
+    """
+    params = params or {}
+    missing = [f for f in _SAVE_MEMORY_FIELDS if not str(params.get(f, "")).strip()]
+    if missing:
+        return (f"Error: save_memory needs {', '.join(_SAVE_MEMORY_FIELDS)}; "
+                f"missing or empty: {', '.join(missing)}. "
+                f"Got: {sorted(params) or 'no arguments'}")
     save_memory(params["key"], params["description"], params["content"])
     return f"Saved memory '{params['key']}'"
 
@@ -1908,7 +2558,7 @@ def handle_ask_user_question(params: dict) -> str:
             "user correct it afterward if it was wrong."
         )
 
-    OTHER_LABEL = "✎ Other (type your own answer)"
+    OTHER_LABEL = "Other"
 
     def _ask_custom() -> str:
         try:
@@ -1926,22 +2576,37 @@ def handle_ask_user_question(params: dict) -> str:
         header = str(q.get("header") or "").strip()
         multi = bool(q.get("multiSelect"))
 
+        # Who is asking goes on its own line, with the header beside it rather
+        # than after the question: a header trailing a long question wraps onto
+        # the next line and reads as part of the question.
         print()
-        badge = f'  {DIM}[{header}]{RESET}' if header else ''
-        print(f'  {MAGENTA}{BOLD}▌ TOMAS asks{RESET}{badge}')
-        print(f'  {text}')
+        who = 'TOMAS asks' + (f' {DIM}· {header}{RESET}' if header else '')
+        print(f'  {MAGENTA}{BOLD}▌{RESET} {MAGENTA}{who}{RESET}')
+        print(f'  {BOLD}{text}{RESET}')
+        print()
 
-        labels = []
-        for opt in options:
-            label = str(opt.get("label", "")).strip()
-            desc = str(opt.get("description", "")).strip()
-            labels.append(f'{label}  {DIM}— {desc}{RESET}' if desc else label)
-        labels.append(OTHER_LABEL)
+        # Descriptions in their own column, not trailing off each label behind
+        # an em dash. With three options of different name lengths the ragged
+        # version gives the eye no line to follow, and the choice is the whole
+        # point of the screen.
+        from text_display import display_width
+
+        raw = [str(opt.get("label", "")).strip() for opt in options]
+        width = max((display_width(r) for r in raw + [OTHER_LABEL]), default=0)
+
+        def _row(label: str, desc: str) -> str:
+            pad = " " * max(0, width - display_width(label))
+            return f'{label}{pad}   {DIM}{desc}{RESET}' if desc else label
+
+        labels = [_row(label, str(opt.get("description", "")).strip())
+                  for opt, label in zip(options, raw)]
+        labels.append(_row(OTHER_LABEL, 'type your own answer'))
         other_idx = len(options)
 
         if multi:
             picked = _arrow_checklist(
-                text, labels, footer='Space toggle · Enter confirm · Esc skip') or []
+                "", labels,
+                footer='Space toggle · Enter confirm · Esc skip') or []
             chosen = []
             for i in picked:
                 if i == other_idx:
@@ -1951,7 +2616,8 @@ def handle_ask_user_question(params: dict) -> str:
                 else:
                     chosen.append(str(options[i].get("label", "")))
         else:
-            idx = _arrow_menu(text, labels, footer='↑↓ move · Enter select · Esc skip')
+            idx = _arrow_menu("", labels,
+                              footer='↑↓ move · Enter select · Esc skip')
             chosen = []
             if idx == other_idx:
                 custom = _ask_custom()
@@ -1960,9 +2626,24 @@ def handle_ask_user_question(params: dict) -> str:
             elif idx != -1:
                 chosen.append(str(options[idx].get("label", "")))
 
-        print(f'  {GREEN}→{RESET} ' + (', '.join(chosen) if chosen else '(skipped)'))
-        answered.append({"question": text, "answers": chosen})
+        if chosen:
+            print(f'  {GREEN}→{RESET} ' + ', '.join(chosen))
+        else:
+            print(f'  {DIM}→ skipped{RESET}')
+        answered.append({"question": text, "answers": chosen,
+                         "skipped": not chosen})
 
+    # Say what an empty answer *means*. `{"answers": []}` reads as "the user
+    # answered nothing", which a model resolves by asking the same question
+    # again or by silently picking for them. Declining to choose is itself an
+    # instruction: proceed, decide it yourself, and say what you assumed.
+    if any(a["skipped"] for a in answered):
+        return json.dumps({
+            "answers": answered,
+            "note": ("The user skipped one or more questions. Do not ask them "
+                     "again. Choose the most reasonable option yourself, "
+                     "state which one you chose and why, and continue."),
+        }, ensure_ascii=False)
     return json.dumps({"answers": answered}, ensure_ascii=False)
 
 
@@ -2387,8 +3068,34 @@ def _truncate_section(text: str, max_chars: int, label: str = "") -> str:
     return cut + notice
 
 
+_warned_instructions: set = set()
+
+
+def _warn_instructions_dropped(dropped: list, budget_chars: int) -> None:
+    """Tell the *user* which instruction files did not fit, once per set.
+
+    The old code appended "[... instructions truncated ...]" to the prompt and
+    told nobody else. That notice went to the model, which cannot restore the
+    missing text, cannot ask about it, and has no reason to mention it — so
+    the person whose file was being ignored was the only one kept in the dark.
+    """
+    key = tuple(sorted(dropped))
+    if key in _warned_instructions:
+        return
+    _warned_instructions.add(key)
+    names = ", ".join(dropped)
+    print(f'  {YELLOW}⚠{RESET}  instruction files not sent this session: '
+          f'{BOLD}{names}{RESET}\n'
+          f'     {DIM}They do not fit the {budget_chars:,}-char budget for a '
+          f'{CONTEXT_WINDOW:,}-token window. Shorten them, or switch to a '
+          f'model with a larger window.{RESET}')
+
+
 # Maximum size for each system-prompt section (in characters)
-MAX_INSTRUCTIONS_CHARS = 24000      # AGENTS.md + CLAUDE.md + global instructions
+#: Retained for callers and tests that ask "what is the ceiling": the *applied*
+#: budget is now derived per-window by `core.budget.instructions_budget`, and
+#: this is the largest it can ever be.
+MAX_INSTRUCTIONS_CHARS = 40000      # AGENTS.md + CLAUDE.md + global instructions
 MAX_DIRECTIVES_CHARS = 1000         # standing rules (bounded by MAX_DIRECTIVES too)
 MAX_LEARNED_CHARS = 1500            # retrieved facts (bounded by k, not by store size)
 MAX_SKILLS_CHARS = 4000             # skills section
@@ -2439,6 +3146,18 @@ def _stable_inputs() -> list[Path]:
     return paths
 
 
+def _budget_sections() -> frozenset:
+    """Which system-prompt sections the active budget allows.
+
+    Falls back to "everything" rather than "nothing": a budget that cannot be
+    read must not silently strip the agent of its instructions.
+    """
+    try:
+        return active_budget().enabled_sections
+    except Exception:
+        return frozenset(core_budget.SECTION_KEYS)
+
+
 def _stable_fingerprint() -> tuple:
     """(path, mtime, size) for each input — cheap, and changes when they do.
 
@@ -2454,6 +3173,11 @@ def _stable_fingerprint() -> tuple:
             signature.append((str(path), int(st.st_mtime_ns), st.st_size))
         except OSError:
             signature.append((str(path), 0, -1))    # absent is a state too
+    # Two sections of the stable half are switchable (instructions, skills
+    # catalogue), and switching one moves no file on disk. Without this the
+    # memoised prefix would outlive the setting that built it, and a user who
+    # turned the catalogue off would watch the token count refuse to move.
+    signature.append(("budget:sections", tuple(sorted(_budget_sections())), 0))
     return tuple(signature)
 
 
@@ -2493,14 +3217,30 @@ def build_system_prompt(user_message: str = "") -> str:
     if _stable_prefix is not None and signature == _stable_signature:
         stable = _stable_prefix
     else:
+        # Which sections are allowed at all. Read once here rather than per
+        # section, so the stable half is built against a single consistent
+        # answer — and note `_stable_fingerprint` carries the same flags, or
+        # a toggle would not survive the memoisation below.
+        allowed = _budget_sections()
         stable = BASE_PROMPT + _environment_section()
         # project-level instructions from AGENTS.md / agent.md / CLAUDE.md
         # plus ~/.tomas/instructions/
-        instructions_section = build_instructions_section(PROJECT_DIR)
+        # Budgeted as a share of the real window and cut by whole files —
+        # never at a character offset. See `instructions_manager.fit_instructions`
+        # for why the old blunt slice was the bug behind "the agent does not
+        # follow my AGENT.md": the cut landed mid-document and the only party
+        # told about it was the model.
+        if "instructions" in allowed:
+            import core.budget as _budget
+            import instructions_manager as _im
+            budget_chars = _budget.instructions_budget(CONTEXT_WINDOW)
+            instructions_section, dropped = _im.fit_instructions(
+                _im.instruction_parts(PROJECT_DIR), budget_chars)
+            if dropped:
+                _warn_instructions_dropped(dropped, budget_chars)
+        else:
+            instructions_section = ""
         if instructions_section:
-            instructions_section = _truncate_section(
-                instructions_section, MAX_INSTRUCTIONS_CHARS, "instructions"
-            )
             stable += f"\n\n{instructions_section}"
         # legacy support: AGENT_INSTRUCTIONS.md or BEHAVIOR.md
         for candidate in [PROJECT_DIR / "AGENT_INSTRUCTIONS.md",
@@ -2514,7 +3254,8 @@ def build_system_prompt(user_message: str = "") -> str:
         # joined string at a character offset (which used to cut mid-skill-
         # name). Names only; it does not vary with the message, so it belongs
         # up here where it can be cached rather than re-sent every turn.
-        skills_section = build_skills_section(max_chars=MAX_SKILLS_CHARS)
+        skills_section = (build_skills_section(max_chars=MAX_SKILLS_CHARS)
+                          if "skills_catalogue" in allowed else "")
         if skills_section:
             stable += f"\n\n{skills_section}"
         _stable_prefix = stable
@@ -2529,8 +3270,10 @@ def build_system_prompt(user_message: str = "") -> str:
     # learned") was obeyed 0/29 — while being present in the prompt on all 29
     # turns. The rule was never the problem; the channel was. Directives keep
     # their own imperative heading and still precede the retrieved facts.
+    tail_allowed = _budget_sections()
     try:
-        directives = learning.directives_for_prompt()
+        directives = (learning.directives_for_prompt()
+                      if "standing_rules" in tail_allowed else "")
         if directives:
             directives = _truncate_section(directives, MAX_DIRECTIVES_CHARS,
                                            "standing rules")
@@ -2551,7 +3294,8 @@ def build_system_prompt(user_message: str = "") -> str:
     # silently fell off the end of the budget; retrieval keeps the prompt
     # flat in size no matter how much is stored.
     try:
-        learned = learning.recall(user_message, k=5)
+        learned = (learning.recall(user_message, k=5)
+                   if "learned_facts" in tail_allowed else "")
         if learned:
             learned = _truncate_section(learned, MAX_LEARNED_CHARS, "learned")
             # Heading rewritten from "What I've learned about this user and
@@ -2567,7 +3311,8 @@ def build_system_prompt(user_message: str = "") -> str:
     # nothing ever read `triggers`, so a procedure written for a job never
     # reached the model while it was doing that job.
     try:
-        triggered = build_triggered_skills(user_message, MAX_TRIGGERED_SKILL_CHARS)
+        triggered = (build_triggered_skills(user_message, MAX_TRIGGERED_SKILL_CHARS)
+                     if "triggered_skills" in tail_allowed else "")
         if triggered:
             tail += f"\n\n{triggered}"
     except Exception:
@@ -2975,10 +3720,18 @@ def maybe_prune(messages: list) -> list:
     return messages
 
 
-def maybe_compact(messages: list, system_prompt: str = "") -> list:
+def maybe_compact(messages: list, system_prompt: str = "",
+                  force: bool = False) -> list:
     """Compact the conversation if it's getting too large.
 
     Now accounts for system_prompt + tool definitions + max_tokens in the budget.
+
+    `force` is what `/compact` passes, and it exists because the two are
+    genuinely different questions. Turning automatic compaction off means "do
+    not spend a model call on this without asking me" — it cannot also mean
+    "and refuse when I do ask", which is what a single code path would have
+    delivered: the moment the user set Never, the command they were told to use
+    instead became a silent no-op.
     """
     msg_tok = _estimate_tokens(messages)
     sys_tok = _estimate_system_prompt_tokens(system_prompt) if system_prompt else 0
@@ -2988,11 +3741,35 @@ def maybe_compact(messages: list, system_prompt: str = "") -> list:
     plan = core_context.compaction_plan(
         used_tokens=msg_tok,
         window_tokens=CONTEXT_WINDOW,
-        reserve_tokens=sys_tok + TOOL_TOKENS + MAX_TOKENS,
-        fit_fraction=COMPACTION_THRESHOLD,
+        reserve_tokens=sys_tok + TOOL_TOKENS + output_reserve(),
+        # `force` asks the fit question at the default threshold rather than
+        # not asking it at all, so /compact reports honest arithmetic while
+        # still doing what it was told.
+        fit_fraction=(core_context.DEFAULT_FIT_FRACTION if force
+                      else COMPACTION_THRESHOLD),
         cost_limit=COMPACTION_COST_LIMIT,
     )
-    if not plan.needed:
+    if plan.reason == "overhead" and not force:
+        # Not silence: this is the state where the agent cannot work properly
+        # and the cause is fixable, so saying nothing would leave the user
+        # watching every turn run slowly for no visible reason. Once per
+        # session — it is a configuration problem, not a per-turn event.
+        global _warned_overhead
+        if not _warned_overhead:
+            _warned_overhead = True
+            print(f'  {YELLOW}⚠{RESET}  {plan.reserve:,} tokens of tools, prompt and '
+                  f'output reserve leave no room in a {plan.window:,}-token window '
+                  f'{DIM}(compaction cannot help — it only shrinks the '
+                  f'conversation){RESET}\n'
+                  f'     {DIM}Fix it in{RESET} {CYAN}/budget{RESET}{DIM} — or the '
+                  f'Context Budget page in agent_cli.py{RESET}')
+        return messages
+    # `force` compacts a conversation that does not strictly need it — which
+    # is the whole point of a manual command — but not one so short that the
+    # summary plus its two framing messages would be larger than the original.
+    # "Compacted" that grows the transcript is a worse answer than "nothing to
+    # gain", and the caller reports the difference.
+    if not plan.needed and not (force and len(messages) > 4):
         return messages
     before_tok = plan.used
     print(f'  {DIM}[context] compacting conversation '
@@ -3018,7 +3795,7 @@ def maybe_compact(messages: list, system_prompt: str = "") -> list:
     except Exception as e:
         print(f'  {RED}⚠{RESET} {DIM}compaction failed: {e}{RESET}')
         # Fallback: leave room for tools + max_tokens
-        budget = int((CONTEXT_WINDOW - TOOL_TOKENS - MAX_TOKENS) * 0.5)
+        budget = int((CONTEXT_WINDOW - TOOL_TOKENS - output_reserve()) * 0.5)
         keep = [messages[-1]] if messages else []
         running = _estimate_tokens(keep)
         for m in reversed(messages[:-1]):
@@ -3053,6 +3830,60 @@ _is_client_error = core_loop.is_client_error
 # Session-scoped tool approvals. Answering "always" records the exact call the
 # user saw; it no longer rewrites RISK_LEVELS for the rest of the process.
 APPROVALS = ApprovalStore()
+
+
+def init_mcp(config: Optional[dict] = None) -> dict:
+    """Connect MCP servers and wire them into this module's tool state.
+
+    Extracted from `main()`, where it was inlined. That mattered: the
+    simulation harness needed the same startup and had to reimplement thirty
+    lines of it, which is how a harness and its app drift until the harness is
+    testing something the app does not do. One caller is a coincidence; two
+    is a function.
+
+    Returns a summary — servers connected, servers that failed, tool count,
+    renames — so a caller can print whatever its front end prints instead of
+    this deciding. Never raises: a broken MCP config degrades to the built-in
+    tools, because losing `read_file` because a browser server has no
+    credentials is not a trade anyone would choose.
+    """
+    global COMBINED_TOOLS, TOOL_TOKENS, MCP_TOOL_NAME_MAP, ALL_TOOLS, mcp_manager
+
+    from mcp_manager import read_mcp_servers
+
+    summary = {"servers": [], "failed": {}, "disabled": [], "tools": 0,
+               "renamed": 0, "dropped": 0, "budget": 0, "error": ""}
+    try:
+        manager = MCPManager()
+        all_config = read_mcp_servers() if config is None else dict(config)
+        summary["disabled"] = sorted(n for n, c in all_config.items()
+                                     if c.get("disabled"))
+        manager.discover_and_connect(config=all_config)
+        mcp_manager = manager
+        summary["servers"] = sorted(manager.servers)
+        summary["failed"] = dict(getattr(manager, "failed_servers", {}) or {})
+
+        if manager.tools:
+            mcp_tools, MCP_TOOL_NAME_MAP, renamed = resolve_mcp_tool_conflicts(
+                manager.tools)
+            ALL_TOOLS = TOOLS + mcp_tools
+            budget = tool_ceiling()
+            COMBINED_TOOLS, dropped = apply_tool_cap(mcp_tools, max_allowed=budget)
+            summary.update(tools=len(mcp_tools), renamed=renamed,
+                           dropped=dropped, budget=budget)
+        else:
+            ALL_TOOLS = list(TOOLS)
+            COMBINED_TOOLS = TOOLS
+            MCP_TOOL_NAME_MAP = {}
+        TOOL_TOKENS = estimate_tool_tokens(COMBINED_TOOLS)
+    except Exception as e:
+        summary["error"] = f"{type(e).__name__}: {e}"
+        mcp_manager = MCPManager()
+        ALL_TOOLS = list(TOOLS)
+        COMBINED_TOOLS = TOOLS
+        MCP_TOOL_NAME_MAP = {}
+        TOOL_TOKENS = estimate_tool_tokens(TOOLS)
+    return summary
 
 
 def _tool_origin(name: str) -> str:
@@ -3167,7 +3998,7 @@ def tools_for_turn(messages: list) -> tuple[list[dict], list[dict]]:
     edits and moves to browser automation should get browser tools when they
     ask for them, not whichever server connected first at startup.
     """
-    pool = ALL_TOOLS or COMBINED_TOOLS or TOOLS
+    pool = enabled_tools()
     context = _recent_user_text(messages)
     try:
         context = f"{context}\n{self_improve.get_session_analysis().get('purpose', '')}"
@@ -3392,6 +4223,17 @@ def build_state(system_prompt: str, messages: list, responder) -> AgentState:
         # about why a copy would lose the transcript.
         mark_history_for_caching(messages,
                                  breakpoints=MAX_CACHE_BREAKPOINTS - 1)
+        # ...and again before every model call the turn goes on to make. Marking
+        # once here covered only the history that existed before the first call;
+        # a turn that then makes 29 tool calls appends 58 messages behind those
+        # marks and pays full price for all of them, which is the case
+        # mark_history_for_caching's own docstring names as needing it most.
+        # Re-cutting is free: cache_control says where to cut, so moving it does
+        # not change the bytes the cache is keyed on.
+        remark_cache = lambda msgs: mark_history_for_caching(
+            msgs, breakpoints=MAX_CACHE_BREAKPOINTS - 1)
+    else:
+        remark_cache = None
 
     return AgentState(
         system_prompt=system_prompt,
@@ -3400,9 +4242,13 @@ def build_state(system_prompt: str, messages: list, responder) -> AgentState:
         get_model=_get_model,
         tools=selected if caps.tool_use else [],
         max_tokens=effective_max_tokens(caps),
+        temperature=effective_temperature(),
+        max_turn_seconds=MAX_TURN_SECONDS,
         execute_tool=execute_tool,
         risk_of=risk_for,
         origin_of=_tool_origin,
+        parallel_safe=parallel_safe,
+        before_model_call=remark_cache,
         responder=responder,
         approvals=APPROVALS,
         auto_approve_low=AUTO_APPROVE_LOW,
@@ -3427,7 +4273,22 @@ def _run_text_protocol(state, adapter, reply: str, messages: list) -> str:
     back, and let it continue. Slower and less reliable than native tool use
     — which is the point: the missing capability costs a feature, not the
     session.
+
+    Permission is asked through `state` and the live `adapter`, the same way
+    `core.loop.run_turn` asks it. This called a `request_permission()` that
+    does not exist anywhere in the program, so the whole path died with
+    `NameError` the moment a model actually emitted a tool call — on the one
+    route that exists *because* the provider cannot call tools natively, i.e.
+    exactly the small and self-hosted models it was written for. Nothing
+    caught it because nothing tested it.
+
+    Not `check_permission()`: that legacy helper reads module globals and
+    constructs its own `TerminalAdapter`, so a headless run would have been
+    handed an interactive prompt with no one to answer it, and the turn's own
+    mode (yolo/bypass) would have been ignored.
     """
+    from core.events import PermissionNeeded
+
     for _ in range(TEXT_PROTOCOL_MAX_ROUNDS):
         calls = parse_text_tool_calls(reply)
         if not calls:
@@ -3435,19 +4296,39 @@ def _run_text_protocol(state, adapter, reply: str, messages: list) -> str:
         results = []
         for call in calls:
             name, params = call["name"], call["input"]
-            if not request_permission(name, params):
+            approved = True
+            if state.needs_permission(name, params):
+                decision = adapter.ask(PermissionNeeded(
+                    "", name, params, state.risk_of(name, params)))
+                if decision == "always_allow_this_call":
+                    state.approvals.approve(name, params)
+                else:
+                    approved = decision == "allow"
+            if not approved:
                 results.append(
                     f"[{name}] Error: the user denied this tool call. Retrying "
                     f"the same call will be denied again — do not re-issue it.")
                 continue
             t0 = time.perf_counter()
             try:
-                out = execute_tool(name, params)
-                ok = True
+                # Through `state`, like everything else here. `build_state`
+                # injects the module-level `execute_tool`/`_record_tool_call`,
+                # so this is the same call in production — but reading the
+                # globals directly meant the one path a host cannot override
+                # was the fallback path, and the function was untestable
+                # without touching the real filesystem.
+                out = state.execute_tool(name, params)
+                ok = not (isinstance(out, str)
+                          and out.lstrip().startswith("Error:"))
             except Exception as e:
                 out, ok = f"Error: tool raised {type(e).__name__}: {e}", False
-            _record_tool_call(name, params, str(out)[:200],
-                              int((time.perf_counter() - t0) * 1000), ok)
+            if state.on_tool_call:
+                try:
+                    state.on_tool_call(name, params, str(out)[:200],
+                                       int((time.perf_counter() - t0) * 1000),
+                                       ok)
+                except Exception:
+                    pass
             results.append(f"[{name}]\n{str(out)[:state.max_result_chars]}")
         messages.append({"role": "assistant", "content": reply})
         messages.append({"role": "user",
@@ -3645,6 +4526,18 @@ def agent_loop(system_prompt: str, messages: list) -> str:
         raise
     finally:
         _turn_timings.append(time.perf_counter() - t0)
+        # A model the provider will not serve is worth writing down. The core
+        # only reports it — it cannot import a catalogue without giving up
+        # being dependency-free — so the host does the writing, here, where it
+        # already reads the rest of the turn's findings back.
+        if getattr(state, "model_unavailable", False):
+            try:
+                import zen_catalog
+
+                zen_catalog.mark_unavailable(_get_model(),
+                                             state.last_error or "")
+            except Exception:
+                pass
         # Propagate what the turn learned back into module state.
         was_streaming = not _streaming_disabled
         _streaming_disabled = not state.streaming_enabled
@@ -3659,9 +4552,18 @@ def agent_loop(system_prompt: str, messages: list) -> str:
                 degrade_capability("streaming", state.streaming_error or "stream failed")
         _last_turn_usage["input"] = state.usage.get("input", 0)
         _last_turn_usage["output"] = state.usage.get("output", 0)
+        _last_turn_usage["cached_input"] = state.usage.get("cached_input", 0)
         _session_tokens["input"] += state.usage.get("total_input", 0)
         _session_tokens["output"] += state.usage.get("total_output", 0)
+        _session_tokens["cached_input"] += state.usage.get("total_cached_input", 0)
         _session_tokens["calls"] += state.usage.get("calls", 0)
+        # What the streamed call cost before being thrown away and re-issued
+        # non-streamed. Spent on every tool step and counted by nothing until
+        # now — see core.loop._record_discarded_stream.
+        for key in ("duplicate_input", "duplicate_calls",
+                    "would_have_served", "stream_malformed_tool_args"):
+            _session_tokens[key] = (_session_tokens.get(key, 0)
+                                    + state.usage.get(key, 0))
         # A turn that produced nothing is recorded as such. Silence here is
         # what let a session with eight prompts and zero replies be saved,
         # and then be reported as eight turns of completed work.
@@ -3703,6 +4605,7 @@ SLASH_COMMANDS = {
     "mode":         {"desc": "Show/change mode: /mode [auto|default]", "icon": "⚙"},
     "config":       {"desc": "Interactive menu: provider, model, mode", "icon": "🛠"},
     "compact":      {"desc": "Force compact conversation now",    "icon": "⚙"},
+    "budget":       {"desc": "Context budget: /budget [economy|balanced|full|auto|tools N|output N|on|off <section>]", "icon": "▣"},
     "skills":       {"desc": "List installed skills",            "icon": "⚡"},
     "skill":        {"desc": "Run a skill: /skill <name>",        "icon": "⚡"},
     "mcp-prompt":   {"desc": "MCP prompt templates: /mcp-prompt [name]", "icon": "◈"},
@@ -3833,8 +4736,13 @@ def _arrow_menu(title: str, items: list[str], footer: str = "") -> int:
 
     def draw() -> int:
         rows = 0
-        sys.stdout.write(CLEAR_LINE + f'  {BOLD}{title}{RESET}\n')
-        rows += 1
+        # An empty title draws no row at all. `ask_user_question` prints the
+        # question itself -- with its header badge and its own spacing -- and
+        # then opens the picker; passing the same text through as a title put
+        # that sentence on screen twice, one line apart.
+        if title:
+            sys.stdout.write(CLEAR_LINE + f'  {BOLD}{title}{RESET}\n')
+            rows += 1
         for i, label in enumerate(items):
             marker = f'{GREEN}▶{RESET} ' if i == selected else '  '
             body = f'{BOLD}{label}{RESET}' if i == selected else label
@@ -3929,8 +4837,9 @@ def _arrow_checklist(title: str, items: list[str], footer: str = "") -> Optional
 
     def draw() -> int:
         rows = 0
-        sys.stdout.write(CLEAR_LINE + f'  {BOLD}{title}{RESET}\n')
-        rows += 1
+        if title:                      # see `_arrow_menu.draw` for why
+            sys.stdout.write(CLEAR_LINE + f'  {BOLD}{title}{RESET}\n')
+            rows += 1
         for i, label in enumerate(items):
             box = f'{GREEN}[x]{RESET}' if checked[i] else '[ ]'
             marker = f'{GREEN}▶{RESET} ' if i == cursor else '  '
@@ -4128,7 +5037,7 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
         # The old line divided cumulative session tokens by the window, so a
         # long session read "418% of 1,000,000 used" — two different
         # quantities with the same unit.
-        live_tok = (_estimate_tokens(messages) + TOOL_TOKENS + MAX_TOKENS)
+        live_tok = (_estimate_tokens(messages) + TOOL_TOKENS + output_reserve())
         fill = (live_tok / cw * 100) if cw else 0.0
         note = '' if window.trusted else f' {YELLOW}— not measured{RESET}'
         lines = [
@@ -4203,13 +5112,37 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
                     f'({RESET}{CYAN}/provider list{RESET}{RED}).{RESET}')
         active.model = sub
         provider_manager.save(active, activate_it=True)
-        provider_manager.apply_env("AGENT_MODEL", sub)
+        # `activate()`, not a bare `apply_env("AGENT_MODEL", ...)`. The bare
+        # call only ever wrote the model name — `save()` above never touches
+        # `os.environ` at all — so if a *different* provider's `activate()`
+        # was the last one to run in this process, `ANTHROPIC_BASE_URL` and
+        # `ANTHROPIC_API_KEY` stayed pointed at it. `/model` then sent this
+        # provider's model name to that stale endpoint: an Ollama cloud model
+        # name reached OpenRouter and came back "not a valid model ID" — a
+        # provider mismatch reported as a bad model name. `activate()` is the
+        # one place that reapplies base_url/api_key/headers together with the
+        # model, which is exactly what `agent_cli.py`'s TUI already does for
+        # every other model switch.
+        provider_manager.activate(active.name)
+        # Before `_refresh_context_window`, not after: that function reads the
+        # stored capabilities, and the stored capabilities still describe the
+        # model we just switched away from.
+        try:
+            caps = provider_manager.refresh_for_model(active)
+        except Exception:
+            caps = active.capabilities
         reinit_client()
         cw = _refresh_context_window()
+        note = (f'  {DIM}Endpoint capabilities carried over — run{RESET} '
+                f'{CYAN}/provider probe{RESET} {DIM}to re-measure.{RESET}')
+        if active.type == "ollama":
+            note = (f'  {DIM}Tool use:{RESET} {"yes" if caps.tool_use else "no"}'
+                    f'{DIM} · Vision:{RESET} {"yes" if caps.vision else "no"}')
         return (f'  {GREEN}✓{RESET} Switched model to {BOLD}{sub}{RESET} on {active.name} '
-                f'({cw:,} token context).\n'
-                f'  {DIM}Capabilities were measured for the previous model — run{RESET} '
-                f'{CYAN}/provider probe{RESET} {DIM}to re-measure if needed.{RESET}')
+                f'({cw:,} token context).\n' + note)
+
+    if cmd == "budget":
+        return _budget_command(parts[1].strip() if len(parts) > 1 else "")
 
     if cmd == "mode":
         arg = parts[1].lower() if len(parts) > 1 else ""
@@ -4284,33 +5217,50 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
         if not messages:
             return f'  {DIM}No conversation to compact.{RESET}'
         before = len(messages)
-        messages[:] = maybe_compact(messages)
+        # `force`: the user asked, so the automatic threshold — including
+        # "never" — does not apply. Without it, choosing Never in the budget
+        # page silently turned this command into a no-op that still reported
+        # success.
+        messages[:] = maybe_compact(messages, force=True)
         after = len(messages)
+        if after == before:
+            return (f'  {DIM}Nothing to gain — the conversation is already '
+                    f'smaller than a summary of it would be.{RESET}')
         return f'  {GREEN}✓{RESET} Compacted ({before} → {after} messages).'
 
     if cmd == "zen":
         try:
-            from zen_proxy import check_status, ZEN_MODELS
+            import zen_catalog
+            from zen_proxy import check_status
             port = 6446
             running = check_status(port)
+            # The catalogue is reported whether or not the proxy runs. Gating
+            # it on the daemon was backwards twice over: the daemon is opt-in
+            # (openai_adapter translates in-process), and it serves the same
+            # stale list this now replaces.
+            cat = zen_catalog.catalog()
+            base = os.environ.get("ANTHROPIC_BASE_URL", "")
+            model = os.environ.get("AGENT_MODEL", "Not set")
+            active = cat.get(model)
             lines = [
                 f'  {BOLD}OpenCode Zen{RESET}',
                 f'  {DIM}{"─" * 46}{RESET}',
-                f'  {"◉" if running else "○"}  Proxy: {"running" if running else "not running"}',
+                f'  {CYAN}◈{RESET}  Endpoint: {base or "not set"}',
+                f'  {CYAN}◎{RESET}  Model:    {active.label if active else model}',
+                f'  {"◉" if running else "○"}  Optional local proxy: '
+                f'{"running" if running else "not running"}',
+                '',
+                f'  {DIM}Free models — {len(cat.free())} of {len(cat.models)} '
+                f'served ({cat.freshness}):{RESET}',
             ]
-            if running:
-                base = os.environ.get("ANTHROPIC_BASE_URL", "")
-                model = os.environ.get("AGENT_MODEL", "Not set")
-                lines.append(f'  {CYAN}◈{RESET}  Endpoint: {base}')
-                lines.append(f'  {CYAN}◎{RESET}  Model:    {model}')
-                lines.append('')
-                lines.append(f'  {DIM}Available free models:{RESET}')
-                for m in ZEN_MODELS:
-                    lines.append(f'    {DIM}•{RESET} {m}')
-            else:
-                lines.append('')
-                lines.append(f'  {YELLOW}Tip: Start the proxy from the{RESET}')
-                lines.append(f'  {YELLOW}  Connect / configure provider menu.{RESET}')
+            for m in cat.free():
+                mark = f'{GREEN}●{RESET}' if m.id == model else f'{DIM}•{RESET}'
+                lines.append(f'    {mark} {m.label}')
+            if not cat.free():
+                lines.append(f'    {DIM}none right now{RESET}')
+            lines.append('')
+            lines.append(f'  {DIM}{len(cat.paid())} further models bill per '
+                         f'token — switch with{RESET} {CYAN}/model{RESET}')
             return '\n'.join(lines)
         except Exception as e:
             return f'  {YELLOW}Zen: {e}{RESET}'
@@ -4454,7 +5404,7 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
             return f'  {RED}⚠{RESET} PDF report failed: {e}'
 
     # ── Session commands ──
-    if cmd in ("session", "sessions"):
+    if cmd in ("session", "sessions", "save", "load"):
         # "sessions" is an alias that defaults to the "list" subcommand.
         # parts is split with maxsplit=1, so parts[1] holds "sub [arg]".
         # Re-split to extract the subcommand and any trailing argument.
@@ -4465,6 +5415,17 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
         # /sessions (alias) with no subcommand → list
         if cmd == "sessions" and not sub:
             sub = "list"
+        # /save and /load are listed in SLASH_COMMANDS, offered by tab
+        # completion, and were handled by nothing at all: both returned None,
+        # which the REPL renders as no output whatsoever. The user typed the
+        # command the help screen told them to type, saw an empty line, and
+        # their session was not saved. They are the short forms of subcommands
+        # that already work, so they route to them rather than growing a
+        # second implementation.
+        elif cmd == "save":
+            sub, sid_arg = "save", ""
+        elif cmd == "load":
+            sub, sid_arg = "continue", (rest.strip() or "")
 
         if sub in ("list", "ls"):
             sessions = list_sessions(limit=20)
@@ -4499,7 +5460,13 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
 
         elif sub in ("continue", "load"):
             if not sid_arg:
-                return f'  {YELLOW}Usage:{RESET} {CYAN}/session continue <id>{RESET}\n  {DIM}Use{RESET} {CYAN}/session list{RESET} {DIM}to see session IDs.{RESET}'
+                # Name the form they actually typed. Being told to use
+                # `/session continue` after typing `/load` reads as though
+                # `/load` was the wrong command, when it is the short form.
+                usage = '/load <id>' if cmd == 'load' else '/session continue <id>'
+                return (f'  {YELLOW}Usage:{RESET} {CYAN}{usage}{RESET}\n'
+                        f'  {DIM}Use{RESET} {CYAN}/session list{RESET} '
+                        f'{DIM}to see session IDs.{RESET}')
             sid = sid_arg
             loaded = continue_session(sid)
             if loaded is None:
@@ -5071,7 +6038,6 @@ def read_input_with_suggestions(prompt: str) -> str:
     def _show():
         nonlocal showing, selected
         matches = _get_matches()
-        cf = _cmd_filter()
 
         # Mode status string (always shown in suggestion line)
         mode = current_mode_name()
@@ -5626,25 +6592,22 @@ def main() -> int:
     print()
 
     # ── Initialize MCP connections (single pass, no pre-test) ──
-    global COMBINED_TOOLS
-    from mcp_manager import read_mcp_servers
+    # The work is in `init_mcp`; everything from here to the end of the block
+    # is this front end deciding what to say about it.
+    mcp_summary = init_mcp()
+    if mcp_summary["error"]:
+        print(f'  {RED}⚠{RESET}  MCP initialization failed: {mcp_summary["error"]}')
     try:
-        mcp_manager = MCPManager()
-        all_config = read_mcp_servers()
-        disabled = {n for n, c in all_config.items() if c.get("disabled")}
-
-        mcp_manager.discover_and_connect(config=all_config)
-
-        # Compute summary after connecting
-        connected_servers = set(mcp_manager.servers.keys())
-        attempted = {n for n in all_config if n not in disabled}
-        failed = attempted - connected_servers
-        total_tools = len(mcp_manager.tools)
+        disabled = set(mcp_summary["disabled"])
+        connected_servers = set(mcp_summary["servers"])
+        total_tools = mcp_summary["tools"]
 
         # One status line. Six red error lines before the user has typed
         # anything were mostly "this optional server has no credentials",
         # which is a fact, not a failure — and not one they can act on here.
-        needs_auth, broken = _classify_mcp_failures(mcp_manager.failed_servers)
+        # The split into "needs credentials" and "broken" is what makes that
+        # one line honest rather than merely short.
+        needs_auth, broken = _classify_mcp_failures(mcp_summary["failed"])
         if connected_servers:
             line = (f'  {GREEN}✓{RESET}  {BOLD}MCP:{RESET} '
                     f'{len(connected_servers)} connected {DIM}·{RESET} {total_tools} tools')
@@ -5667,32 +6630,18 @@ def main() -> int:
                   f'({RESET}agent_cli.py{RESET}{DIM}); {RESET}{CYAN}/mcp-resources{RESET} '
                   f'{DIM}lists published resources{RESET}')
 
-        # Resolve names once. Which tools are *sent* is decided per turn by
-        # select_tools(), against what the user is actually asking for.
-        global TOOL_TOKENS, MCP_TOOL_NAME_MAP, ALL_TOOLS
-        if mcp_manager.tools:
-            mcp_tools, MCP_TOOL_NAME_MAP, renames = resolve_mcp_tool_conflicts(mcp_manager.tools)
-            if renames:
-                print(f'  {YELLOW}⚠{RESET}  Renamed {renames} MCP tool(s) to avoid built-in name conflicts')
-            ALL_TOOLS = TOOLS + mcp_tools
-            budget = tool_ceiling()
-            COMBINED_TOOLS, dropped = apply_tool_cap(mcp_tools, max_allowed=budget)
-            if dropped:
-                print(f'  {CYAN}◈{RESET}  {len(mcp_tools)} MCP tools available, '
-                      f'{budget} fit per turn {DIM}(selected by relevance to each '
-                      f'message; the model is told what is held back){RESET}')
-        else:
-            ALL_TOOLS = list(TOOLS)
-            COMBINED_TOOLS = TOOLS
-            MCP_TOOL_NAME_MAP = {}
-        TOOL_TOKENS = estimate_tool_tokens(COMBINED_TOOLS)
+        # Names were resolved inside init_mcp. Which tools are *sent* is decided
+        # per turn by select_tools(), against what the user is actually asking.
+        if mcp_summary["renamed"]:
+            print(f'  {YELLOW}⚠{RESET}  Renamed {mcp_summary["renamed"]} MCP '
+                  f'tool(s) to avoid built-in name conflicts')
+        if mcp_summary["dropped"]:
+            print(f'  {CYAN}◈{RESET}  {mcp_summary["tools"]} MCP tools available, '
+                  f'{mcp_summary["budget"]} fit per turn {DIM}(selected by '
+                  f'relevance to each message; the model is told what is held '
+                  f'back){RESET}')
     except Exception as e:
-        print(f'  {RED}⚠{RESET}  MCP initialization failed: {e}')
-        mcp_manager = MCPManager()
-        ALL_TOOLS = list(TOOLS)
-        COMBINED_TOOLS = TOOLS
-        MCP_TOOL_NAME_MAP = {}
-        TOOL_TOKENS = estimate_tool_tokens(COMBINED_TOOLS)
+        print(f'  {RED}⚠{RESET}  Could not summarise MCP state: {e}')
 
     # ── Initialize self-improving system ──
     self_improve.init()
@@ -5792,7 +6741,23 @@ def main() -> int:
             if s["calls"] > 0:
                 pct = (t["input"] + t["output"]) / CONTEXT_WINDOW * 100
                 elapsed = _fmt_duration(_turn_timings[-1]) if _turn_timings else "?"
-                print(f'  {DIM}┄  {t["input"]:,} in  {t["output"]:,} out  ·  total: {s["input"]:,} in  {s["output"]:,} out  ·  {pct:.1f}% of {CONTEXT_WINDOW:,} ctx  ·  {elapsed}{RESET}')
+                # Only shown when the provider actually reports it: a hardcoded
+                # "0% cached" on an endpoint that simply does not say would read
+                # as a cache that stopped working.
+                cached = ""
+                if s.get("cached_input"):
+                    share = s["cached_input"] / max(1, s["input"]) * 100
+                    cached = f'  ·  {s["cached_input"]:,} cached ({share:.0f}%)'
+                # The bill nobody was shown: streamed calls re-issued
+                # non-streamed to get their tool blocks. Named "duplicate"
+                # rather than folded into the total because it is the number
+                # that argues for removing the second call.
+                if s.get("duplicate_input"):
+                    served = s.get("would_have_served", 0)
+                    cached += (f'  ·  {s["duplicate_input"]:,} duplicate'
+                               f' ({served}/{s.get("duplicate_calls", 0)}'
+                               f' recoverable)')
+                print(f'  {DIM}┄  {t["input"]:,} in  {t["output"]:,} out  ·  total: {s["input"]:,} in  {s["output"]:,} out{cached}  ·  {pct:.1f}% of {CONTEXT_WINDOW:,} ctx  ·  {elapsed}{RESET}')
             # ── Self-improvement analysis, after the reply so it never adds latency ──
             try:
                 self_improve.maybe_analyze_after_turn()

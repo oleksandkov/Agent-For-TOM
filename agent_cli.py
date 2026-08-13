@@ -17,6 +17,8 @@ Usage:
     TOMAS mcp env <server> --unset KEY  Remove an env var
     TOMAS skill list               List installed skills
     TOMAS skill install <name> -- <command> [args...]  Install a skill from npm
+    TOMAS browser                  Download the Playwright browser (~170 MB)
+                                   for web search; duckduckgo is used without it
     TOMAS update                   Update TOMAS from GitHub
     TOMAS uninstall                Remove TOMAS completely
     TOMAS --help                   Show this help
@@ -551,7 +553,8 @@ def confirm_menu(title: str, items: list, header_lines: list = None,
 #  INFO DISPLAY (paged / press-any-key)
 # ═══════════════════════════════════════════════════════════
 
-def show_info_page(title: str, lines: list, prompt: str = "Press any key to go back"):
+def show_info_page(title: str, lines: list, prompt: str = "Press any key to go back",
+                   accept: tuple = ()):
     """Display a page of info, scrollable, and wait for the user to leave.
 
     Two fixes over the previous version, which printed everything and waited
@@ -563,6 +566,13 @@ def show_info_page(title: str, lines: list, prompt: str = "Press any key to go b
     * **It consumes whole keys.** `getch()` returns one byte, and an arrow key
       sends two. The orphaned second byte stayed in the buffer and was read by
       the *next* menu as a phantom keypress, moving the selection on its own.
+
+    `accept` names keys the caller wants back rather than swallowed (e.g.
+    `('e',)` for "edit this file"). Returns the key that was pressed when it is
+    one of those, else None. It exists so a page offering an action does not
+    have to re-implement the scrolling and key decoding to get one keystroke —
+    which is exactly how the instruction pages ended up back on raw `getch()`
+    with both bugs above.
     """
     columns = term_columns()
     budget = max(1, columns - 1)
@@ -591,10 +601,12 @@ def show_info_page(title: str, lines: list, prompt: str = "Press any key to go b
         sys.stdout.flush()
 
         key = get_key()
+        if accept and key in accept:
+            return key
         if not more:
-            return
+            return None
         if key in ('ESC', 'ENTER', 'q', 'LEFT', 'CTRL_C'):
-            return
+            return None
         if key == 'UP':
             top -= 1
         elif key == 'DOWN':
@@ -898,6 +910,313 @@ def page_tools():
             lines.append(f'     {DIM}Params: {", ".join(props.keys())}{RESET}')
         lines.append('')
     show_info_page('Tools', lines)
+
+
+def _budget_header(agent_mod, breakdown, budget) -> list:
+    """The live breakdown, drawn above the choices that change it.
+
+    Rendered by `agent.render_budget` rather than re-derived here: the whole
+    point of this page is that the numbers are the ones the turn actually
+    uses, and a second implementation would drift from the first within a
+    release. This function only frames what that returns.
+    """
+    auto = ' (auto)' if budget.profile.name != _budget_settings_name(agent_mod) else ''
+    lines = [
+        f'  {BOLD}{budget.profile.label}{RESET}{DIM}{auto} · '
+        f'{breakdown.window:,} token window{RESET}',
+        f'  {DIM}{budget.profile.summary}{RESET}',
+        '',
+    ]
+    lines.extend(agent_mod.render_budget(breakdown))
+    lines.append('')
+    return lines
+
+
+def _budget_settings_name(agent_mod) -> str:
+    try:
+        return agent_mod.budget_settings().profile
+    except Exception:
+        return 'auto'
+
+
+def _budget_pick_preset(agent_mod, settings):
+    """Choose a preset, or let the window choose one."""
+    import dataclasses
+
+    import core.budget as cb
+    window = agent_mod.CONTEXT_WINDOW or agent_mod.DEFAULT_CONTEXT_WINDOW
+    auto = cb.auto_profile(window)
+    options = [
+        f'  {"Auto":<10}{DIM}— follow the model: {auto.label} for '
+        f'{window:,} tokens{RESET}',
+    ]
+    for name in ('economy', 'balanced', 'full'):
+        p = cb.PRESETS[name]
+        marker = f'{GREEN}◈{RESET}' if settings.profile == name else ' '
+        options.append(f'{marker} {p.label:<10}{DIM}— {p.summary}{RESET}')
+    idx = arrow_menu('Preset', options, footer=DEFAULT_FOOTER)
+    if idx < 0:
+        return settings
+    chosen = 'auto' if idx == 0 else ('economy', 'balanced', 'full')[idx - 1]
+    return dataclasses.replace(settings, profile=chosen)
+
+
+def _budget_set_number(settings, field: str, label: str, current: int,
+                       derived: bool):
+    """Set a numeric override, or hand the field back to the profile."""
+    import dataclasses
+    note = 'derived from the window' if derived else 'set by hand'
+    raw = prompt_text(f'{label} (currently {current:,}, {note}) — '
+                      f'a number, or "auto"')
+    if not raw:
+        return settings
+    if raw.strip().lower() == 'auto':
+        return dataclasses.replace(settings, **{field: None})
+    try:
+        return dataclasses.replace(settings, **{field: max(0, int(raw))})
+    except ValueError:
+        show_info_page('Not a number', [f'  {RED}✗{RESET}  {raw!r} is not a number.'])
+        return settings
+
+
+def _budget_browse_tools(agent_mod, settings):
+    """Turn individual tools and whole MCP servers on or off.
+
+    Servers first, because switching one off is the move that actually
+    recovers tokens — a single MCP server here publishes dozens of tools, and
+    disabling them one at a time is not a workflow anyone will finish.
+    """
+    import dataclasses
+
+    import core.budget as cb
+    while True:
+        pool = agent_mod.ALL_TOOLS or agent_mod.COMBINED_TOOLS or agent_mod.TOOLS
+        budget = agent_mod.active_budget()
+        groups: dict = {}
+        for tool in pool:
+            name = tool.get('name', '')
+            server = agent_mod._server_of(name) or 'built-in'
+            groups.setdefault(server, []).append(name)
+
+        rows, actions = [], []
+        for server in sorted(groups):
+            names = groups[server]
+            off = server in budget.disabled_servers
+            if server == 'built-in':
+                # Built-ins are never sent to the chopping block: read, write,
+                # edit and run are what the agent *is*, and a budget screen
+                # that let you disable them would be offering to break it.
+                rows.append(f'  {DIM}{server:<28}{len(names):>3} tools · '
+                            f'always on{RESET}')
+                actions.append(None)
+                continue
+            cost = agent_mod.estimate_tool_tokens(
+                [t for t in pool if t.get('name') in names])
+            mark = f'{RED}✕{RESET}' if off else f'{GREEN}✓{RESET}'
+            state = f'{DIM}disabled{RESET}' if off else f'~{cost:,} tok'
+            rows.append(f'{mark} {server:<28}{len(names):>3} tools · {state}')
+            actions.append(('server', server))
+        rows.append('')
+        actions.append(None)
+        disabled_count = len(budget.disabled_tools)
+        rows.append(f'  {DIM}Individual tools…{RESET}'
+                    + (f' {DIM}({disabled_count} disabled){RESET}'
+                       if disabled_count else ''))
+        actions.append(('individual', ''))
+
+        idx = arrow_menu('Tools & servers', rows, footer=DEFAULT_FOOTER)
+        if idx < 0 or idx >= len(actions) or actions[idx] is None:
+            return settings
+        kind, value = actions[idx]
+        if kind == 'server':
+            settings = cb.toggle_server(settings, value)
+            agent_mod.save_budget_settings(settings)
+        else:
+            settings = _budget_browse_individual(agent_mod, settings)
+
+
+def _budget_browse_individual(agent_mod, settings):
+    import core.budget as cb
+    while True:
+        pool = agent_mod.ALL_TOOLS or agent_mod.COMBINED_TOOLS or agent_mod.TOOLS
+        budget = agent_mod.active_budget()
+        builtin = {t.get('name') for t in agent_mod.TOOLS}
+        rows, names = [], []
+        for tool in sorted(pool, key=lambda t: t.get('name', '')):
+            name = tool.get('name', '')
+            if name in builtin:
+                continue
+            off = name in budget.disabled_tools
+            mark = f'{RED}✕{RESET}' if off else f'{GREEN}✓{RESET}'
+            cost = agent_mod.estimate_tool_tokens([tool])
+            rows.append(f'{mark} {name:<44}{DIM}~{cost:,} tok{RESET}')
+            names.append(name)
+        if not rows:
+            show_info_page('No MCP tools', [
+                '  No MCP tools are connected, so there is nothing to disable.',
+                '',
+                f'  {DIM}Built-in tools are always on.{RESET}'])
+            return settings
+        idx = arrow_menu('Individual tools', rows, footer=DEFAULT_FOOTER)
+        if idx < 0 or idx >= len(names):
+            return settings
+        settings = cb.toggle_tool(settings, names[idx])
+        agent_mod.save_budget_settings(settings)
+
+
+def page_context_budget():
+    """Show where the context window goes, and change it.
+
+    This page exists because nothing showed the user the composition of a
+    turn. Measured on a 32,768-token local model: tool schemas 18,079 tokens,
+    output reserve 8,192, system prompt 3,353 — 29,625 of fixed cost against a
+    24,576 compaction trigger, so compaction fired on the first message with an
+    empty history and could never clear. Every one of those numbers was
+    available to the program and none of them was available to the person
+    paying for them.
+    """
+    import agent as agent_mod
+    import core.budget as cb
+
+    while True:
+        try:
+            settings = agent_mod.budget_settings(refresh=True)
+            breakdown = agent_mod.budget_breakdown()
+            budget = agent_mod.active_budget()
+        except Exception as exc:
+            show_info_page('Context Budget', [
+                f'  {RED}✗{RESET}  Could not read the budget: {exc}'])
+            return
+
+        rows = [
+            f'  Preset             {BOLD}{budget.profile.label}{RESET}'
+            + (f'{DIM}  (following the model){RESET}'
+               if settings.profile not in cb.PRESETS else ''),
+            f'  Tool ceiling       {BOLD}{budget.tool_ceiling}{RESET}'
+            f'{DIM}  {"set by hand" if budget.tool_ceiling_is_manual else "from the window"}'
+            f' · {breakdown.tools_sent} of {breakdown.tools_available} sent{RESET}',
+            f'  Output reserve     {BOLD}{budget.output_reserve:,}{RESET}'
+            f'{DIM}  {"set by hand" if budget.output_reserve_is_manual else "from the window"}{RESET}',
+            f'  Tools & servers    {DIM}enable or disable individually{RESET}',
+            f'  Auto-compact at    {BOLD}{cb.compaction_percent_label(settings)}'
+            f'{RESET}{DIM}  when to summarise the conversation{RESET}',
+            '',
+        ]
+        actions = ['preset', 'tools', 'output', 'browse', 'compact', None]
+        for spec in cb.SECTIONS:
+            key = spec['key']
+            on = budget.allows(key)
+            mark = f'{GREEN}✓{RESET}' if on else f'{RED}✕{RESET}'
+            guard = (f' {YELLOW}·{RESET}{DIM} self-improvement{RESET}'
+                     if spec['always_on'] else '')
+            rows.append(f'{mark} {spec["label"]:<24}{DIM}{spec["detail"]}{RESET}{guard}')
+            actions.append(('section', key))
+        rows.append('')
+        actions.append(None)
+        rows.append(f'  {DIM}Reset to defaults{RESET}')
+        actions.append('reset')
+
+        idx = arrow_menu('Context Budget', rows,
+                         header_lines=_budget_header(agent_mod, breakdown, budget),
+                         footer=DEFAULT_FOOTER, max_visible=len(rows))
+        if idx < 0 or idx >= len(actions) or actions[idx] is None:
+            return
+        action = actions[idx]
+
+        if action == 'preset':
+            settings = _budget_pick_preset(agent_mod, settings)
+        elif action == 'tools':
+            settings = _budget_set_number(
+                settings, 'tool_ceiling', 'Tool ceiling',
+                budget.tool_ceiling, not budget.tool_ceiling_is_manual)
+        elif action == 'output':
+            settings = _budget_set_number(
+                settings, 'output_reserve', 'Output reserve (tokens)',
+                budget.output_reserve, not budget.output_reserve_is_manual)
+        elif action == 'browse':
+            settings = _budget_browse_tools(agent_mod, settings)
+        elif action == 'compact':
+            settings = _budget_pick_compaction(agent_mod, settings)
+        elif action == 'reset':
+            settings = cb.Settings()
+        else:
+            _kind, key = action
+            window = agent_mod.CONTEXT_WINDOW or agent_mod.DEFAULT_CONTEXT_WINDOW
+            was_on = budget.allows(key)
+            if was_on and key in cb.ALWAYS_ON and not _confirm_disable_learning(key):
+                continue
+            settings = cb.toggle_section(settings, key, window)
+        agent_mod.save_budget_settings(settings)
+
+
+def _budget_pick_compaction(agent_mod, settings):
+    """Choose when the conversation is summarised, or switch it off.
+
+    The window percentage is shown next to each choice in tokens, because
+    "90%" is only a decision the user can make if they can see what 90% of
+    *their* model is — the same reason the rest of this page shows numbers
+    rather than shares.
+    """
+    import core.budget as cb
+
+    window = agent_mod.CONTEXT_WINDOW or agent_mod.DEFAULT_CONTEXT_WINDOW
+    rows, values = [], []
+    for percent, label, detail in cb.COMPACTION_CHOICES:
+        current = f'{GREEN}●{RESET}' if percent == settings.compact_at_percent \
+            else f'{DIM}○{RESET}'
+        if percent:
+            at = f'{DIM}  ≈ {int(window * percent / 100):,} tokens{RESET}'
+        elif percent is None:
+            at = (f'{DIM}  ≈ '
+                  f'{int(window * cb.core_context.DEFAULT_FIT_FRACTION):,} '
+                  f'tokens{RESET}')
+        else:
+            at = ''
+        rows.append(f'{current} {label:<24}{DIM}{detail}{RESET}{at}')
+        values.append(percent)
+
+    idx = arrow_menu(
+        'Automatic compaction',
+        rows,
+        header_lines=[
+            f'  {DIM}When the request reaches this share of the '
+            f'{window:,}-token window, the{RESET}',
+            f'  {DIM}conversation so far is replaced by a summary. '
+            f'{RESET}{CYAN}/compact{RESET}{DIM} always works,{RESET}',
+            f'  {DIM}whatever is chosen here.{RESET}',
+            '─' * 50,
+        ],
+        footer=DEFAULT_FOOTER)
+    if idx < 0 or idx >= len(values):
+        return settings
+    return cb.set_compact_at(settings, values[idx])
+
+
+def _confirm_disable_learning(key: str) -> bool:
+    """Ask before switching off a part of the self-improving loop.
+
+    No *preset* may disable these (core.budget enforces that), but the user
+    may — and should be told what it costs rather than discovering later that
+    the agent stopped remembering. This is the one toggle on the page that
+    changes what the program is rather than what it spends.
+    """
+    label = {'learned_facts': 'retrieved facts',
+             'standing_rules': 'standing rules'}.get(key, key)
+    idx = arrow_menu(
+        f'Turn off {label}?',
+        [f'  {DIM}Keep it on (recommended){RESET}',
+         f'  {RED}Turn it off{RESET}  {DIM}— the agent stops applying what it '
+         f'has learned{RESET}'],
+        header_lines=[
+            f'  {YELLOW}⚠{RESET}  This is part of the self-improving loop.',
+            f'  {DIM}It costs 0 tokens until something has actually been '
+            f'learned, and{RESET}',
+            f'  {DIM}what it costs after that is what the agent knows about '
+            f'you.{RESET}',
+            '',
+        ],
+        footer=DEFAULT_FOOTER)
+    return idx == 1
 
 
 def page_mcps():
@@ -1656,22 +1975,31 @@ def _page_view_instructions(title: str, subtitle: str, path):
     Both instruction pages differ only in which file they point at. The titles
     say what the file *governs* -- the filenames AGENT.md and AGENTS.md differ
     by one character and told the reader nothing about the difference.
+
+    Rendered through `show_info_page` rather than by printing and calling
+    `msvcrt.getch()`, which this did and which cost it both of the bugs that
+    function was written to fix: an instructions file longer than the terminal
+    scrolled off the top with no way back, and an arrow key pressed here left
+    its second byte in the buffer for the *next* menu to read as a phantom
+    keypress. A file the user is told to keep their standing rules in is
+    exactly the file most likely to outgrow one screen.
     """
-    clear_screen()
-    print(f'{BOLD}{title}{RESET}')
-    print(f'{DIM}{subtitle}{RESET}')
-    print(f'{DIM}{path}{RESET}')
-    print('─' * 50)
     if path.exists():
         body = path.read_text(encoding="utf-8").strip()
-        print(body if body else f'  {DIM}(file is empty){RESET}')
+        content = body.split('\n') if body else [f'  {DIM}(file is empty){RESET}']
     else:
-        print(f'  {DIM}(not created yet — press [e] to start it){RESET}')
-    print()
-    sys.stdout.write(DIM + 'Press any key to go back, or [e] to edit...' + RESET)
-    sys.stdout.flush()
-    key = msvcrt.getch()
-    if key in (b'e', b'E'):
+        content = [f'  {DIM}(not created yet — press [e] to start it){RESET}']
+
+    lines = [
+        f'{DIM}{subtitle}{RESET}',
+        f'{DIM}{path}{RESET}',
+        '─' * 50,
+        *content,
+    ]
+    key = show_info_page(title, lines,
+                         prompt='Press any key to go back, or [e] to edit',
+                         accept=('e', 'E'))
+    if key in ('e', 'E'):
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             if not path.exists():
@@ -1797,27 +2125,54 @@ def page_configure_provider():
     elif idx == 3:  # Google AI
         key = prompt_text('Enter Google AI API key')
         if key:
+            import provider_manager as _pm
             update_dotenv("GOOGLE_API_KEY", key)
             _save_provider_config(
                 provider_names[3],
-                {"GOOGLE_API_KEY": key},
+                {"GOOGLE_API_KEY": key,
+                 # Saved explicitly so the provider is usable, not merely
+                 # recorded. It used to store the key alone and then say so:
+                 # "Google AI is saved but the agent uses the ANTHROPIC_* env
+                 # vars for API calls" — a configured provider that could not
+                 # be called, with the disclaimer standing in for the feature.
+                 "ANTHROPIC_BASE_URL": _pm.GOOGLE_OPENAI_BASE,
+                 "ANTHROPIC_API_KEY": key,
+                 "ANTHROPIC_EXTRA_HEADERS": ""},
                 provider_type="google"
             )
-            show_info_page('Done', ['  ✓ Google AI configured.',
-                                    '',
-                                    f'  {YELLOW}Note: Google AI is saved but the agent uses',
-                                    '  the ANTHROPIC_* env vars for API calls.',
-                                    '  Use "Switch provider" to activate it.'])
+            import net_probe
+            net_probe.invalidate('google_catalog')
+            catalog = _pm.google_model_catalog(key)
+            if catalog:
+                top = catalog[0]
+                update_dotenv("AGENT_MODEL", top['name'])
+                show_info_page('Connected to Google AI', [
+                    f'  {GREEN}✓{RESET} API key set',
+                    f'  {GREEN}✓{RESET} Endpoint: {_pm.GOOGLE_OPENAI_BASE}',
+                    f'  {GREEN}✓{RESET} Model: {top["name"]} '
+                    f'({top["context_window"]:,} ctx)',
+                    '',
+                    f'  {DIM}{len(catalog)} models are reachable with this key '
+                    f'— pick another from "Change Model".{RESET}',
+                ])
+            else:
+                show_info_page('⚠ Google AI', [
+                    f'  {YELLOW}The key was saved, but Google returned no '
+                    f'models for it.{RESET}',
+                    '',
+                    f'  {DIM}Check it at https://aistudio.google.com/apikey{RESET}',
+                ])
     elif idx == 4:  # OpenCode Zen — auto-start proxy, no config needed
         _zen_setup_proxy()
         # Also save to multi-provider config
-        from zen_proxy import ZEN_MODELS
+        import zen_catalog
         config = _load_providers_config()
         if "providers" not in config:
             config["providers"] = {}
         config["providers"][provider_names[4]] = {
             "type": "zen",
-            "model": os.environ.get("AGENT_MODEL", ZEN_MODELS[0])
+            "model": (os.environ.get("AGENT_MODEL", "")
+                      or zen_catalog.default_free_model())
         }
         config["active"] = provider_names[4]
         _save_providers_config(config)
@@ -1856,6 +2211,7 @@ def page_configure_provider():
         lines.append(f'  Context window: {caps.context_window:,} tokens')
         lines.append(f'  Tool use:       {"yes" if caps.tool_use else "no — text protocol fallback"}')
         lines.append(f'  Streaming:      {"yes" if caps.streaming else "no — blocking fallback"}')
+        lines.append(f'  Vision:         {"yes" if caps.vision else "no"}')
         show_info_page('Done', lines)
     elif idx == 6:  # Custom
         name = prompt_text('Provider name')
@@ -1903,20 +2259,24 @@ def page_configure_zen():
 
 def _zen_setup_proxy():
     """Start the built-in Zen proxy and configure TOMAS to use it."""
-    from zen_proxy import check_status, start_proxy, ZEN_MODELS, MODEL_CONTEXT_WINDOWS
+    import zen_catalog
+    from zen_proxy import check_status, start_proxy
     port = 6446
+    cat = zen_catalog.catalog()
+    model = zen_catalog.default_free_model()
+    entry = cat.get(model)
 
     if check_status(port):
         # Already running — just configure
         update_dotenv("ANTHROPIC_API_KEY", "oc-zen-proxy")
         update_dotenv("ANTHROPIC_BASE_URL", f"http://127.0.0.1:{port}")
         update_dotenv("ANTHROPIC_EXTRA_HEADERS", "")
-        update_dotenv("AGENT_MODEL", ZEN_MODELS[0])
+        update_dotenv("AGENT_MODEL", model)
         reinit_client()
         show_info_page('Zen Proxy Ready', [
             '  ✓ Zen proxy already running',
             f'  ✓ Connected: http://127.0.0.1:{port}',
-            f'  ✓ Model: {ZEN_MODELS[0]} ({MODEL_CONTEXT_WINDOWS.get(ZEN_MODELS[0], "?"):,} ctx)',
+            f'  ✓ Model: {entry.label if entry else model}',
             '',
             '  Tip: Use Choose Model menu to pick a different model.',
         ])
@@ -1935,16 +2295,18 @@ def _zen_setup_proxy():
             update_dotenv("ANTHROPIC_API_KEY", "oc-zen-proxy")
             update_dotenv("ANTHROPIC_BASE_URL", f"http://127.0.0.1:{port}")
             update_dotenv("ANTHROPIC_EXTRA_HEADERS", "")
-            update_dotenv("AGENT_MODEL", ZEN_MODELS[0])
+            update_dotenv("AGENT_MODEL", model)
             reinit_client()
             show_info_page('Zen Proxy Started', [
                 '  ✓ Zen proxy is running locally',
                 f'  ✓ Endpoint: http://127.0.0.1:{port}',
-                f'  ✓ Default model: {ZEN_MODELS[0]}',
+                f'  ✓ Default model: {entry.label if entry else model}',
                 '',
-                '  Available models:',
-                *(f'    • {m} ({MODEL_CONTEXT_WINDOWS.get(m, "?"):,} ctx)' for m in ZEN_MODELS),
+                f'  Free models ({cat.freshness}):',
+                *(f'    • {m.label}' for m in cat.free()),
                 '',
+                f'  {DIM}{len(cat.paid())} more models are available and bill '
+                f'per token — see Choose Model.{RESET}',
                 f'  {YELLOW}Note: Free-tier models may have rate limits.{RESET}',
             ])
         else:
@@ -1965,21 +2327,27 @@ def _zen_setup_direct():
     them in-process (see `openai_adapter.py`, `provider.type == "zen"`), so a
     direct connection is the normal, supported path.
     """
-    from zen_proxy import ZEN_MODELS, MODEL_CONTEXT_WINDOWS
+    import zen_catalog
     key = prompt_text('Enter Zen API key (or leave blank for free tier)', 'public')
     if not key:
         key = 'public'
+    # The default follows the key. Blank means "free tier" in the prompt above,
+    # and it used to select `ZEN_MODELS[0]` — `claude-fable-5`, which bills.
+    cat = zen_catalog.catalog()
+    model = (zen_catalog.default_free_model() if key == 'public'
+             else (cat.models[0].id if cat else ''))
+    entry = cat.get(model)
     update_dotenv("ANTHROPIC_API_KEY", key)
     update_dotenv("ANTHROPIC_BASE_URL", "https://opencode.ai/zen/v1")
-    update_dotenv("AGENT_MODEL", ZEN_MODELS[0])
+    update_dotenv("AGENT_MODEL", model)
     reinit_client()
-    cw = MODEL_CONTEXT_WINDOWS.get(ZEN_MODELS[0], "?")
     show_info_page('Connected to Zen', [
         f'  {GREEN}✓{RESET} API key set',
         f'  {GREEN}✓{RESET} Endpoint: https://opencode.ai/zen/v1',
-        f'  {GREEN}✓{RESET} Model: {ZEN_MODELS[0]}'
-        + (f' ({cw:,} ctx)' if isinstance(cw, int) else ''),
+        f'  {GREEN}✓{RESET} Model: {entry.label if entry else model}',
         '',
+        f'  {DIM}{len(cat.free())} of {len(cat.models)} Zen models are free '
+        f'({cat.freshness}).{RESET}',
         f'  {DIM}Authentication headers are added in-process — no proxy to run.{RESET}',
         f'  {DIM}Pick a different model from "Change Model".{RESET}',
     ])
@@ -1987,7 +2355,9 @@ def _zen_setup_direct():
 
 def _zen_show_info():
     """Show information about OpenCode Zen."""
-    from zen_proxy import ZEN_MODELS, MODEL_CONTEXT_WINDOWS, check_status
+    import zen_catalog
+    from zen_proxy import check_status
+    cat = zen_catalog.catalog()
     port = 6446
     running = check_status(port)
     r_icon = f'{GREEN}✓{RESET}' if running else f'{RED}✗{RESET}'
@@ -2002,14 +2372,14 @@ def _zen_show_info():
         f'    {GREEN}✓{RESET} Direct — headers added in-process, no proxy needed',
         f'    {r_icon} Optional local proxy on http://127.0.0.1:{port}',
         '',
-        f'  {BOLD}Free-tier models:{RESET}',
-        *(f'    {DIM}•{RESET} {m} ({MODEL_CONTEXT_WINDOWS.get(m, "?"):,} ctx)' for m in ZEN_MODELS),
+        f'  {BOLD}Free models{RESET} {DIM}({len(cat.free())} of {len(cat.models)} '
+        f'served · {cat.freshness}){RESET}',
+        *(f'    {DIM}•{RESET} {m.label}' for m in cat.free()),
+        *([] if cat.free() else
+          [f'    {DIM}none — upstream is charging for every model right now{RESET}']),
         '',
-        f'  {BOLD}Pricing (Zen, not free-tier):{RESET}',
-        f'  {DIM}  opencode/claude-sonnet-5     $2/$10  per M tokens{RESET}',
-        f'  {DIM}  opencode/claude-haiku-4-5    $1/$5   per M tokens{RESET}',
-        f'  {DIM}  opencode/gpt-5.4-mini        $0.75/$4.50 per M tokens{RESET}',
-        f'  {DIM}  opencode/qwen3.7-plus        $0.40/$1.60 per M tokens{RESET}',
+        f'  {BOLD}Everything else bills per token.{RESET}',
+        f'  {DIM}  Current rates: https://opencode.ai/docs/zen{RESET}',
         '',
         f'  {BOLD}Links:{RESET}',
         f'  {CYAN}https://opencode.ai/docs/zen{RESET}',
@@ -2037,6 +2407,8 @@ def _detect_provider() -> str:
         return "openrouter"
     if "opencode" in base or "127.0.0.1:6446" in base or "localhost:6446" in base or "zen" in base:
         return "zen"
+    if "11434" in base or "ollama" in base:
+        return "ollama"
     if "anthropic" in base:
         return "anthropic"
     if "openai" in base:
@@ -2044,13 +2416,23 @@ def _detect_provider() -> str:
     return "other"
 
 
-# Map from providers.json 'type' field to _detect_provider() return values
+# Map from providers.json 'type' field to _detect_provider() return values.
+#
+# "ollama" belongs here for the same reason every other type does, and its
+# absence was not harmless: an active Ollama provider fell past this table,
+# then past the URL sniffing above (an `http://localhost:11434/v1` base
+# matches none of those substrings), and landed on "other" — whose entry in
+# `_provider_model_entries` is a static list of cloud models. Choosing
+# Ollama and then opening "Choose model" offered `openai/gpt-4o` and
+# `anthropic/claude-sonnet-4.5`, and none of the models actually installed
+# on the machine.
 PROVIDER_TYPE_TO_DETECT = {
     "openrouter": "openrouter",
     "zen": "zen",
     "anthropic": "anthropic",
     "openai": "openai",
     "google": "google",
+    "ollama": "ollama",
 }
 
 
@@ -2071,6 +2453,7 @@ PROVIDER_LABELS = {
     "anthropic": "Anthropic Direct",
     "openai": "OpenAI",
     "google": "Google AI",
+    "ollama": "Ollama (local)",
     "other": "Generic",
 }
 
@@ -2130,14 +2513,33 @@ def _provider_model_entries(provider: str) -> list[tuple[str, str | None]]:
             ('nousresearch/hermes-3-llama-3.1-405b', 'nousresearch/hermes-3-llama-3.1-405b'),
         ]
     elif provider == "zen":
-        from zen_proxy import ZEN_MODELS, MODEL_CONTEXT_WINDOWS
-        entries = [
-            ('── Zen free-tier models ──', None),
-        ]
-        for m in ZEN_MODELS:
-            cw = MODEL_CONTEXT_WINDOWS.get(m, '?')
-            cw_str = f'{cw:,} ctx' if isinstance(cw, int) else str(cw)
-            entries.append((f'  {m} ({cw_str})', m))
+        # Live, never static — for the reason the Ollama branch below is, and
+        # then some: this list *changed under the hardcoded copy* three times.
+        # Free first and under its own heading, because the old menu filed all
+        # sixty models under "free-tier models" while eight of them were free.
+        import net_probe
+        import zen_catalog
+        cat = net_probe.cached('zen_catalog', 60.0, zen_catalog.catalog)
+        entries = []
+        free = cat.free()
+        if free:
+            entries.append(('── Free (no charge) ──', None))
+            entries += [(f'  {m.label}', m.id) for m in free]
+        paid = cat.paid() if free else cat.models
+        if paid:
+            entries.append(('── Paid (billed per token) ──' if free
+                            else '── Zen models ──', None))
+            entries += [(f'  {m.label}', m.id) for m in paid]
+        # Only when the list is actually doubtful. A fresh cache is the normal
+        # fast path, not a degraded one — warning on it would train the user to
+        # ignore the warning that matters.
+        if cat.source == "static":
+            entries.insert(0, (f'{DIM}(offline — showing the built-in list, '
+                               f'which may be out of date){RESET}', None))
+        elif cat.source == "cache" and cat.age_seconds > zen_catalog.CACHE_TTL:
+            hours = int(cat.age_seconds // 3600)
+            entries.insert(0, (f'{DIM}(offline — cached list, {hours}h old){RESET}',
+                               None))
     elif provider == "anthropic":
         entries = [
             ('── Anthropic Direct ──', None),
@@ -2149,6 +2551,58 @@ def _provider_model_entries(provider: str) -> list[tuple[str, str | None]]:
             ('claude-3-5-sonnet-20241022',        'claude-3-5-sonnet-20241022'),
             ('claude-3-5-haiku-20241022',         'claude-3-5-haiku-20241022'),
         ]
+    elif provider == "ollama":
+        # Live, never static: the only models worth offering are the ones
+        # installed on this machine, and a hardcoded list of them would be
+        # wrong the first time the user runs `ollama pull`. Cached because
+        # this runs on every redraw of the menu.
+        import net_probe
+        import provider_manager
+        catalog = net_probe.cached(
+            'ollama_catalog', 30.0, provider_manager.ollama_catalog)
+        if catalog:
+            entries = [('── Installed locally ──', None)]
+            for m in catalog:
+                marks = []
+                if m['tools']:
+                    marks.append('tools')
+                if m['vision']:
+                    marks.append('vision')
+                ctx = (f"{'' if m.get('exact', True) else '≤'}"
+                       f"{m['context_window']:,} ctx"
+                       if m['context_window'] else '? ctx')
+                note = f"{ctx}{', ' + '/'.join(marks) if marks else ''}"
+                # Tool use is not decoration here: without it the agent drops
+                # to the text protocol, so it is the single fact that decides
+                # whether a local model is usable for real work.
+                entries.append((f"  {m['name']}  {DIM}({note}){RESET}", m['name']))
+        else:
+            entries = [
+                ('── Ollama is not answering ──', None),
+                (f'  {DIM}Start it with `ollama serve`, then reopen this menu.{RESET}', None),
+            ]
+    elif provider == "google":
+        # Live, for the same reason Ollama and Zen are: which Gemini models a
+        # key can reach is a property of the key, and the list moves. Without
+        # this branch google fell through to `_provider_model_entries("other")`
+        # — a static cloud list — which is exactly the bug that hid all eight
+        # installed Ollama models.
+        import net_probe
+        import provider_manager
+        catalog = net_probe.cached(
+            'google_catalog', 60.0, provider_manager.google_model_catalog)
+        if catalog:
+            entries = [('── Available to this key ──', None)]
+            for m in catalog:
+                ctx = f"{m['context_window']:,} ctx" if m['context_window'] else '? ctx'
+                entries.append(
+                    (f"  {m['name']}  {DIM}({ctx}){RESET}", m['name']))
+        else:
+            entries = [
+                ('── Google is not answering ──', None),
+                (f'  {DIM}Set GOOGLE_API_KEY, or add the key under '
+                 f'Connect / configure provider.{RESET}', None),
+            ]
     elif provider == "openai":
         entries = [
             ('── OpenAI models ──', None),
@@ -2237,12 +2691,27 @@ def _show_filtered_model_menu(model_entries, label, current, initial_query=None)
 
 
 def _update_provider_model(model: str):
-    """Update the model in the stored provider config, if any."""
+    """Update the model in the stored provider config, if any.
+
+    The stored capabilities describe the model being replaced, so they are
+    re-measured for the new one rather than inherited — see
+    `provider_manager.refresh_for_model`. A failure here is not fatal: the
+    model switch itself has already been written, and stale capabilities
+    degrade a feature where a raised exception would lose the switch.
+    """
     config = _load_providers_config()
     active = config.get("active")
-    if active and active in config.get("providers", {}):
-        config["providers"][active]["model"] = model
-        _save_providers_config(config)
+    if not (active and active in config.get("providers", {})):
+        return
+    config["providers"][active]["model"] = model
+    _save_providers_config(config)
+    try:
+        import provider_manager
+        provider = provider_manager.get(active)
+        if provider is not None:
+            provider_manager.refresh_for_model(provider)
+    except Exception:
+        pass
 
 
 def page_choose_model():
@@ -2261,17 +2730,13 @@ def page_choose_model():
         else:
             model_entries = _provider_model_entries(provider)
             model_entries.insert(0, ('🔍  Retry fetch from OpenRouter API', '__fetch__'))
-    # For Zen: try to fetch from running proxy if available
+    # Zen fetches upstream directly (see `_provider_model_entries`). It used to
+    # ask the local proxy instead, when one happened to be running — but the
+    # proxy builds its `/v1/models` reply out of the same hardcoded
+    # `ZEN_MODELS`, so that path cost a port probe and an HTTP round trip to
+    # return the stale list a second time.
     elif provider == "zen":
-        from zen_proxy import check_status
-        if check_status(6446):
-            fetched = _try_fetch_zen_proxy_entries()
-            if fetched is not None:
-                model_entries = fetched
-            else:
-                model_entries = _provider_model_entries(provider)
-        else:
-            model_entries = _provider_model_entries(provider)
+        model_entries = _provider_model_entries(provider)
     else:
         model_entries = _provider_model_entries(provider)
 
@@ -2328,7 +2793,16 @@ def page_choose_model():
 
 
 def _try_fetch_openrouter_entries() -> list[tuple[str, str | None]] | None:
-    """Try to fetch model entries from OpenRouter API. Returns list or None on failure."""
+    """Model entries from the OpenRouter API. None on failure.
+
+    Free models come first and under their own heading, and every row says
+    whether the model can call tools. Both matter more than the alphabetical
+    ordering they replace: the catalogue is 409 entries long, 18 of them free,
+    and a model that cannot call tools cannot drive this agent at all — it
+    drops to the text protocol at best. Measured against the live catalogue,
+    3 of the 18 free models declare no tool support, and picking one of those
+    is a failure the menu can prevent rather than explain afterwards.
+    """
     import urllib.request
     import json
     try:
@@ -2345,53 +2819,44 @@ def _try_fetch_openrouter_entries() -> list[tuple[str, str | None]] | None:
     if not models:
         return None
 
-    models.sort(key=lambda m: m.get("id", ""))
-    entries: list[tuple[str, str | None]] = []
-    for m in models:
-        mid = m.get("id", "")
-        pricing = m.get("pricing", {}) or {}
+    def price(model, key):
         try:
-            prompt_p = float(pricing.get("prompt")) if pricing.get("prompt") is not None else None
-            comp_p = float(pricing.get("completion")) if pricing.get("completion") is not None else None
+            raw = (model.get("pricing") or {}).get(key)
+            return float(raw) if raw is not None else None
         except (ValueError, TypeError):
-            prompt_p = None
-            comp_p = None
-        if prompt_p is not None and comp_p is not None:
-            label = f'{mid}  (P: ${prompt_p:.4f} · C: ${comp_p:.4f} per token)'
-        else:
-            label = mid
-        entries.append((label, mid))
+            return None
 
-    if not entries:
-        return None
+    def describe(model):
+        mid = model.get("id", "")
+        marks = []
+        ctx = model.get("context_length") or 0
+        if ctx:
+            marks.append(f'{ctx:,} ctx')
+        if "tools" not in (model.get("supported_parameters") or []):
+            marks.append('no tools')
+        prompt_p, comp_p = price(model, "prompt"), price(model, "completion")
+        if prompt_p is not None and comp_p is not None and (prompt_p or comp_p):
+            # Per million, not per token. OpenRouter quotes per-token prices
+            # like 3e-07, and `$0.0000/$0.0000` was every paid model on the
+            # page — a price column that could not distinguish the cheapest
+            # model in the catalogue from the most expensive.
+            marks.append(f'${prompt_p * 1e6:,.2f}/${comp_p * 1e6:,.2f} per M')
+        return (f'  {mid}  {DIM}({" · ".join(marks)}){RESET}' if marks
+                else f'  {mid}'), mid
 
-    return entries
-
-
-def _try_fetch_zen_proxy_entries() -> list[tuple[str, str | None]] | None:
-    """Fetch model entries from the running Zen proxy (http://127.0.0.1:6446/v1/models)."""
-    import urllib.request
-    import json
-    try:
-        req = urllib.request.Request(
-            "http://127.0.0.1:6446/v1/models",
-            headers={"User-Agent": "TOMAS/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception:
-        return None
-
-    models = data.get("data", [])
-    if not models:
-        return None
+    free, paid = [], []
+    for model in sorted(models, key=lambda m: m.get("id", "")):
+        prompt_p, comp_p = price(model, "prompt"), price(model, "completion")
+        (free if prompt_p == 0 and comp_p == 0 else paid).append(model)
 
     entries: list[tuple[str, str | None]] = []
-    for m in models:
-        mid = m.get("id", "")
-        entries.append((f'  {mid}', mid))
-
-    return entries
+    if free:
+        entries.append((f'── Free ({len(free)}) ──', None))
+        entries += [describe(m) for m in free]
+    if paid:
+        entries.append((f'── Paid ({len(paid)}) ──', None))
+        entries += [describe(m) for m in paid]
+    return entries or None
 
 
 def _fetch_openrouter_models():
@@ -2430,7 +2895,7 @@ def _ensure_api_configured() -> bool:
         return True
 
     try:
-        from zen_proxy import ZEN_MODELS
+        import zen_catalog
     except ImportError:
         print(f"  {RED}✗{RESET} No API key configured.")
         print(f"  {RED}✗{RESET} Set ANTHROPIC_API_KEY in {TOMAS_DIR / '.env'} to use TOMAS.")
@@ -2441,7 +2906,12 @@ def _ensure_api_configured() -> bool:
     update_dotenv("ANTHROPIC_BASE_URL", "https://opencode.ai/zen/v1")
     update_dotenv("ANTHROPIC_EXTRA_HEADERS", "")
     if os.environ.get("AGENT_MODEL", "").strip() == "":
-        update_dotenv("AGENT_MODEL", ZEN_MODELS[0])
+        # A model that is actually free. This line said `ZEN_MODELS[0]`, which
+        # is `claude-fable-5` — the sentence printed above promised the free
+        # tier and the next statement selected a billing model.
+        model = zen_catalog.default_free_model()
+        update_dotenv("AGENT_MODEL", model)
+        print(f"  {DIM}Model: {model}{RESET}")
     print(f"  {DIM}Connect your own provider any time from the menu.{RESET}")
     try:
         from agent import reinit_client
@@ -2504,6 +2974,7 @@ MENU_ITEMS = [
     f'  {YELLOW}⬡{RESET}  MCP Servers',
     f'  {YELLOW}⬡{RESET}  Tools',
     f'  {YELLOW}⬡{RESET}  Skills',
+    f'  {YELLOW}▣{RESET}  Context Budget',
     '',
     f'  {CYAN}◈{RESET}  Sessions & Notes',
     f'  {BLUE}✎{RESET}  Agent Instructions',
@@ -2523,6 +2994,7 @@ MENU_ACTIONS = [
     page_mcps,
     page_tools,
     page_skills,
+    page_context_budget,
     None,  # spacer
     page_sessions,
     page_edit_instructions,
@@ -2766,8 +3238,7 @@ def _check_mcp_health(names, timeout: int = 45) -> dict[str, dict]:
     pending, not as broken -- the process is left running rather than
     killed, since it may simply need more time to finish that first fetch.
     """
-    from concurrent.futures import ThreadPoolExecutor
-    from concurrent.futures import wait as futures_wait
+    import net_probe
     from mcp_manager import MCPServer, read_mcp_servers
 
     configs = read_mcp_servers()
@@ -2789,31 +3260,31 @@ def _check_mcp_health(names, timeout: int = 45) -> dict[str, dict]:
         except Exception as exc:
             return {"connected": False, "error": str(exc), "tool_count": 0}
 
-    # `wait(timeout=...)` bounds the *overall* wait to one budget shared by
-    # every server running in parallel. A `with ThreadPoolExecutor(...)`
-    # block would not do that -- its exit calls `shutdown(wait=True)`,
-    # which blocks on every still-running probe regardless of the timeout
-    # already given up on, so the bound would exist in name only.
-    pool = ThreadPoolExecutor(max_workers=max(1, len(names)))
-    futures = {pool.submit(probe, name): name for name in names}
-    done, pending = futures_wait(futures, timeout=timeout)
-    for fut in done:
-        name = futures[fut]
-        try:
-            results[name] = fut.result()
-        except Exception as exc:
-            results[name] = {"connected": False, "error": str(exc), "tool_count": 0}
-    for fut in pending:
-        name = futures[fut]
+    # One budget shared by every server running in parallel, and genuinely
+    # abandoned when it runs out. The previous version used
+    # `ThreadPoolExecutor` + `wait(timeout=...)` and a comment explaining that
+    # this bounded the wait -- it bounded only the *foreground* wait. The
+    # pool's threads are non-daemon and `concurrent.futures` joins them from an
+    # atexit hook, so every probe given up on here was waited for again at
+    # interpreter shutdown, silently. `net_probe.fan_out` uses daemon threads,
+    # which is what makes "leave it running" true rather than aspirational.
+    done, unfinished = net_probe.fan_out(
+        probe, list(names), max_workers=max(1, len(names)), timeout=timeout)
+    for name, row in done:
+        results[name] = (
+            {"connected": False, "error": str(row), "tool_count": 0}
+            if isinstance(row, Exception) else row)
+    for name in unfinished:
         results[name] = {
             "connected": False,
             "error": f"still starting after {timeout}s -- first run downloads "
                      f"the package; try `TOMAS mcp list` again shortly",
             "tool_count": 0,
         }
-    # Leave any still-pending probe to finish (or fail) on its own rather
-    # than block here waiting for it a second time.
-    pool.shutdown(wait=False)
+    # No shutdown call: `net_probe.fan_out` runs on daemon threads, so an
+    # abandoned probe needs nothing closing and cannot delay exit. (The
+    # `pool.shutdown(wait=False)` that used to be here outlived the pool it
+    # belonged to and raised NameError on every `TOMAS setup`.)
     return results
 
 
@@ -2909,26 +3380,31 @@ def cmd_setup():
         "type": "stdio", "command": "uvx", "args": ["mcp-pdf"],
     })
 
-    # ── Install Python deps ──
+    # ── Playwright browser ──
+    #
+    # Only refreshed when it is already here. The installer stopped fetching
+    # ~170 MB of Chromium for every user because web search falls back to
+    # duckduckgo without it — and this ran straight afterwards and downloaded
+    # it anyway, which made that decision worth nothing. `TOMAS browser` is
+    # the one place that fetches it on purpose.
+    from pathlib import Path as _Path
+
+    cache = _Path(os.environ.get("LOCALAPPDATA", "")) / "ms-playwright"
+    have_browser = cache.exists() and any(cache.glob("chromium-*"))
     print()
-    print(f"  {YELLOW}⚙ Checking Python dependencies...{RESET}")
-    try:
-        subprocess.run(
-            [str(python_exe), "-m", "pip", "install", "playwright"],
-            check=True,
-            capture_output=True,
-            timeout=120,
-        )
-        subprocess.run(
-            [str(python_exe), "-m", "playwright", "install", "chromium"],
-            check=True,
-            capture_output=True,
-            timeout=180,
-        )
-        print(f"  {GREEN}✓{RESET} playwright + chromium installed")
-    except Exception as e:
-        print(f"  {YELLOW}⚠ playwright install skipped: {e}{RESET}")
-        print(f"  {DIM}Run manually: pip install playwright && playwright install chromium{RESET}")
+    if have_browser:
+        print(f"  {YELLOW}⚙ Refreshing the Playwright browser...{RESET}")
+        try:
+            subprocess.run(
+                [str(python_exe), "-m", "playwright", "install", "chromium"],
+                check=True, capture_output=True, timeout=180)
+            print(f"  {GREEN}✓{RESET} Playwright browser up to date")
+        except Exception as e:
+            print(f"  {YELLOW}⚠ Playwright refresh skipped: {e}{RESET}")
+    else:
+        print(f"  {DIM}No Playwright browser (~170 MB) — web search will use "
+              f"duckduckgo.{RESET}")
+        print(f"  {DIM}Add it any time with{RESET} {CYAN}TOMAS browser{RESET}")
 
     # ── Verify every default server actually starts and answers -- a
     #    config written above proves nothing about whether it works ──
@@ -3094,6 +3570,36 @@ def print_help():
 #  CLI ENTRY POINT — parse subcommands
 # ═══════════════════════════════════════════════════════════
 
+def cmd_install_browser():
+    """Fetch the Playwright browser, on demand rather than at install time.
+
+    The installer stopped downloading ~170 MB of Chromium for every user
+    because web search does not require it — `web_search` prefers Playwright
+    and falls back to duckduckgo_search/ddgs — so this is the other half of
+    that decision: the capability has to stay one command away, or "optional"
+    quietly means "unavailable".
+    """
+    import subprocess
+
+    print(f'  {CYAN}◈{RESET} Downloading the Playwright browser '
+          f'{DIM}(~170 MB, once){RESET}')
+    sys.stdout.flush()
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=False)
+    except FileNotFoundError:
+        print(f'  {RED}✗{RESET} playwright is not installed in this '
+              f'environment.')
+        return
+    if result.returncode == 0:
+        print(f'  {GREEN}✓{RESET} Browser ready — web search will use it '
+              f'from now on.')
+    else:
+        print(f'  {RED}✗{RESET} Download failed (exit {result.returncode}). '
+              f'Web search still works via duckduckgo.')
+
+
 def main():
     # ── No args → interactive TUI ──
     if len(sys.argv) == 1:
@@ -3110,6 +3616,11 @@ def main():
     # ── --help → show help ──
     if arg in ('--help', '-h'):
         print_help()
+        return
+
+    # ── browser → fetch the Playwright browser on demand ──
+    if arg == 'browser':
+        cmd_install_browser()
         return
 
     # ── mcp subcommand ──

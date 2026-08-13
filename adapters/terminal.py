@@ -33,6 +33,7 @@ from core.events import (
     RetryScheduled,
     StreamingDisabled,
     TextDelta,
+    ToolCallsRecovered,
     ToolFinished,
     ToolResultTruncated,
     ToolStarted,
@@ -320,6 +321,15 @@ class TerminalAdapter:
             print(f'\n  {YELLOW}⚠{RESET} Transient error ({event.reason}) — retrying in '
                   f'{event.delay_s:g}s (attempt {event.attempt}/{event.max_attempts})...')
 
+        elif isinstance(event, ToolCallsRecovered):
+            # On the streamed path the JSON has already been printed token by
+            # token, so this doubles as the explanation for it: what is on
+            # screen was a tool call, and it is being run rather than shown.
+            self._end_stream_line()
+            names = ', '.join(event.names)
+            print(f'  {YELLOW}↻{RESET} {DIM}the model wrote its tool call as text '
+                  f'— recovered: {names}{RESET}')
+
         elif isinstance(event, StreamingDisabled):
             print(f'\n  {YELLOW}⚠{RESET} {DIM}streaming unavailable on this provider '
                   f'— continuing without it{RESET}')
@@ -361,21 +371,37 @@ class TerminalAdapter:
                       f'unavailable this run{RESET}')
             return "deny"
 
+        # Same shape as `ask_user_question`: a marker line saying who is
+        # asking and about what, the thing itself, then the choice. The two
+        # prompts are the only places TOMAS stops and waits for a person, and
+        # they used to look nothing like each other — one a bold warning
+        # banner, the other a bare `input()` — so the fact that both mean
+        # "you decide now" had to be learned twice.
         risk_colors = {"low": GREEN, "medium": YELLOW, "high": RED}
         risk_color = risk_colors.get(event.risk, RED)
-        print(f'\n  {risk_color}{BOLD}⚠ Permission ({event.risk.upper()} risk){RESET}')
-        print(f'  {DIM}Tool:{RESET} {BOLD}{event.name}{RESET}')
-        for k, v in (event.args or {}).items():
-            print(f'  {DIM}{k}:{RESET} {shorten(str(v), term_width() - 6)}')
+        print(f'\n  {risk_color}{BOLD}▌{RESET} {risk_color}Permission '
+              f'{DIM}· {event.risk} risk{RESET}')
+        print(f'  {BOLD}{event.name}{RESET}')
+        args = event.args or {}
+        if args:
+            width = max(len(str(k)) for k in args)
+            for k, v in args.items():
+                pad = " " * max(0, width - len(str(k)))
+                print(f'  {DIM}{k}{pad}{RESET}  '
+                      f'{shorten(str(v), term_width() - width - 8)}')
+        print()
         try:
             resp = input(
-                f'  {YELLOW}Allow?{RESET} [y/N/always for this exact call]: '
+                f'  {DIM}[y] allow  [n] deny  [a] always allow this exact '
+                f'call{RESET}  '
             ).strip().lower()
         except EOFError:
             return "deny"
-        if resp == "always":
+        # "always" stays accepted: it is what the prompt asked for until now,
+        # and a user who types it should not silently get a denial.
+        if resp in ("a", "always"):
             return "always_allow_this_call"
-        return "allow" if resp == "y" else "deny"
+        return "allow" if resp in ("y", "yes") else "deny"
 
     def ask_continue(self, event) -> bool:
         """The turn used its budget. Ask rather than abandon the task."""
@@ -383,10 +409,13 @@ class TerminalAdapter:
         if not self.interactive:
             print(f'  {DIM}non-interactive — continuing automatically{RESET}')
             return True
+        print(f'\n  {YELLOW}{BOLD}▌{RESET} {YELLOW}Budget reached{RESET}'
+              f'  {DIM}· {event.calls_used} tool calls so far{RESET}')
+        print(f'  {BOLD}Keep working on this task?{RESET}')
+        print()
         try:
-            resp = input(
-                f'  {YELLOW}Continue working on this task?{RESET} [Y/n]: '
-            ).strip().lower()
+            resp = input(f'  {DIM}[Y] keep going  [n] stop and '
+                         f'summarise{RESET}  ').strip().lower()
         except EOFError:
             return False
         return resp in ("", "y", "yes")

@@ -23,13 +23,18 @@ it.
 
 from __future__ import annotations
 
+import http.client
+import io
 import json
 import os
+import threading
 import urllib.error
 import urllib.request
 from typing import Any, Iterator, Optional
+from urllib.parse import urlsplit
 
-from zen_proxy import anthropic_to_openai, openai_to_anthropic, _oc_id
+from zen_proxy import (anthropic_to_openai, attach_reasoning,
+                       openai_to_anthropic, _oc_id)
 
 DEFAULT_TIMEOUT = 300
 
@@ -65,10 +70,39 @@ class _Block(dict):
         return f"<Block {self.type} {self.name or self.text[:24]!r}>"
 
 
+def cached_prompt_tokens(usage: Any) -> int:
+    """How many prompt tokens the provider served from its prefix cache.
+
+    Every OpenAI-wire provider that does automatic caching reports it, and each
+    one spells it differently. Without this the agent shows the raw
+    `prompt_tokens` and nothing else, so a turn that was 95% cache hits and a
+    turn that was 0% look identical on screen — and the work that keeps the
+    prefix byte-stable (sticky tool selection, the stable prompt half) has no
+    visible effect to protect it from being undone.
+
+    Returns 0 when the provider says nothing, which is not the same as a miss
+    and is why this is reported separately rather than folded into the total.
+    """
+    if not isinstance(usage, dict):
+        return 0
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict) and details.get("cached_tokens") is not None:
+        return int(details.get("cached_tokens") or 0)
+    for key in ("prompt_cache_hit_tokens", "cached_tokens",
+                "cache_read_input_tokens"):
+        if usage.get(key) is not None:
+            return int(usage.get(key) or 0)
+    return 0
+
+
 class _Usage:
     def __init__(self, data: dict):
         self.input_tokens = data.get("input_tokens", 0)
         self.output_tokens = data.get("output_tokens", 0)
+        #: The part of `input_tokens` that was a cache hit, when the provider
+        #: reports it. Not subtracted from the total: this is what was sent,
+        #: annotated with what it cost.
+        self.cached_input_tokens = data.get("cached_input_tokens", 0)
 
 
 class Message:
@@ -83,6 +117,10 @@ class Message:
         self.stop_reason = data.get("stop_reason", "end_turn")
         self.content = [_Block(b) for b in data.get("content", [])]
         self.usage = _Usage(data.get("usage", {}))
+        #: Tool calls whose arguments arrived as unparseable JSON and were
+        #: replaced with `{}`. Set by the streaming path; the core reads it to
+        #: measure how often a streamed reply would have been usable on its own.
+        self.malformed_tool_args = 0
 
     def model_dump(self) -> dict:
         return dict(self._data)
@@ -132,6 +170,13 @@ class _Stream:
 
     def __iter__(self) -> Iterator[_Event]:
         text_parts: list[str] = []
+        # Accumulated but never yielded as an event: the chain-of-thought is
+        # not the reply and must not appear on screen. It is collected because
+        # a thinking model's *next* request is rejected without it — see
+        # `zen_proxy.reasoning_of`. Doing this only on the non-streamed path
+        # would fix nothing for the providers that actually stream, which is
+        # most of them.
+        reasoning_parts: list[str] = []
         tool_calls: dict[int, dict] = {}
         finish_reason = None
         usage: dict = {}
@@ -151,13 +196,26 @@ class _Stream:
                 text_parts.append(piece)
                 yield _Event("content_block_delta", delta=_Delta("text_delta", piece))
 
+            # Spelled `reasoning_content` by DeepSeek and the Zen relay, and
+            # `reasoning` by some others. Both are collected; neither is shown.
+            thought = delta.get("reasoning_content") or delta.get("reasoning")
+            if thought and isinstance(thought, str):
+                reasoning_parts.append(thought)
+
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
                 slot = tool_calls.setdefault(
                     idx, {"id": tc.get("id") or _oc_id("toolu"),
-                          "name": "", "arguments": ""})
+                          "name": "", "arguments": "", "extra": None})
                 if tc.get("id"):
                     slot["id"] = tc["id"]
+                # Provider-specific baggage that has to survive the round trip
+                # — Gemini 3's `thought_signature` lives here and the next
+                # request is rejected without it. Kept opaque on purpose: this
+                # module does not need to know what is inside, only that
+                # dropping it breaks the turn after the tool call.
+                if tc.get("extra_content"):
+                    slot["extra"] = tc["extra_content"]
                 fn = tc.get("function") or {}
                 if fn.get("name"):
                     slot["name"] = fn["name"]
@@ -174,15 +232,26 @@ class _Stream:
         content: list[dict] = []
         if text_parts:
             content.append({"type": "text", "text": "".join(text_parts)})
+        # Counted, not just swallowed. This substitution is the one thing the
+        # streamed assembly cannot do as well as a second non-streamed call —
+        # so it is the number that decides whether that second call is still
+        # worth making. Silently returning `{}` made the question unanswerable.
+        malformed = 0
         for _, slot in sorted(tool_calls.items()):
             try:
                 parsed = json.loads(slot["arguments"] or "{}")
             except json.JSONDecodeError:
                 parsed = {}
-            content.append({"type": "tool_use", "id": slot["id"],
-                            "name": slot["name"], "input": parsed})
+                malformed += 1
+            block = {"type": "tool_use", "id": slot["id"],
+                     "name": slot["name"], "input": parsed}
+            if slot.get("extra"):
+                block["extra_content"] = slot["extra"]
+            content.append(block)
         if not content:
             content.append({"type": "text", "text": ""})
+
+        attach_reasoning(content, "".join(reasoning_parts))
 
         stop_reason = {"tool_calls": "tool_use", "length": "max_tokens",
                        "stop": "end_turn"}.get(finish_reason or "stop", "end_turn")
@@ -195,8 +264,10 @@ class _Stream:
             "stop_reason": stop_reason,
             "usage": {"input_tokens": usage.get("prompt_tokens", 0),
                       "output_tokens": usage.get("completion_tokens",
-                                                 len("".join(text_parts)) // 4)},
+                                                 len("".join(text_parts)) // 4),
+                      "cached_input_tokens": cached_prompt_tokens(usage)},
         })
+        self._final.malformed_tool_args = malformed
         yield _Event("message_stop")
 
     def get_final_message(self) -> Message:
@@ -233,6 +304,114 @@ def _iter_sse(resp) -> Iterator[dict]:
 #  Adapter
 # ══════════════════════════════════════════════════════════════════════
 
+class _PooledResponse:
+    """An HTTPResponse that hands its connection back when it is closed.
+
+    Everything the callers touch — `.read()`, `.headers`, `.status`, iteration
+    by line, `with` — forwards to the real response. `close()` is the one that
+    does extra work: it decides whether the connection is safe to reuse before
+    closing it.
+    """
+
+    def __init__(self, pool: "_ConnectionPool", conn, resp):
+        self._pool = pool
+        self._conn = conn
+        self._resp = resp
+        self._released = False
+
+    def __getattr__(self, name):
+        return getattr(self._resp, name)
+
+    def __iter__(self):
+        return iter(self._resp)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        # `isclosed()` is true only once the body has been read to the end.
+        # A half-read body leaves bytes in the socket that would be parsed as
+        # the *next* response's status line, so anything short of fully drained
+        # is thrown away rather than pooled. This is why streamed calls — which
+        # stop at `[DONE]` without draining — do not currently reuse their
+        # connection, and must not be made to without solving that first.
+        reusable = False
+        try:
+            reusable = bool(self._resp.isclosed())
+        except Exception:
+            reusable = False
+        try:
+            self._resp.close()
+        except Exception:
+            pass
+        self._pool.release(self._conn, reusable=reusable)
+
+
+class _ConnectionPool:
+    """One keep-alive connection per endpoint.
+
+    `urllib.request.urlopen` pools nothing and sends `Connection: close`, so
+    every model call paid for a fresh TCP and TLS handshake. A tool-using turn
+    makes one call per step — a 29-step turn opened 58 connections to the same
+    host — and all of that is dead air before the first token of the reply.
+
+    One slot, not many: the agent issues its model calls one at a time, so a
+    larger pool would only hold connections open for nothing. The lock is
+    there because probes and the TUI can touch an adapter off the turn thread.
+    """
+
+    def __init__(self, endpoint: str, timeout: int):
+        parts = urlsplit(endpoint)
+        self._secure = parts.scheme != "http"
+        self._host = parts.hostname or ""
+        self._port = parts.port
+        self._timeout = timeout
+        self.path = parts.path or "/"
+        if parts.query:
+            self.path = f"{self.path}?{parts.query}"
+        self._idle = None
+        self._lock = threading.Lock()
+
+    def _new(self):
+        if self._secure:
+            return http.client.HTTPSConnection(
+                self._host, self._port, timeout=self._timeout)
+        return http.client.HTTPConnection(
+            self._host, self._port, timeout=self._timeout)
+
+    def acquire(self):
+        with self._lock:
+            conn, self._idle = self._idle, None
+        return conn if conn is not None else self._new()
+
+    def release(self, conn, reusable: bool) -> None:
+        if reusable:
+            with self._lock:
+                if self._idle is None:
+                    self._idle = conn
+                    return
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        with self._lock:
+            conn, self._idle = self._idle, None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 class ProviderStreamError(RuntimeError):
     """The endpoint would not stream. Recoverable — fall back to blocking."""
 
@@ -253,12 +432,24 @@ class OpenAICompatAdapter:
 
     def __init__(self, base_url: str, api_key: str = "",
                  extra_headers: Optional[dict] = None,
-                 timeout: int = DEFAULT_TIMEOUT):
+                 timeout: int = DEFAULT_TIMEOUT,
+                 preserve_tool_extras: bool = False):
         self.base_url = (base_url or "").rstrip("/")
         self.api_key = api_key or ""
         self.extra_headers = dict(extra_headers or {})
         self.timeout = timeout
+        #: Whether `extra_content` on a tool call is echoed back upstream.
+        #:
+        #: Off by default and on for Google, because the field is *its*
+        #: baggage: Gemini 3 requires its `thought_signature` back and
+        #: rejects the follow-up request without it, while another endpoint
+        #: has no idea what it is. The transcript outlives a provider switch,
+        #: so a conversation started on Gemini and continued on OpenAI would
+        #: otherwise post a Google signature to OpenAI — stripping here is
+        #: what keeps that switch working.
+        self.preserve_tool_extras = preserve_tool_extras
         self.messages = _Messages(self)
+        self._pool = _ConnectionPool(self._endpoint, timeout)
 
     # ── plumbing ──
 
@@ -277,11 +468,41 @@ class OpenAICompatAdapter:
         return headers
 
     def _request(self, body: dict):
-        req = urllib.request.Request(
-            self._endpoint, data=json.dumps(body).encode("utf-8"), method="POST")
-        for k, v in self._headers().items():
-            req.add_header(k, v)
-        return urllib.request.urlopen(req, timeout=self.timeout)
+        """POST the body on a kept-alive connection.
+
+        Raises `urllib.error.HTTPError` on a 4xx/5xx exactly as `urlopen` did,
+        body attached, so both call sites keep reading `e.read()` unchanged.
+        """
+        payload = json.dumps(body).encode("utf-8")
+        headers = self._headers()
+        headers["Connection"] = "keep-alive"
+        headers["Content-Length"] = str(len(payload))
+
+        last_err: Optional[Exception] = None
+        for attempt in (0, 1):
+            conn = self._pool.acquire()
+            try:
+                conn.request("POST", self._pool.path, body=payload,
+                             headers=headers)
+                resp = conn.getresponse()
+            except Exception as e:
+                # A pooled connection the server has since dropped fails here,
+                # on the write, not on connect — so one retry on a fresh
+                # connection is what makes reuse safe at all. Exactly one:
+                # a second would start hiding real outages behind a delay.
+                self._pool.release(conn, reusable=False)
+                last_err = e
+                if attempt == 0:
+                    continue
+                raise
+            if resp.status >= 400:
+                detail = resp.read()
+                self._pool.release(conn, reusable=True)
+                raise urllib.error.HTTPError(
+                    self._endpoint, resp.status, resp.reason or "",
+                    resp.headers, io.BytesIO(detail))
+            return _PooledResponse(self._pool, conn, resp)
+        raise last_err if last_err else RuntimeError("request failed")
 
     @staticmethod
     def _estimate_input_tokens(kw: dict) -> int:
@@ -290,7 +511,13 @@ class OpenAICompatAdapter:
         return len(blob) // 4
 
     @staticmethod
-    def _build_body(kw: dict) -> dict:
+    def _strip_tool_extras(body: dict) -> None:
+        """Remove provider-specific `extra_content` from every tool call."""
+        for message in body.get("messages") or []:
+            for call in message.get("tool_calls") or []:
+                call.pop("extra_content", None)
+
+    def _build_body(self, kw: dict) -> dict:
         """Translate the request, then supply what the translation omits.
 
         `anthropic_to_openai` returns only `messages` (and `tools` when there
@@ -310,6 +537,8 @@ class OpenAICompatAdapter:
                 key = "stop" if passthrough == "stop_sequences" else passthrough
                 body[key] = kw[passthrough]
         body.pop("stream", None)
+        if not self.preserve_tool_extras:
+            self._strip_tool_extras(body)
         return body
 
     # ── public surface ──
@@ -322,8 +551,14 @@ class OpenAICompatAdapter:
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:400]
             raise RuntimeError(f"HTTP {e.code} from {self._endpoint}: {detail}") from e
-        return Message(openai_to_anthropic(
-            raw, kw.get("model", ""), self._estimate_input_tokens(kw)))
+        data = openai_to_anthropic(
+            raw, kw.get("model", ""), self._estimate_input_tokens(kw))
+        # Annotated here rather than inside the translation: `openai_to_anthropic`
+        # is shared with the standalone proxy, which speaks strict Anthropic
+        # shapes and has no field to put this in.
+        data.setdefault("usage", {})["cached_input_tokens"] = (
+            cached_prompt_tokens(raw.get("usage")))
+        return Message(data)
 
     def stream(self, **kw) -> _Stream:
         return _Stream(self, kw)
@@ -390,9 +625,17 @@ def build_from_active():
         key = zen.pop("Authorization", "").replace("Bearer ", "") or key
         zen.pop("Content-Type", None)
         headers.update(zen)
+    elif provider.type == "google":
+        # Same resolution the probe uses, so a measurement and a real call
+        # never reach different endpoints — the bug `probe_base_url` exists
+        # to prevent for zen.
+        base = provider_manager.probe_base_url(provider)
+        key = (key or os.environ.get("GOOGLE_API_KEY", "")
+               or os.environ.get("GEMINI_API_KEY", ""))
     elif provider.type == "ollama":
         key = key or "ollama"      # the shim rejects an empty bearer
 
     if not base or ":6446" in base:
         return None                # nothing sane to point at
-    return OpenAICompatAdapter(base, key, headers)
+    return OpenAICompatAdapter(base, key, headers,
+                               preserve_tool_extras=provider.type == "google")

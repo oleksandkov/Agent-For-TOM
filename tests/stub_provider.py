@@ -150,6 +150,47 @@ class StreamingToolStub(BaseStub):
             pass
 
 
+class KeepAliveStub(BaseStub):
+    """Speaks HTTP/1.1 and counts the TCP connections it was handed.
+
+    The counter is the whole point: `urllib.request.urlopen` opened one
+    connection per request and said `Connection: close`, so a turn's worth of
+    model calls paid for a TLS handshake each. Nothing in a mocked client can
+    show that — only a server counting sockets can.
+
+    It also reports cached prompt tokens, which every OpenAI-wire provider that
+    caches does and the adapter used to discard.
+    """
+
+    protocol_version = "HTTP/1.1"
+    timeout = 3          # so a kept-alive socket cannot wedge a test run
+    connections = 0
+    requests = 0
+    _counter_lock = threading.Lock()
+
+    @classmethod
+    def reset(cls):
+        with cls._counter_lock:
+            cls.connections = 0
+            cls.requests = 0
+
+    def setup(self):
+        with KeepAliveStub._counter_lock:
+            KeepAliveStub.connections += 1
+        super().setup()
+
+    def do_POST(self):
+        req = self._read()
+        if self._reject_if_incomplete(req):
+            return
+        with KeepAliveStub._counter_lock:
+            KeepAliveStub.requests += 1
+        self._json({"choices": [{"message": {"content": "ok"},
+                                 "finish_reason": "stop", "index": 0}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 2,
+                              "prompt_tokens_details": {"cached_tokens": 90}}})
+
+
 class _Server(HTTPServer):
     """HTTPServer whose shutdown() also releases the socket, so a test run
     does not fill the log with ResourceWarnings. Records the last request

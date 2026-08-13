@@ -26,6 +26,7 @@ from .events import (
     StreamingDisabled,
     TextDelta,
     ThinkingStarted,
+    ToolCallsRecovered,
     ToolFinished,
     ToolResultTruncated,
     ToolStarted,
@@ -34,6 +35,7 @@ from .events import (
     TurnStarted,
 )
 from .state import CYCLE_WINDOW, REPEATED_CALL_LIMIT, AgentState
+from .toolcall_text import recover as recover_text_tool_calls
 
 MAX_RETRIES = 3
 
@@ -257,16 +259,230 @@ def detect_loop(signatures: list[str]) -> Optional[str]:
     return None
 
 
+#: What share of a clipped tool result is kept from the end.
+#: A traceback's exception line, a compiler's error summary, a test runner's
+#: failure count and `run_command`'s own exit line all live at the tail.
+#: Head-only clipping handed the model the banner of a failing command and
+#: none of its error — the most expensive characters were the ones dropped.
+RESULT_TAIL_SHARE = 0.3
+
+
+def clip_result(text: str, limit: int) -> str:
+    """Clip an oversized tool result to `limit` characters, keeping both ends.
+
+    Pure, and deliberately budget-neutral: the same `limit` characters of
+    content survive as before, they are just taken from both ends instead of
+    only the front. The marker names how much went missing so the model can
+    tell a clipped result from a complete one and re-run for the middle.
+    """
+    if len(text) <= limit:
+        return text
+    tail = int(limit * RESULT_TAIL_SHARE)
+    if tail < 1:
+        # No room to split meaningfully — behave exactly as before.
+        return text[:limit] + f"\n[...truncated, full result was {len(text)} chars]"
+    head = limit - tail
+    cut = len(text) - limit
+    return (f"{text[:head]}"
+            f"\n[...{cut:,} chars cut from the middle; "
+            f"full result was {len(text):,} chars]\n"
+            f"{text[-tail:]}")
+
+
+#: How many tool calls may be in flight at once. Small on purpose: the point
+#: is to overlap a handful of file reads, not to open thirty sockets and make
+#: the machine the bottleneck instead of the model.
+MAX_PARALLEL_TOOLS = 4
+
+
+def _parallel_batch(state: AgentState, blocks: list) -> list:
+    """The blocks in this batch that may run at the same time as each other.
+
+    Narrow and opt-in, for two reasons that are not negotiable:
+
+    * **Nothing the user would be asked about.** A permission prompt is a
+      sequential, blocking conversation, and a worker thread cannot hold one.
+      A call that needs approval must not begin before the answer arrives.
+    * **Only what the host declared safe.** `parallel_safe` defaults to False,
+      so a host that says nothing gets exactly today's behaviour.
+
+    Returns [] rather than a single block when only one qualifies: spinning up
+    a pool to run one read costs more than it saves.
+    """
+    if len(blocks) < 2:
+        return []
+    batch = [b for b in blocks
+             if not state.needs_permission(b.name, b.input)
+             and state.parallel_safe(b.name, b.input)]
+    return batch if len(batch) > 1 else []
+
+
+def _run_parallel(state: AgentState, blocks: list) -> dict:
+    """Run `blocks` concurrently. Returns {tool_use_id: (result, ok, ms)}.
+
+    Nothing is yielded and no host callback fires from in here. A generator
+    cannot yield across a thread boundary, and `on_tool_call` appends to lists
+    the front end reads — so every event, every callback and every transcript
+    append still happens on the main thread, in the original block order, once
+    this has returned. Concurrency buys the wall clock and changes nothing else.
+
+    A tool that raises is caught per block, exactly as the sequential path does:
+    one failing read must not take the other three down with it.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def run_one(block):
+        started_at = time.perf_counter()
+        try:
+            result = state.execute_tool(block.name, block.input)
+            ok = not (isinstance(result, str)
+                      and result.lstrip().startswith("Error:"))
+        except Exception as e:
+            result = f"Error: tool raised {type(e).__name__}: {e}"
+            ok = False
+        return result, ok, int((time.perf_counter() - started_at) * 1000)
+
+    with ThreadPoolExecutor(
+            max_workers=min(MAX_PARALLEL_TOOLS, len(blocks))) as pool:
+        outcomes = list(pool.map(run_one, blocks))
+    return {b.id: outcome for b, outcome in zip(blocks, outcomes)}
+
+
+def _prepare_request(state: AgentState) -> None:
+    """Let the host re-cut prompt-cache breakpoints against the current history.
+
+    Runs before *every* model call, on both paths, because the history a
+    tool-using turn accumulates is exactly the history that used to go
+    uncached: the host was only asked once, before the turn made a single call.
+
+    Swallows everything it raises. A caching hint that fails is a missed
+    optimisation; a caching hint that ends the turn is a bug, and the hook runs
+    on the hot path of every request in the session.
+    """
+    if state.before_model_call is None:
+        return
+    try:
+        state.before_model_call(state.messages)
+    except Exception:
+        pass
+
+
+def _cached_input(usage) -> int:
+    """Cache hits, under either name the two client shapes use.
+
+    The adapter normalises the OpenAI-wire spellings into `cached_input_tokens`;
+    the Anthropic SDK reports `cache_read_input_tokens` and nothing else. The
+    native name matters most, because Anthropic is the only provider where the
+    agent places the breakpoints itself — so it is the one whose caching needs
+    to be measurable to stay correct.
+
+    Type-checked rather than defaulted: a token counter is formatted with `:,`
+    and summed across a session, so anything that is not a number has to become
+    zero here and not three screens later.
+    """
+    for name in ("cached_input_tokens", "cache_read_input_tokens"):
+        value = getattr(usage, name, None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    return 0
+
+
 def _record_usage(state: AgentState, usage) -> None:
     if not usage:
         return
     inp = getattr(usage, "input_tokens", 0) or 0
     out = getattr(usage, "output_tokens", 0) or 0
+    # Reported alongside the input rather than deducted from it: this is what
+    # was sent, annotated with how much of it the provider already had. Folding
+    # it into the total would make a well-cached turn look like a cheap one and
+    # hide the thing worth watching — how much is being re-sent at full price.
+    cached = _cached_input(usage)
     state.usage["input"] = inp
     state.usage["output"] = out
+    state.usage["cached_input"] = cached
     state.usage["total_input"] = state.usage.get("total_input", 0) + inp
     state.usage["total_output"] = state.usage.get("total_output", 0) + out
+    state.usage["total_cached_input"] = (
+        state.usage.get("total_cached_input", 0) + cached)
     state.usage["calls"] = state.usage.get("calls", 0) + 1
+
+
+def _record_discarded_stream(state: AgentState, usage, final_msg) -> None:
+    """Account for a streamed answer that is about to be thrown away.
+
+    A streamed call that wants tools falls through to a second, non-streamed
+    call carrying the identical payload, and only that second call was ever
+    counted — `_record_usage` is skipped on this path precisely so the turn is
+    not billed twice. But the request was still sent and still paid for, so the
+    counter has been under-reporting by roughly the size of the whole
+    conversation, once per tool step. A 29-step turn reporting 1.8M input
+    tokens really spent closer to 3.5M.
+
+    `would_have_served` is the number that decides whether the second call can
+    be dropped altogether. The adapter already assembles complete tool_use
+    blocks from the stream; the only thing it cannot do is recover arguments
+    whose JSON never parsed, which it counts as `malformed_tool_args`. So a
+    session where that stays at zero is a session where the second call bought
+    nothing at all — and this is what says so, instead of arithmetic.
+    """
+    inp = getattr(usage, "input_tokens", 0) or 0
+    out = getattr(usage, "output_tokens", 0) or 0
+    state.usage["duplicate_input"] = state.usage.get("duplicate_input", 0) + inp
+    state.usage["duplicate_output"] = state.usage.get("duplicate_output", 0) + out
+    state.usage["duplicate_calls"] = state.usage.get("duplicate_calls", 0) + 1
+
+    malformed = getattr(final_msg, "malformed_tool_args", 0)
+    if not isinstance(malformed, int) or isinstance(malformed, bool):
+        malformed = 0
+    state.usage["stream_malformed_tool_args"] = (
+        state.usage.get("stream_malformed_tool_args", 0) + malformed)
+    # Always present once a stream has been discarded, even at zero. A counter
+    # that exists only when it is non-zero forces every reader to guess whether
+    # a missing key means "none" or "never measured" — and those are the two
+    # answers this whole measurement exists to tell apart.
+    state.usage["would_have_served"] = (
+        state.usage.get("would_have_served", 0) + (1 if malformed == 0 else 0))
+
+
+def turn_expired(state: AgentState) -> bool:
+    """Whether this turn has used its wall-clock allowance.
+
+    Monotonic, so a clock change mid-turn cannot end it early or extend it
+    forever. `turn_deadline == 0` means unbounded, which stays the default for
+    any host that has not asked for a ceiling.
+    """
+    return bool(state.turn_deadline) and time.monotonic() >= state.turn_deadline
+
+
+def _report_deadline(state: AgentState, partial: str) -> Iterator[AgentEvent]:
+    """Say the turn ran out of time, and what that leaves the user holding."""
+    limit = int(state.max_turn_seconds)
+    kept = (f" What it had written is below." if partial else
+            " It had produced nothing to keep.")
+    state.last_error = f"turn deadline {limit}s exceeded"
+    yield ErrorOccurred(
+        f"This turn hit its {limit}s time limit and was stopped between steps, "
+        f"so the transcript is intact.{kept} Ask for a smaller piece of the "
+        f"work, or raise AGENT_MAX_TURN_SECONDS.",
+        detail=state.last_error, recoverable=True)
+
+
+def _sampling(state: AgentState) -> dict:
+    """Sampling knobs for a model call, or `{}` to accept the provider default.
+
+    One function, called from both `_stream_call` and `_model_call`, because
+    sampling that applies on one path and not the other is a difference the
+    user cannot see and cannot explain: the same question would come back
+    steady when the reply had a tool call in it and unhinged when it did not.
+    `tests/test_core_loop.py::PathParity` pins it.
+
+    Returns a dict rather than a value so "say nothing" stays expressible.
+    Sending `temperature: null`, or a number to a provider that rejects the
+    parameter, would trade a sampling problem for a 400.
+    """
+    if state.temperature is None:
+        return {}
+    return {"temperature": state.temperature}
 
 
 def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
@@ -280,12 +496,14 @@ def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
     stop_reason = None
     usage_info = None
 
+    _prepare_request(state)
     with state.get_client().messages.stream(
         model=state.get_model(),
         max_tokens=state.max_tokens,
         system=state.system_prompt,
         tools=state.tools,
         messages=state.messages,
+        **_sampling(state),
     ) as stream:
         for event in stream:
             # Checked per chunk rather than only between turns: without this
@@ -318,6 +536,8 @@ def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
     # too would bill the same turn twice.
     if not wants_tools:
         _record_usage(state, usage_info)
+    else:
+        _record_discarded_stream(state, usage_info, final_msg)
     return "".join(text_parts), wants_tools
 
 
@@ -328,6 +548,109 @@ def _quota_error(err: Exception) -> ErrorOccurred:
         "temporary blip, so retrying will not clear it. Switch provider or model "
         "with /provider or /model, or wait for the allowance to reset.",
         detail=str(err), recoverable=False)
+
+
+def _upstream_excerpt(err: Exception, limit: int = 220) -> str:
+    """The provider's own words, short enough to sit inside a message.
+
+    The terminal adapter prints `ErrorOccurred.message` and nothing else, so a
+    diagnosis that files the upstream text away under `detail` is *less*
+    debuggable than the raw dump it replaces. Say what we think it was, then
+    show what they actually said.
+
+    Clipped from both ends for the same reason tool results are: the status
+    line and endpoint are at the front, the provider's actual sentence is at
+    the back, and a head-only excerpt of a JSON error body is entirely
+    preamble — `{"error":{"param":null,"type":...` and nothing that names the
+    problem.
+    """
+    text = " ".join(str(err).split())
+    if len(text) <= limit:
+        return text
+    head = limit // 3
+    return f"{text[:head]} … {text[-(limit - head):]}"
+
+
+#: An upstream saying "this model is not there", in the several ways gateways
+#: word it. Measured against OpenCode Zen on 2026-08-13: `ling-3.0-tiny-free`
+#: is listed by `/v1/models` and answers every request with
+#: `[404] No endpoints found for inclusionai/ling-3.0-tiny:free`, and
+#: `laguna-s-2.1-free` with `503 Endpoint is unavailable`. Both are advertised
+#: and neither is served.
+_MODEL_GONE_MARKERS = (
+    "no endpoints found",
+    "endpoint is unavailable",
+    "model not found",
+    "no such model",
+    "does not exist",
+    "is not supported",
+    "unknown model",
+    "model_not_found",
+)
+
+
+def is_model_unavailable(err: Exception) -> bool:
+    """True when the failure is "that model is not there", not "bad request"."""
+    low = str(err).lower()
+    return any(marker in low for marker in _MODEL_GONE_MARKERS)
+
+
+def _model_unavailable_error(err: Exception) -> ErrorOccurred:
+    """Name the one failure a user can fix in one keystroke.
+
+    Worth separating from the generic 4xx because the generic advice is
+    actively wrong here. A gateway that lists a model it cannot route to
+    answers with a 400, so this arrived as "the provider rejected the request
+    itself … usually that is a payload too large for the model (try /compact)"
+    — sending the user to compact a two-message conversation to fix a model
+    that does not exist. Nothing about the payload was ever the problem.
+    """
+    return ErrorOccurred(
+        "This model is listed by the provider but is not currently being "
+        "served, so every request to it fails the same way — it is not "
+        "something retrying or compacting can fix. Pick another with /model. "
+        f"Upstream said: {_upstream_excerpt(err)}",
+        detail=str(err), recoverable=False)
+
+
+def _client_error(err: Exception) -> ErrorOccurred:
+    """Name what a 4xx actually was, instead of "an unexpected error".
+
+    A client error was diagnosed only inside the `anthropic.InternalServerError`
+    branch — which the in-process adapter never raises. It reports a 400 as a
+    plain `RuntimeError` carrying the upstream's JSON body, so every rejected
+    request on the adapter path (that is, every OpenAI-wire provider: zen,
+    openrouter, ollama, custom) fell through to the catch-all and dumped raw
+    JSON at the user.
+
+    This changes no control flow. A 4xx is fatal to the turn before and after,
+    because a retry sends the identical payload and is refused identically.
+    What changes is whether the user can tell a rejected credential from an
+    oversized payload from a model that cannot answer this conversation at all.
+    """
+    text = str(err)
+    excerpt = _upstream_excerpt(err)
+    if "reasoning_content" in text:
+        return ErrorOccurred(
+            "This endpoint answered in thinking mode, and requires the reasoning "
+            "it produced to be passed back with the conversation. TOMAS does not "
+            "carry that field yet, so the turn cannot continue on this model — "
+            "switch with /model, or pick a model without thinking mode. "
+            f"Upstream said: {excerpt}",
+            detail=text, recoverable=False)
+    if any(k in text for k in ("401", "403", "Unauthorized", "Forbidden",
+                               "authentication")):
+        return ErrorOccurred(
+            "The provider refused the credentials for this request. Check the "
+            "key for the active provider with /provider. "
+            f"Upstream said: {excerpt}",
+            detail=text, recoverable=False)
+    return ErrorOccurred(
+        "The provider rejected the request itself, so sending it again unchanged "
+        "would fail the same way. Usually that is a payload too large for the "
+        "model (try /compact) or a parameter it does not accept. "
+        f"Upstream said: {excerpt}",
+        detail=text, recoverable=False)
 
 
 def _model_call(state: AgentState) -> Iterator[AgentEvent]:
@@ -342,22 +665,39 @@ def _model_call(state: AgentState) -> Iterator[AgentEvent]:
         return event
 
     for attempt in range(MAX_RETRIES + 1):
+        # A retry is a *new* request, so the deadline applies to starting it.
+        # Without this the ladder outruns the ceiling on its own: a stalled
+        # call costs the full 300 s socket timeout, timeouts are classified
+        # retryable, and four attempts plus backoff is over twenty minutes for
+        # one step of one turn.
+        if attempt and turn_expired(state):
+            yield fail(ErrorOccurred(
+                "Out of time for this turn before the retry could run.",
+                detail=f"turn deadline {int(state.max_turn_seconds)}s exceeded",
+                recoverable=True))
+            return None
         try:
+            _prepare_request(state)
             response = state.get_client().messages.create(
                 model=state.get_model(),
                 max_tokens=state.max_tokens,
                 system=state.system_prompt,
                 tools=state.tools,
                 messages=state.messages,
+                **_sampling(state),
             )
             _record_usage(state, getattr(response, "usage", None))
             return response
         except anthropic.InternalServerError as e:
+            # Checked before the retryable test on purpose: a missing model is
+            # reported as a 503 by some gateways, which `is_retryable_error`
+            # reads as a blip and burns the whole 5/10/20s ladder on.
+            if is_model_unavailable(e):
+                state.model_unavailable = True
+                yield fail(_model_unavailable_error(e))
+                return None
             if is_client_error(e) and not is_retryable_error(e):
-                yield fail(ErrorOccurred(
-                    "The AI service rejected the request. The system prompt or "
-                    "message may be too large. Try /compact to reduce context size.",
-                    detail=str(e), recoverable=False))
+                yield fail(_client_error(e))
                 return None
             if is_quota_error(e):
                 yield fail(_quota_error(e))
@@ -374,8 +714,19 @@ def _model_call(state: AgentState) -> Iterator[AgentEvent]:
             yield RetryScheduled(attempt + 1, MAX_RETRIES, delay, str(e))
             time.sleep(delay)
         except Exception as e:
+            if is_model_unavailable(e):
+                state.model_unavailable = True
+                yield fail(_model_unavailable_error(e))
+                return None
             if is_quota_error(e):
                 yield fail(_quota_error(e))
+                return None
+            # Same test, same order, same outcome as the SDK branch above: a
+            # 4xx that happens to carry a retryable-looking word in its body
+            # keeps the retry it has today, and everything else is reported
+            # instead of being dumped raw.
+            if is_client_error(e) and not is_retryable_error(e):
+                yield fail(_client_error(e))
                 return None
             if attempt < MAX_RETRIES and is_retryable_error(e):
                 delay = backoff_delay(attempt, e)
@@ -450,6 +801,34 @@ def _report_truncation(state: AgentState, text: str) -> Iterator[AgentEvent]:
     yield ErrorOccurred(message, detail=state.last_error, recoverable=True)
 
 
+def _report_empty_reply(state: AgentState) -> Iterator[AgentEvent]:
+    """Say that the model returned nothing at all.
+
+    Not the same as a truncation, which `_report_truncation` already covers by
+    reading `stop_reason == "max_tokens"`. This is the case where the provider
+    hands back a well-formed response containing no text, no tool call and no
+    stop reason — measured on `nvidia/nemotron-nano-12b-v2-vl:free` via
+    OpenRouter, which answers `finish_reason: null`, `content: null`,
+    `tool_calls: null` and no usage block.
+
+    Without this the turn ends `TurnStarted → ThinkingStarted → TurnFinished`
+    and the user sees a spinner, then their prompt again. That is the exact
+    shape of failure `_report_truncation` was written for — "the user saw a
+    token counter and nothing else, asked 'where is the file?', and got
+    another empty turn" — arriving through a different door.
+
+    Recoverable, because the next message often works: this is usually the
+    model, not the configuration.
+    """
+    state.last_error = "empty reply from the provider"
+    yield ErrorOccurred(
+        "The model returned an empty response — no text, no tool call, and no "
+        "reason given. Nothing was wrong with the request, so trying again "
+        "often works; if it keeps happening, this model is not usable here "
+        "and /model will switch it.",
+        detail=state.last_error, recoverable=True)
+
+
 def _can_escalate(state: AgentState, text: str, escalated: bool) -> bool:
     """Is this a truncation worth one more attempt with a bigger budget?
 
@@ -498,6 +877,34 @@ def _escalate(state: AgentState, discarded: str = "") -> Iterator[AgentEvent]:
         recoverable=True)
 
 
+def _recover_written_tool_calls(state: AgentState, text: str,
+                                streamed: bool) -> Iterator[AgentEvent]:
+    """Lift a tool call the model typed out back into the tool channel.
+
+    Returns a response shaped like one that asked for tools, or None when the
+    reply really was an answer. Called at the one moment on each path where a
+    turn is about to end without having called anything — which is precisely
+    when a written-out call is the difference between a working model and a
+    model that prints JSON at the user and stops.
+
+    Both paths call it, and both hand the result into the *same* tool-execution
+    code below: a recovered call is subject to permissions, loop detection and
+    the budget checkpoint exactly like a real one. That is why this builds a
+    response instead of running anything — recovery changes where a call came
+    from, never what may be done with it.
+
+    Deliberately last, after the truncation branch. A reply cut off at
+    max_tokens can end mid-JSON, and half a tool call is not one; escalating
+    first means the retry gets the chance to produce a complete call.
+    """
+    recovered = recover_text_tool_calls(text, state.tools)
+    if recovered is None:
+        return None
+    yield ToolCallsRecovered([b.name for b in recovered.recovered],
+                             streamed=streamed)
+    return recovered
+
+
 def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[AgentEvent]:
     """Drive one user turn to completion, yielding events as it goes."""
     started = time.perf_counter()
@@ -516,6 +923,9 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
     # less than they had before it — half a document beats nothing.
     discarded = ""
 
+    state.turn_deadline = (time.monotonic() + state.max_turn_seconds
+                           if state.max_turn_seconds > 0 else 0.0)
+
     while True:
         # Checked once per iteration — after a tool batch or a continuation
         # extension, before spending another model call — as well as inside
@@ -527,7 +937,21 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                                interrupted=True)
             return
 
+        # Same position, same reason: decline to start the next step rather
+        # than abandon one in flight. `text` is whatever the turn has produced
+        # so far and is handed back — a turn stopped on time must not also
+        # lose the work it had done.
+        if turn_expired(state):
+            yield from _report_deadline(state, discarded)
+            yield TurnFinished(reply=discarded, usage=dict(state.usage),
+                               seconds=time.perf_counter() - started)
+            return
+
         yield ThinkingStarted(state.get_model())
+
+        # A response rebuilt from a tool call the model wrote as text, when
+        # there is one. Reset per iteration: the next step gets its own answer.
+        recovered = None
 
         # ── Streaming attempt ──
         if state.streaming_enabled:
@@ -554,21 +978,37 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                             continue
                         text = text or discarded
                         yield from _report_truncation(state, text)
-                    # Record the reply — without this the streaming path
-                    # silently reintroduces the no-memory bug.
-                    if text:
-                        state.messages.append({"role": "assistant", "content": text})
-                    yield TurnFinished(reply=text, usage=dict(state.usage),
-                                       seconds=time.perf_counter() - started)
-                    return
+                    recovered = yield from _recover_written_tool_calls(
+                        state, text, streamed=True)
+                    if recovered is None:
+                        # Record the reply — without this the streaming path
+                        # silently reintroduces the no-memory bug.
+                        if text:
+                            state.messages.append({"role": "assistant", "content": text})
+                        elif state.last_stop_reason != "max_tokens":
+                            yield from _report_empty_reply(state)
+                        yield TurnFinished(reply=text, usage=dict(state.usage),
+                                           seconds=time.perf_counter() - started)
+                        return
+                    # A recovered call needs no second request: the stream ran
+                    # to completion, so its text is whole and the blocks built
+                    # from it are too. This is the one kind of tool call that
+                    # does not fall through, and the reason is that there is
+                    # nothing a non-streamed repeat could add — it would re-ask
+                    # the same question and be answered in text again.
                 # Tools requested: fall through to the non-streamed call, which
                 # returns complete tool_use blocks.
             except Exception as e:
-                # A quota is the one streaming failure that falling through
-                # cannot fix — the non-streamed call spends another request to
-                # be told the same thing. Stop here.
-                if is_quota_error(e):
-                    event = _quota_error(e)
+                # Two streaming failures that falling through cannot fix — the
+                # non-streamed call spends another request to be told the same
+                # thing. A model the provider does not serve is the second:
+                # without this it also gets recorded as "this provider cannot
+                # stream", which is a lie that outlives the model switch.
+                if is_quota_error(e) or is_model_unavailable(e):
+                    if is_model_unavailable(e):
+                        state.model_unavailable = True
+                    event = (_model_unavailable_error(e)
+                             if is_model_unavailable(e) else _quota_error(e))
                     state.last_error = event.detail or event.message
                     yield event
                     # Same rule as the failed-retry path below: a discarded
@@ -591,7 +1031,9 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                 state.streaming_error_retryable = is_retryable_error(e)
                 yield StreamingDisabled(str(e))
 
-        response = yield from _model_call(state)
+        response = recovered
+        if response is None:
+            response = yield from _model_call(state)
         if response is None:
             # The retry that was meant to replace a discarded partial answer
             # never landed. Hand back what was thrown away rather than nothing:
@@ -614,12 +1056,18 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                     continue
                 text = text or discarded
                 yield from _report_truncation(state, text)
-            if text:
-                state.messages.append({"role": "assistant", "content": text})
-                yield AssistantMessage(text)
-            yield TurnFinished(reply=text, usage=dict(state.usage),
-                               seconds=time.perf_counter() - started)
-            return
+            recovered = yield from _recover_written_tool_calls(
+                state, text, streamed=False)
+            if recovered is None:
+                if text:
+                    state.messages.append({"role": "assistant", "content": text})
+                    yield AssistantMessage(text)
+                elif response.stop_reason != "max_tokens":
+                    yield from _report_empty_reply(state)
+                yield TurnFinished(reply=text, usage=dict(state.usage),
+                                   seconds=time.perf_counter() - started)
+                return
+            response = recovered
 
         tool_blocks = [b for b in response.content if b.type == "tool_use"]
         for b in tool_blocks:
@@ -656,12 +1104,30 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
 
         # ── Execute ──
         tool_results = []
+        # Read-only calls nobody is being asked about can overlap. Their
+        # ToolStarted events are emitted here, up front, because the work
+        # begins for all of them at once; everything after this — results,
+        # truncation, callbacks, the transcript — still runs in block order in
+        # the single loop below, which remains the only place that handles a
+        # tool result.
+        parallel = _parallel_batch(state, tool_blocks)
+        precomputed: dict = {}
+        if parallel and not state.interrupted():
+            for block in parallel:
+                yield ToolStarted(block.id, block.name, block.input,
+                                  state.risk_of(block.name, block.input),
+                                  origin=state.origin_of(block.name))
+            precomputed = _run_parallel(state, parallel)
+
         for block in tool_blocks:
+            done = precomputed.get(block.id)
             # A queued call that hasn't started yet is simply skipped — the
             # one already running (if any) is stopped from inside its own
             # handler (run_command polls this same signal to kill its
-            # subprocess), not by anything here.
-            if state.interrupted():
+            # subprocess), not by anything here. One already *finished* in the
+            # parallel batch is kept: the work is done and paid for, and the
+            # transcript needs a result for every tool_use regardless.
+            if done is None and state.interrupted():
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -670,11 +1136,12 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                 continue
 
             risk = state.risk_of(block.name, block.input)
-            yield ToolStarted(block.id, block.name, block.input, risk,
-                              origin=state.origin_of(block.name))
+            if done is None:
+                yield ToolStarted(block.id, block.name, block.input, risk,
+                                  origin=state.origin_of(block.name))
 
             approved = True
-            if state.needs_permission(block.name, block.input):
+            if done is None and state.needs_permission(block.name, block.input):
                 decision = state.responder.ask(
                     PermissionNeeded(block.id, block.name, block.input, risk))
                 if decision == "deny":
@@ -683,7 +1150,9 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                     state.approvals.approve(block.name, block.input)
 
             t0 = time.perf_counter()
-            if not approved:
+            if done is not None:
+                result, ok, _elapsed_ms = done
+            elif not approved:
                 # "user denied this tool call" reads like a transient failure,
                 # so the model rewrote the same command cosmetically and tried
                 # again — six times in one observed turn, until the loop
@@ -713,7 +1182,10 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                 except Exception as e:  # a tool must never kill the turn
                     result = f"Error: tool raised {type(e).__name__}: {e}"
                     ok = False
-            ms = int((time.perf_counter() - t0) * 1000)
+            # A parallel call reports the time it actually spent, not the
+            # fraction of a second it takes to look its result up here.
+            ms = (done[2] if done is not None
+                  else int((time.perf_counter() - t0) * 1000))
 
             if state.on_tool_call:
                 try:
@@ -724,8 +1196,7 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
 
             if isinstance(result, str) and len(result) > state.max_result_chars:
                 yield ToolResultTruncated(block.name, len(result), state.max_result_chars)
-                result = (result[:state.max_result_chars]
-                          + f"\n[...truncated, full result was {len(result)} chars]")
+                result = clip_result(result, state.max_result_chars)
 
             yield ToolFinished(block.id, block.name, result, ms, ok=ok,
                                error=None if ok else result)

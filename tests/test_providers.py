@@ -553,6 +553,92 @@ def _tool(name, desc=""):
             "input_schema": {"type": "object", "properties": {}}}
 
 
+class TestConnectionReuse(unittest.TestCase):
+    """One handshake per turn, not one per model call.
+
+    A 29-step tool turn made 58 requests to the same host and opened 58
+    connections, because `urlopen` pools nothing. The model call is the slow
+    part of a turn, and this was pure dead air stacked in front of every one
+    of them.
+    """
+
+    def setUp(self):
+        stub_provider.KeepAliveStub.reset()
+        self.srv, self.url = stub_provider.serve(stub_provider.KeepAliveStub)
+        self.adapter = openai_adapter.OpenAICompatAdapter(self.url, "k")
+
+    def tearDown(self):
+        # Before shutdown: a kept-alive socket the client still holds would
+        # keep the single-threaded stub inside its handler and hang teardown.
+        self.adapter._pool.close()
+        self.srv.shutdown()
+
+    def _call(self):
+        return self.adapter.messages.create(
+            model="stub-model", max_tokens=8, system="s",
+            messages=[{"role": "user", "content": "hi"}], tools=[])
+
+    def test_repeated_calls_share_one_connection(self):
+        for _ in range(5):
+            self._call()
+        self.assertEqual(stub_provider.KeepAliveStub.requests, 5)
+        self.assertEqual(
+            stub_provider.KeepAliveStub.connections, 1,
+            "five model calls must not cost five TCP+TLS handshakes")
+
+    def test_the_reply_is_unchanged_by_pooling(self):
+        first, second = self._call(), self._call()
+        for reply in (first, second):
+            self.assertEqual(reply.content[0].text, "ok")
+            self.assertEqual(reply.stop_reason, "end_turn")
+
+    def test_a_dropped_connection_is_retried_once_on_a_fresh_one(self):
+        """The failure mode reuse introduces: the server closed the pooled
+        socket while it was idle, and the write fails rather than the connect.
+        Without the retry every such turn dies on a healthy provider."""
+        self._call()
+        # Kill the pooled connection behind the adapter's back, exactly as an
+        # idle timeout on the server side would.
+        self.adapter._pool._idle.close()
+        reply = self._call()
+        self.assertEqual(reply.content[0].text, "ok",
+                         "a stale pooled connection must not surface to the caller")
+
+    def test_an_error_response_still_carries_its_body(self):
+        """`create` reports 4xx by reading `e.read()`. Losing the body there
+        would put the diagnosis back to a bare status code."""
+        with self.assertRaises(RuntimeError) as caught:
+            self.adapter.messages.create(
+                model="", max_tokens=8, system="s",
+                messages=[{"role": "user", "content": "hi"}], tools=[])
+        self.assertIn("401", str(caught.exception))
+        self.assertIn("not supported", str(caught.exception))
+
+    def test_cached_prompt_tokens_are_reported(self):
+        reply = self._call()
+        self.assertEqual(reply.usage.input_tokens, 100)
+        self.assertEqual(reply.usage.cached_input_tokens, 90)
+
+
+class TestCachedTokenReporting(unittest.TestCase):
+    """Providers spell the cache-hit count four different ways."""
+
+    def test_openai_nested_details(self):
+        self.assertEqual(openai_adapter.cached_prompt_tokens(
+            {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 64}}), 64)
+
+    def test_deepseek_flat_key(self):
+        self.assertEqual(openai_adapter.cached_prompt_tokens(
+            {"prompt_tokens": 100, "prompt_cache_hit_tokens": 80}), 80)
+
+    def test_silence_is_not_a_miss_but_reports_zero(self):
+        self.assertEqual(openai_adapter.cached_prompt_tokens({"prompt_tokens": 100}), 0)
+
+    def test_junk_does_not_raise(self):
+        self.assertEqual(openai_adapter.cached_prompt_tokens(None), 0)
+        self.assertEqual(openai_adapter.cached_prompt_tokens("nope"), 0)
+
+
 class TestToolSelection(unittest.TestCase):
 
     def setUp(self):

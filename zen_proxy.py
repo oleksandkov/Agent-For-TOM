@@ -36,8 +36,34 @@ BOLD = '\033[1m'
 DIM = '\033[2m'
 RESET = '\033[0m'
 
-# Models available via the free Zen tier
-# (as of July 2026 — fetched from upstream API, may change)
+def _live_catalog():
+    """The current Zen catalogue, falling back to the tables below.
+
+    Imported lazily because `zen_catalog` reaches back into this module for
+    exactly those tables when it cannot reach the network.
+    """
+    try:
+        import zen_catalog
+        return zen_catalog.catalog()
+    except Exception:                       # offline, or import trouble
+        from types import SimpleNamespace
+        models = [SimpleNamespace(id=m, context=MODEL_CONTEXT_WINDOWS.get(m, 128_000),
+                                  free=m.endswith("-free"))
+                  for m in ZEN_MODELS]
+        return SimpleNamespace(models=models, source="static",
+                               free=lambda: [m for m in models if m.free])
+
+
+# The offline fallback, and nothing more. `zen_catalog` fetches the real list
+# from `opencode.ai/zen/v1/models` on every path that shows models to a user;
+# this is what is left when there is no network and no cache.
+#
+# It is kept rather than deleted because a first run with no connectivity still
+# has to offer *something*, but it is wrong the moment upstream changes and
+# there is no way to notice from in here — checked on 2026-08-13, three of
+# these had been withdrawn and four served models were absent. Do not add to
+# it by hand expecting the picker to show the addition; the picker asks
+# upstream.
 ZEN_MODELS = [
     # Claude
     "claude-fable-5",
@@ -247,6 +273,44 @@ def _upstream_request(zen_req: Request, max_retries: int = 2) -> bytes:
     raise last_error  # type: ignore[misc]
 
 
+def reasoning_of(blocks) -> str:
+    """The `reasoning_content` carried on an assistant turn's blocks, if any.
+
+    A thinking model's chain-of-thought is part of the assistant turn, and some
+    upstreams *require* it back on the next request rather than merely
+    accepting it:
+
+        400 invalid_request_error — "The `reasoning_content` in the thinking
+        mode must be passed back"
+
+    Measured on `deepseek-v4-flash-free` through Zen: turn 1 and 2 answered,
+    and turn 3 — the first request replaying an assistant turn that had
+    reasoning — failed, then every turn after it. A ten-turn session delivered
+    two answers. Neither this module nor `openai_adapter` mentioned
+    `reasoning_content` anywhere, so it was being dropped on the floor for
+    every reasoning model; `zen_catalog` reports `reasoning: True` for all
+    eight of Zen's free models.
+
+    Stored on the content blocks rather than beside them because
+    `core.loop` appends `response.content` straight into `messages` and nothing
+    else survives that hop — the same reason Gemini 3's `thought_signature`
+    rides on the tool_use block. Read from any block, written to the first.
+    """
+    if not isinstance(blocks, list):
+        return ""
+    for block in blocks:
+        if isinstance(block, dict) and block.get("reasoning_content"):
+            return str(block["reasoning_content"])
+    return ""
+
+
+def attach_reasoning(blocks: list, reasoning: str) -> list:
+    """Put `reasoning` on the first block, so it round-trips. No-op if empty."""
+    if reasoning and blocks and isinstance(blocks[0], dict):
+        blocks[0]["reasoning_content"] = reasoning
+    return blocks
+
+
 def anthropic_to_openai(ant_body: dict) -> dict:
     """Convert an Anthropic-format request body to OpenAI format."""
     messages = []
@@ -278,8 +342,23 @@ def anthropic_to_openai(ant_body: dict) -> dict:
             tool_uses = [b for b in content if b.get("type") == "tool_use"]
             if tool_uses and role == "assistant":
                 msg_entry: dict = {"role": "assistant", "content": text or None}
-                msg_entry["tool_calls"] = [
-                    {
+                # `extra_content` is echoed back when the block carries it.
+                # Gemini 3 attaches a `thought_signature` to every tool call
+                # and *requires* it on the way back in:
+                #
+                #   400 INVALID_ARGUMENT — "Function call is missing a
+                #   thought_signature in functionCall parts. This is required
+                #   for tools to work correctly."
+                #
+                # Rebuilding the call from id/name/input alone therefore made
+                # every Gemini 3 model run its first tool and then fail the
+                # follow-up request — the tool worked and the turn did not.
+                # Verified against gemini-3.6-flash, -3.5-flash and
+                # -3.1-flash-lite; 2.5 and gemma do not send one and are
+                # unaffected, because the key is only emitted when present.
+                calls = []
+                for t in tool_uses:
+                    call = {
                         "id": t["id"],
                         "type": "function",
                         "function": {
@@ -287,8 +366,13 @@ def anthropic_to_openai(ant_body: dict) -> dict:
                             "arguments": json.dumps(t.get("input", {})),
                         },
                     }
-                    for t in tool_uses
-                ]
+                    if t.get("extra_content"):
+                        call["extra_content"] = t["extra_content"]
+                    calls.append(call)
+                msg_entry["tool_calls"] = calls
+                # Thinking models reject the next request without it.
+                if reasoning_of(content):
+                    msg_entry["reasoning_content"] = reasoning_of(content)
                 messages.append(msg_entry)
             elif any(b.get("type") == "tool_result" for b in content):
                 for b in content:
@@ -304,7 +388,13 @@ def anthropic_to_openai(ant_body: dict) -> dict:
                             "content": str(result_content),
                         })
             else:
-                messages.append({"role": role, "content": text})
+                entry = {"role": role, "content": text}
+                # An assistant turn that reasoned and then answered in prose,
+                # with no tool call. Same requirement, different branch — and
+                # the branch a short session is most likely to hit first.
+                if role == "assistant" and reasoning_of(content):
+                    entry["reasoning_content"] = reasoning_of(content)
+                messages.append(entry)
 
     # Tools
     tools = []
@@ -350,15 +440,23 @@ def openai_to_anthropic(oai_resp: dict, model: str, input_tokens: int) -> dict:
             inp = json.loads(tc["function"]["arguments"])
         except (json.JSONDecodeError, KeyError):
             inp = {}
-        content.append({
+        block = {
             "type": "tool_use",
             "id": tc.get("id", _oc_id("toolu")),
             "name": tc["function"]["name"],
             "input": inp,
-        })
+        }
+        # Carried, not dropped. See `anthropic_to_openai` for why.
+        if tc.get("extra_content"):
+            block["extra_content"] = tc["extra_content"]
+        content.append(block)
 
     if not content:
         content.append({"type": "text", "text": ""})
+
+    # Carried onto the blocks so it survives into `messages` and comes back on
+    # the next request. See `reasoning_of`.
+    attach_reasoning(content, (choice.get("message") or {}).get("reasoning_content") or "")
 
     finish = choice.get("finish_reason", "stop")
     stop_reason_map = {
@@ -482,26 +580,36 @@ class ZenProxyHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/v1/models":
+            # Served from the live catalogue, like everything else that lists
+            # Zen models. The whole point of running this daemon is to point
+            # *another* tool at Zen, and that tool's model picker was being
+            # handed a list compiled into this file — three models it offered
+            # had been withdrawn upstream.
+            catalog = _live_catalog()
             data = {
                 "object": "list",
                 "data": [
                     {
-                        "id": m,
+                        "id": m.id,
                         "object": "model",
                         "created": 1779000000,
                         "owned_by": "opencode-zen",
-                        "context_window": MODEL_CONTEXT_WINDOWS.get(m, 128_000),
+                        "context_window": m.context,
+                        "free": m.free,
                     }
-                    for m in ZEN_MODELS
+                    for m in catalog.models
                 ],
             }
             self._send_json(200, data)
         elif self.path == "/health":
+            catalog = _live_catalog()
             self._send_json(200, {
                 "status": "ok",
                 "type": "opencode-zen-proxy",
-                "models": ZEN_MODELS,
-                "model_context_windows": MODEL_CONTEXT_WINDOWS,
+                "catalog_source": catalog.source,
+                "models": [m.id for m in catalog.models],
+                "free_models": [m.id for m in catalog.free()],
+                "model_context_windows": {m.id: m.context for m in catalog.models},
             })
         else:
             self._send_json(404, {"error": "not found"})
@@ -687,8 +795,11 @@ def start_proxy(port: int = DEFAULT_PORT, daemon: bool = False) -> HTTPServer:
         print(f"  OpenAI API:    POST /v1/chat/completions")
         print(f"  Models:        GET  /v1/models")
         print(f"  Health:        GET  /health")
-        model_list = ', '.join(f"{m} ({MODEL_CONTEXT_WINDOWS.get(m, '?')} ctx)" for m in ZEN_MODELS)
-        print(f"  Models: {model_list}")
+        catalog = _live_catalog()
+        free = catalog.free()
+        print(f"  Catalogue:     {len(catalog.models)} models ({catalog.source}), "
+              f"{len(free)} free")
+        print(f"  Free:          {', '.join(m.id for m in free) or 'none'}")
         print()
         try:
             server.serve_forever()

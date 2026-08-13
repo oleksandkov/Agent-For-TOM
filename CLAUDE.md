@@ -61,6 +61,36 @@ TOMAS (Terminal Operated Modular Agent System) — a self-hosted AI coding agent
   therefore lets an explicit `AGENT_MAX_TOKENS` win over it, because the old
   `min(...)` silently clamped every provider to 8192 while the truncation
   message advised raising that very variable.
+- **A tool call the model wrote as text is still a tool call.** Small local
+  models advertise `tools` and then answer in prose. Measured on
+  qwen2.5-coder:3b (Ollama 0.30.6), tools attached, every reply: `tool_calls:
+  null` and `` ```json\n{"name": "read_file", ...} `` in `content`. Its own
+  template tells it to emit `<tool_call>` and not to use backticks; it uses
+  backticks. Ollama's shim lifts only the exact `<tool_call>` form, so the
+  turn reached `run_turn` as `end_turn` with no tool_use block and the JSON
+  was printed at the user — the 3B was deciding correctly and the decision was
+  being discarded. `core/toolcall_text.recover` parses it back and `run_turn`
+  builds a response from it, on **both** paths, so permissions, loop detection
+  and the budget all still apply. Two guards are not optional: the name must be
+  a tool offered *this turn* (the same model answered "what your name?" with
+  `{"name": "TOMAS", "arguments": {}}`), and the object may carry no keys
+  beyond a call, so a fenced JSON *example* is not executed. Recovery runs
+  after the truncation branch — half a call is not a call. Tests:
+  `tests/test_toolcall_text.py`, whose fixtures are verbatim live replies.
+- **The Zen catalogue is fetched, and "free" is a price, not a suffix.**
+  `zen_proxy.ZEN_MODELS` was hand-written and dated; checked against upstream
+  it offered three withdrawn models and hid four served ones, and the picker
+  filed all sixty under "Zen free-tier models" while **eight** were free — the
+  first-run path printed "using the OpenCode Zen free tier" and then selected
+  `claude-fable-5`, which bills. `zen_catalog.py` takes availability from
+  `opencode.ai/zen/v1/models` (5 KB, no auth) and description from
+  `models.dev/api.json` (the catalogue OpenCode publishes; 89 opencode entries,
+  28 of them no longer served — so it may never decide availability). Free is
+  `cost.input == 0 and cost.output == 0`: `big-pickle` is free without the
+  suffix and `minimax-m2.1` bills while `minimax-m2.1-free` does not. Degrades
+  fresh cache → network → stale cache → the static list, never raises, and
+  `Catalog.freshness` says which the user is looking at. `ZEN_MODELS` is the
+  offline fallback only — adding to it by hand will not change the picker.
 - **Nothing that varies with the message may be emitted before something that
   does not.** `build_system_prompt` is built in two halves: a `stable` half
   (BASE_PROMPT, environment, instructions, skills catalogue) and a volatile
@@ -79,6 +109,78 @@ TOMAS (Terminal Operated Modular Agent System) — a self-hosted AI coding agent
   These decide when compaction fires. Tool schemas were counted at `// 6` and
   messages at `// 3`, so the two errors pulled in opposite directions and the
   total looked plausible while neither half was.
+- **A budget is shares of a window, never a table of flat numbers.**
+  `core/budget.py` owns what may occupy the context. The tool ceiling was 64
+  for every Ollama model whether the window was 8,192 or 262,144; the output
+  reserve was 8,192 whether that was 4% or 25% of it. Measured on
+  qwen2.5-coder:3b at 32,768: tools 18,079 (61%), output 8,192 (28%), system
+  prompt 3,353 — 29,625 of fixed cost before the user typed. A `Profile`
+  stores *shares*, and `resolve()` turns them into numbers from the real
+  window and the *measured* per-tool cost of the connected pool, so "what does
+  a 128k model get?" needs no new row. `auto` picks a preset per window class
+  (`AUTO_TIERS`); an explicit `tool_ceiling`/`output_reserve` is the user's
+  number and survives a model switch, while a preset follows the model.
+- **No preset may switch off the learning system.** TOMAS is a self-improving
+  agent; a profile that quietly stops it learning has not economised, it has
+  changed what the program is. `learned_facts` and `standing_rules` are in
+  `ALWAYS_ON` and every preset — `economy` included — leaves them on, costing
+  nothing until something has been learned. Users may still turn them off by
+  hand; the TUI confirms first. Enforced by
+  `test_budget.py::TestLearningSurvivesEveryPreset`.
+- **Compaction must not fire when compacting cannot help.** The rule stopped
+  at "is the request over the trigger", which is half a decision — a request
+  can be over it for a reason compaction cannot touch. It only shrinks the
+  transcript, never below `POST_COMPACTION_FLOOR`. With 29,625 of overhead
+  against a 24,576 trigger it fired on the first message, with a
+  five-character transcript, and on every message after: two full local
+  inferences per turn to summarise what was never the problem.
+  `CompactionPlan.can_help` is the second question, `reason` is `"overhead"`
+  when it answers no, and `maybe_compact` says so once per session. The two
+  toggles in the *stable* prompt half (instructions, skills) are carried in
+  `_stable_fingerprint` — switching one moves no file, so the memoised prefix
+  would otherwise outlive the setting that built it.
+- **Ollama is asked, not experimented on.** `_probe_feature` establishes
+  capabilities by sending a request and seeing what comes back. That fails
+  locally: the model loads into VRAM at the expense of the triggering request —
+  measured on 0.30.6, a streamed probe cost 15.7 s and an image probe 14.9 s
+  *warm*, against an 8 s timeout — and a timeout returns `optimistic`, not a
+  measurement. Streaming was recorded "yes" without a stream ever being seen,
+  vision "no" for every vision model present. `ollama_model_facts` instead
+  reads `capabilities` and `<arch>.context_length` from `/api/show` in one
+  call. The window reported is the **served** one: `/api/ps` is ground truth
+  for a loaded model, else `OLLAMA_CONTEXT_LENGTH` or `OLLAMA_DEFAULT_NUM_CTX`
+  caps it, because the shim exposes no `num_ctx` and a 262,144-token model
+  still loads at 32,768. Cloud-routed models escape that cap, identified by
+  `remote_host` on `/api/tags` rather than a `:cloud` suffix — this module does
+  not read behaviour out of names. `_PROBE_TIMEOUT_LOCAL` covers any *other*
+  local endpoint, still probed the slow way.
+- **The model picker must reach every provider type.** A type missing from
+  `agent_cli.PROVIDER_TYPE_TO_DETECT` falls through to
+  `_provider_model_entries("other")`, a static cloud list. `ollama` was
+  missing, so choosing Ollama and opening "Choose model" offered
+  `openai/gpt-4o` and hid all eight installed models. `test_agent_units.py`
+  asserts every `PROVIDER_TYPES` entry is mapped and labelled. A model switch
+  also re-measures via `refresh_for_model` — capabilities were inherited
+  wholesale, so a 32k model's window followed you to a 262k one.
+- **An empty tool slot is cheaper than a wrong tool.** `select_tools` filled
+  the budget to the brim, so once the tools a message actually scored ran out,
+  the rest of the payload was decided by name length and list order. Measured
+  on the live 257-tool pool at 36 MCP slots: "what time is it in Tokyo" spent
+  21 slots on the pdf server, "remember that I prefer Ukrainian" got 8
+  chrome-devtools tools and zero memory ones, and "hello" got 36 tools none of
+  which scored — ~5,300 tokens per turn of tools chosen by accident, all of
+  which the model reads. Three rules fixed it, to a mean of 12.3 tools and
+  ~2,100 tokens over the same requests: `relevance_floor` is a *share of the
+  best score on the same message* (a description hit is worth 1.0 whatever
+  else is on offer, so a fixed cut-off tuned for a strong match discards
+  everything on a weak one); `SERVER_CORE_QUOTA` requires
+  `tool_name_matches` — eight slots is too large a commitment to make on
+  incidental description overlap; and sticky carry-over applies only when the
+  message scores nothing at all, or it becomes a ratchet that refills the
+  payload one topic at a time. Under-filling is safe *because*
+  `withheld_tools_notice` names what is missing — a gap the model can see
+  beats one hidden behind 36 irrelevant schemas. Tests:
+  `tests/test_tool_selection.py`.
 - **The tool block is the largest single line item in a turn, not the prompt.**
   Measured across 64 real MCP tools: 503 chars (~125 tokens) each, so a 128-tool
   ceiling costs ~16,100 tokens *per turn* — four times the whole system prompt.
@@ -106,6 +208,7 @@ TOMAS (Terminal Operated Modular Agent System) — a self-hosted AI coding agent
 | `session_manager.py` | Auto-saves sessions to `~/.tomas/sessions/` on exit; browse/continue/delete via TUI or `/session`. Records `complete`, `turn_metrics`, and `tool_log`; a transcript with a user turn that produced no reply is saved with `complete: false` and an `incomplete_reason` |
 | `instructions_manager.py` | Loads global (`~/.tomas/instructions/`) and project-level (`AGENT.md`/`agent.md`) instructions into the system prompt |
 | `skills_manager.py` | Discovers skills for `/skills` and `/skill <name>`. One format everywhere (`name`/`description`/`triggers`/`source`/`version`); malformed frontmatter is reported, never fatal; bodies load on demand; `improve_skill()` bumps the version and keeps provenance |
+| `core/budget.py` | Context budget policy — presets as shares of the window, section toggles, per-tool/server enable. Pure: computes and persists, never draws. `/budget` and the TUI page both render `agent.render_budget`, so they cannot disagree |
 | `mcp_manager.py` | MCP server management (shared config with Claude Code at `~/.claude.json`); tools, resources and prompts |
 | `provider_manager.py` | UI-free provider config, activation, and **probed** `Capabilities` (streaming, tool use, system prompt, context window, tool ceiling). Nothing infers behaviour from substrings in a URL or model name at runtime |
 | `openai_adapter.py` | In-process Anthropic↔OpenAI translation with real incremental SSE streaming. Used for openai/openrouter/zen/ollama/custom endpoints; no daemon |

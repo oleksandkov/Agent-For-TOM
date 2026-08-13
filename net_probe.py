@@ -21,8 +21,9 @@ tiny and dependency-free — they run before the heavy imports do.
 from __future__ import annotations
 
 import socket
+import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Optional, Sequence
 from urllib.parse import urlparse
 
 # Long enough for a loopback service to answer, short enough that a dead port
@@ -96,6 +97,104 @@ def url_port_open(url: str, timeout: float = DEFAULT_PORT_TIMEOUT) -> bool:
         return True
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     return port_open(host, port, timeout)
+
+
+# ── Abandonable fan-out ──────────────────────────────────────────────────
+
+#: Long enough for a cold MCP server that is still downloading its package,
+#: short enough that nothing waits on it forever.
+DEFAULT_FAN_OUT_TIMEOUT = 30.0
+
+
+class _Unfinished:
+    """Marks a slot no worker has written yet.
+
+    A sentinel rather than `None`, because `None` is a perfectly good result
+    for a probe that ran and found nothing.
+    """
+
+    def __repr__(self) -> str:
+        return "<unfinished>"
+
+
+_UNFINISHED = _Unfinished()
+
+
+def fan_out(work: Callable[[Any], Any],
+            items: Sequence[Any],
+            max_workers: int = 8,
+            timeout: Optional[float] = DEFAULT_FAN_OUT_TIMEOUT,
+            ) -> tuple[list[tuple[Any, Any]], list[Any]]:
+    """Run `work(item)` over `items` in parallel, and be able to walk away.
+
+    Returns `(done, unfinished)` — `done` as `[(item, result), …]` and
+    `unfinished` as the items still running when the budget ran out. Anything
+    `work` raises is returned as the exception object rather than propagated:
+    one bad server must not take the fan-out down.
+
+    **Both lists come back in the order `items` was given**, never completion
+    order. Not a nicety: MCP tool names are resolved by claim order — the
+    second server to claim a name gets `mcp_<server>_<tool>` — so results
+    arriving in whatever order the network happened to answer renamed a user's
+    tools differently on every startup. Returning completion order bought
+    nothing and cost determinism, which is the one property `pool.map` had
+    that was worth keeping.
+
+    **Why not `ThreadPoolExecutor`.** Its worker threads are non-daemon and
+    `concurrent.futures` registers an `atexit` hook that joins every one of
+    them. So a probe that is "abandoned" is not abandoned at all — it is
+    deferred to interpreter shutdown, where it blocks with no UI, no message
+    and no way to interrupt it. Measured: a process that did nothing but start
+    the MCP connection probe on a daemon thread and then exit took 6.6 s to
+    die, 6.2 s of it after `main` had finished. Two call sites carried comments
+    explaining that they had bounded the wait, and both were wrong in the same
+    way — `wait(timeout=…)` bounds the *foreground* wait and nothing else.
+
+    Daemon threads have exactly the property those comments claimed: the
+    interpreter does not wait for them, so a slow server delays a menu redraw
+    and never delays quitting.
+    """
+    items = list(items)
+    if not items:
+        return [], []
+
+    #: Slot per input index, never a shared list — this is what makes the
+    #: result order the *input* order regardless of who finishes first. Keying
+    #: on the item itself would not do: two servers may compare equal, and
+    #: `id()` is only unique while every object is alive.
+    slots: list[Any] = [_UNFINISHED] * len(items)
+    queue = list(range(len(items)))
+    lock = threading.Lock()
+    finished = threading.Event()
+    remaining = [len(items)]
+
+    def worker():
+        while True:
+            with lock:
+                if not queue:
+                    return
+                index = queue.pop(0)
+            try:
+                result = work(items[index])
+            except Exception as exc:               # returned, never raised
+                result = exc
+            with lock:
+                slots[index] = result
+                remaining[0] -= 1
+                if remaining[0] == 0:
+                    finished.set()
+
+    for _ in range(max(1, min(max_workers, len(items)))):
+        threading.Thread(target=worker, daemon=True).start()
+
+    finished.wait(timeout)
+    with lock:
+        snapshot = list(slots)
+    done = [(items[i], value) for i, value in enumerate(snapshot)
+            if value is not _UNFINISHED]
+    unfinished = [items[i] for i, value in enumerate(snapshot)
+                  if value is _UNFINISHED]
+    return done, unfinished
 
 
 # ── TTL cache ────────────────────────────────────────────────────────────

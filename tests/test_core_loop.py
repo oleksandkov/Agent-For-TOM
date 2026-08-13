@@ -24,13 +24,15 @@ from core.events import (
     ContinuationNeeded,
     ErrorOccurred,
     LoopDetected,
+    RetryScheduled,
     TextDelta,
     ToolFinished,
+    ToolResultTruncated,
     ToolStarted,
     TruncatedOutputDiscarded,
     TurnFinished,
 )
-from core.loop import detect_loop, run_turn
+from core.loop import clip_result, detect_loop, run_turn
 from core.permissions import ApprovalStore, AutoApprove, DenyAll
 from core.state import AgentState
 
@@ -418,6 +420,63 @@ class TestToolFailureIsContained(unittest.TestCase):
         self.assertFalse(finished.ok)
         self.assertIn("disk on fire", finished.result)
 
+    def test_returned_error_string_is_not_a_success(self):
+        """Handlers signal soft failure by *returning* "Error: ...", never by
+        raising. Scoring `ok` on "did not raise" made 116/116 tool calls in
+        the 20260811 sweep report OK while four were command timeouts and one
+        was an unreachable MCP server."""
+        state = make_state(stub_client(
+            FakeResponse([tool_block()], "tool_use"),
+            FakeResponse([text_block("done")], "end_turn"),
+        ), execute_tool=lambda n, a: "Error: command timed out after 120s")
+        adapter = TestAdapter()
+
+        adapter.run(state, "go")
+        self.assertFalse(adapter.of(ToolFinished)[0].ok)
+
+    def test_failed_tool_result_is_flagged_to_the_model(self):
+        """Without is_error the model has to infer failure from prose."""
+        messages: list = []
+        state = make_state(stub_client(
+            FakeResponse([tool_block()], "tool_use"),
+            FakeResponse([text_block("done")], "end_turn"),
+        ), messages=messages,
+           execute_tool=lambda n, a: "Error: no MCP servers are connected.")
+        TestAdapter().run(state, "go")
+
+        results = [b for m in messages if isinstance(m.get("content"), list)
+                   for b in m["content"]
+                   if isinstance(b, dict) and b.get("type") == "tool_result"]
+        self.assertTrue(results, "no tool_result block was recorded")
+        self.assertTrue(results[0].get("is_error"))
+
+    def test_successful_tool_result_carries_no_error_flag(self):
+        messages: list = []
+        state = make_state(stub_client(
+            FakeResponse([tool_block()], "tool_use"),
+            FakeResponse([text_block("done")], "end_turn"),
+        ), messages=messages, execute_tool=lambda n, a: "[exit 0 — ok]\nhello")
+        TestAdapter().run(state, "go")
+
+        results = [b for m in messages if isinstance(m.get("content"), list)
+                   for b in m["content"]
+                   if isinstance(b, dict) and b.get("type") == "tool_result"]
+        self.assertTrue(results)
+        self.assertNotIn("is_error", results[0])
+
+    def test_file_content_beginning_with_error_is_not_a_failure(self):
+        """read_file prefixes every line with a number, so a log file whose
+        first line reads "Error: ..." cannot be mistaken for a failed call."""
+        body = "     1\tError: something inside a log file\n"
+        state = make_state(stub_client(
+            FakeResponse([tool_block()], "tool_use"),
+            FakeResponse([text_block("done")], "end_turn"),
+        ), execute_tool=lambda n, a: body)
+        adapter = TestAdapter()
+
+        adapter.run(state, "go")
+        self.assertTrue(adapter.of(ToolFinished)[0].ok)
+
 
 class TestUsageAccounting(unittest.TestCase):
     def test_totals_accumulate_across_calls(self):
@@ -797,6 +856,278 @@ class TestToolHandlingConvergesOnOnePath(unittest.TestCase):
         self.assertEqual(reply, "done")
         self.assertTrue(adapter.of(ToolStarted), "tools must still run")
         self.assertTrue(adapter.of(ToolFinished))
+
+
+#: The exact body that ended a live session: a thinking-mode DeepSeek behind
+#: Zen, refusing a conversation that arrived without the reasoning it had
+#: produced. The user saw this JSON verbatim, prefixed with "An unexpected
+#: error occurred", and nothing telling them what to do about it.
+ZEN_REASONING_400 = RuntimeError(
+    'HTTP 400 from https://opencode.ai/zen/v1/chat/completions: '
+    '{"error":{"param":null,"type":"invalid_request_error",'
+    '"code":"invalid_request_error","message":"Error from provider (Console): '
+    'Upstream request failed: [invalid_request_error] The `reasoning_content` '
+    'in the thinking mode must be passed back to the API."}}')
+
+
+class TestClientErrorsAreDiagnosed(PathParity):
+    """A 4xx must be named, whichever way the call was made.
+
+    Client errors were diagnosed only inside the `anthropic.InternalServerError`
+    branch — which the in-process adapter never raises. It reports a rejected
+    request as a plain RuntimeError carrying the upstream's JSON, so on every
+    OpenAI-wire provider the diagnosis was skipped and the body was dumped raw.
+
+    Nothing here asserts a retry: a 4xx is fatal to the turn before and after
+    this change, because the retry would send the identical payload.
+    """
+
+    def both_failing(self, err):
+        """Drive one failing turn down each path. Yields (state, adapter)."""
+        for streaming in (False, True):
+            with self.subTest(path="streamed" if streaming else "non-streamed"):
+                client = MagicMock()
+                client.messages.create.side_effect = err
+                client.messages.stream.side_effect = err
+                state = AgentState(
+                    system_prompt="sys", messages=[], get_client=lambda: client,
+                    get_model=lambda: "test-model", streaming_enabled=streaming,
+                    execute_tool=lambda n, a: "ok", responder=AutoApprove())
+                adapter = TestAdapter()
+                adapter.run(state, "go")
+                yield state, adapter
+
+    def test_a_rejected_request_is_never_reported_as_unexpected(self):
+        for state, adapter in self.both_failing(ZEN_REASONING_400):
+            messages = [e.message for e in adapter.of(ErrorOccurred)]
+            self.assertTrue(messages, "the failure must be reported at all")
+            self.assertFalse(
+                any("An unexpected error occurred" in m for m in messages),
+                f"a 400 is a known outcome, not a surprise: {messages}")
+
+    def test_the_thinking_mode_rejection_says_what_to_do(self):
+        for state, adapter in self.both_failing(ZEN_REASONING_400):
+            final = adapter.of(ErrorOccurred)[-1].message
+            self.assertIn("thinking mode", final)
+            self.assertIn("/model", final, "the user needs an action, not a name")
+
+    def test_the_upstream_sentence_survives_the_excerpt(self):
+        """The adapter prints `message` and never `detail`, and a head-only
+        excerpt of this body is all JSON preamble — the words that identify
+        the problem are the last ones."""
+        for state, adapter in self.both_failing(ZEN_REASONING_400):
+            final = adapter.of(ErrorOccurred)[-1].message
+            self.assertIn("reasoning_content", final)
+
+    def test_the_reason_reaches_the_session_file(self):
+        for state, adapter in self.both_failing(ZEN_REASONING_400):
+            self.assertIn("400", state.last_error or "")
+
+    def test_a_refused_key_is_not_described_as_an_oversized_payload(self):
+        err = RuntimeError('HTTP 401 from https://api.example/v1/chat/completions: '
+                           '{"error":{"message":"Missing Authentication header"}}')
+        for state, adapter in self.both_failing(err):
+            final = adapter.of(ErrorOccurred)[-1].message
+            self.assertIn("/provider", final)
+            self.assertNotIn("/compact", final)
+
+    def test_a_retryable_body_keeps_the_retry_it_had(self):
+        """`is_retryable_error` wins over `is_client_error` here exactly as it
+        already does in the SDK branch. Asserted so that tightening the
+        diagnosis never quietly converts a transient failure into a fatal one."""
+        err = RuntimeError("HTTP 400: upstream timeout while routing")
+        for state, adapter in self.both_failing(err):
+            self.assertTrue(adapter.of(RetryScheduled),
+                            "a body naming a timeout must still be retried")
+
+
+class TestTheCacheHookRunsBeforeEveryCall(PathParity):
+    """Prompt-cache breakpoints must be re-cut against the history that exists
+    *now*, not the history that existed when the turn started.
+
+    The host was asked once per user turn. A turn that makes 29 tool calls then
+    appends 58 messages behind marks placed before any of them existed, so the
+    fastest-growing part of the transcript was the part that never got cached —
+    the case `mark_history_for_caching` itself names as needing it most.
+    """
+
+    def test_the_hook_fires_before_the_model_call_either_way(self):
+        for streaming in (False, True):
+            with self.subTest(path="streamed" if streaming else "non-streamed"):
+                seen = []
+                client = (streaming_client("hi", "end_turn") if streaming
+                          else stub_client(FakeResponse([text_block("hi")], "end_turn")))
+                state = AgentState(
+                    system_prompt="sys", messages=[], get_client=lambda: client,
+                    get_model=lambda: "test-model", streaming_enabled=streaming,
+                    execute_tool=lambda n, a: "ok", responder=AutoApprove(),
+                    before_model_call=lambda msgs: seen.append(len(msgs)))
+                TestAdapter().run(state, "go")
+                self.assertTrue(seen, "the host never got a chance to re-mark")
+
+    def test_it_is_called_again_for_each_step_of_a_tool_turn(self):
+        """One call per turn was the bug. Three model calls means three
+        chances to move the breakpoint forward."""
+        client = stub_client(
+            FakeResponse([tool_block(id="tu_1")], "tool_use"),
+            FakeResponse([tool_block(id="tu_2", name="read_file")], "tool_use"),
+            FakeResponse([text_block("done")], "end_turn"))
+        seen = []
+        state = make_state(client,
+                           before_model_call=lambda msgs: seen.append(len(msgs)))
+        TestAdapter().run(state, "go")
+        self.assertEqual(len(seen), 3, f"one hook call per model call: {seen}")
+
+    def test_the_hook_sees_the_history_that_has_grown(self):
+        """It is handed the live list, so a breakpoint it places lands on the
+        tool results this turn just produced."""
+        client = stub_client(
+            FakeResponse([tool_block()], "tool_use"),
+            FakeResponse([text_block("done")], "end_turn"))
+        seen = []
+        state = make_state(client,
+                           before_model_call=lambda msgs: seen.append(len(msgs)))
+        TestAdapter().run(state, "go")
+        self.assertLess(seen[0], seen[-1],
+                        "the second call must see the tool round-trip appended")
+
+    def test_a_hook_that_raises_cannot_kill_the_turn(self):
+        """It runs before every request in the session. A caching hint that can
+        end a turn is worse than no caching at all."""
+        def explode(msgs):
+            raise RuntimeError("breakpoint maths went wrong")
+
+        for reply, state, adapter in self.both("all done", "end_turn"):
+            pass  # baseline: both paths reply normally
+        client = stub_client(FakeResponse([text_block("all done")], "end_turn"))
+        state = make_state(client, before_model_call=explode)
+        self.assertEqual(TestAdapter().run(state, "go"), "all done")
+
+    def test_no_hook_is_a_supported_configuration(self):
+        # Front ends that do not care about caching must not have to supply one.
+        state = make_state(stub_client(
+            FakeResponse([text_block("fine")], "end_turn")))
+        self.assertIsNone(state.before_model_call)
+        self.assertEqual(TestAdapter().run(state, "go"), "fine")
+
+
+class TestCachedInputIsAccounted(unittest.TestCase):
+    """What the provider served from cache is reported, never subtracted.
+
+    Folding it into the total would make a well-cached turn look cheap and hide
+    the number worth watching: how much is still being re-sent at full price.
+    """
+
+    @staticmethod
+    def _usage(input_tokens, cached):
+        return MagicMock(input_tokens=input_tokens, output_tokens=5,
+                         cached_input_tokens=cached)
+
+    def test_the_cached_share_is_recorded(self):
+        response = FakeResponse([text_block("hi")], "end_turn")
+        response.usage = self._usage(1000, 900)
+        state = make_state(stub_client(response))
+        TestAdapter().run(state, "go")
+        self.assertEqual(state.usage["input"], 1000)
+        self.assertEqual(state.usage["cached_input"], 900)
+
+    def test_it_accumulates_across_the_turn(self):
+        first = FakeResponse([tool_block()], "tool_use")
+        first.usage = self._usage(1000, 400)
+        second = FakeResponse([text_block("done")], "end_turn")
+        second.usage = self._usage(1200, 1100)
+        state = make_state(stub_client(first, second))
+        TestAdapter().run(state, "go")
+        self.assertEqual(state.usage["total_input"], 2200)
+        self.assertEqual(state.usage["total_cached_input"], 1500)
+
+    def test_the_anthropic_sdk_spelling_is_read_too(self):
+        """The native SDK says `cache_read_input_tokens`, and Anthropic is the
+        one provider where the agent places the breakpoints itself — so this is
+        the path whose caching most needs to be measurable."""
+        response = FakeResponse([text_block("hi")], "end_turn")
+        response.usage = MagicMock(input_tokens=1000, output_tokens=5,
+                                   cache_read_input_tokens=880)
+        del response.usage.cached_input_tokens
+        state = make_state(stub_client(response))
+        TestAdapter().run(state, "go")
+        self.assertEqual(state.usage["cached_input"], 880)
+
+    def test_a_provider_that_says_nothing_reports_zero(self):
+        """A counter that is summed and rendered with `:,` must never hold a
+        non-number, whatever shape of usage object turns up."""
+        response = FakeResponse([text_block("hi")], "end_turn")
+        response.usage = MagicMock(input_tokens=10, output_tokens=5)
+        del response.usage.cached_input_tokens
+        del response.usage.cache_read_input_tokens
+        state = make_state(stub_client(response))
+        TestAdapter().run(state, "go")
+        self.assertEqual(state.usage["cached_input"], 0)
+        self.assertGreater(state.usage["input"], 0)
+
+    def test_a_nonsense_usage_field_becomes_zero(self):
+        response = FakeResponse([text_block("hi")], "end_turn")
+        response.usage = MagicMock(input_tokens=10, output_tokens=5,
+                                   cached_input_tokens="lots")
+        state = make_state(stub_client(response))
+        TestAdapter().run(state, "go")
+        self.assertEqual(state.usage["cached_input"], 0)
+
+
+class TestClippedResultsKeepTheirTail(unittest.TestCase):
+    """Head-only clipping dropped the half that carries the diagnosis.
+
+    A failing command's exit line, a traceback's exception, a test runner's
+    failure count: all at the end. The model was handed the banner and none of
+    the error, and then reported the tool as having produced nothing useful.
+    """
+
+    def test_a_short_result_is_returned_untouched(self):
+        self.assertEqual(clip_result("small", 100), "small")
+
+    def test_both_ends_survive(self):
+        text = "HEAD" + ("x" * 5000) + "TAIL"
+        clipped = clip_result(text, 1000)
+        self.assertTrue(clipped.startswith("HEAD"))
+        self.assertTrue(clipped.endswith("TAIL"))
+
+    def test_the_budget_is_unchanged(self):
+        """Same characters of content as head-only clipping kept, just taken
+        from both ends — this is not a licence to carry more context."""
+        clipped = clip_result("y" * 9000, 1000)
+        self.assertEqual(sum(c == "y" for c in clipped), 1000,
+                         "exactly the limit survives, from both ends")
+        self.assertLessEqual(len(clipped) - 1000, 200,
+                             "the marker is the only overhead")
+
+    def test_the_gap_is_named_so_the_model_can_re_run(self):
+        clipped = clip_result("z" * 9000, 1000)
+        self.assertIn("cut from the middle", clipped)
+        self.assertIn("9,000", clipped)
+
+    def test_a_limit_too_small_to_split_behaves_as_before(self):
+        clipped = clip_result("q" * 500, 2)
+        self.assertTrue(clipped.startswith("qq"))
+        self.assertIn("truncated", clipped)
+
+    def test_the_turn_clips_with_it(self):
+        """The wiring, not just the helper: a tool returning more than the
+        ceiling must reach the model with its tail intact."""
+        client = stub_client(
+            FakeResponse([tool_block()], "tool_use"),
+            FakeResponse([text_block("done")], "end_turn"))
+        state = make_state(
+            client,
+            execute_tool=lambda n, a: "START" + ("m" * 40_000) + "FINISH",
+            max_result_chars=2_000)
+        adapter = TestAdapter()
+        adapter.run(state, "run it")
+
+        self.assertTrue(adapter.of(ToolResultTruncated))
+        sent = state.messages[2]["content"][0]["content"]
+        self.assertTrue(sent.startswith("START"))
+        self.assertTrue(sent.endswith("FINISH"),
+                        "the tail is where a failing tool says why")
 
 
 class TestTheStreamingCallReportsRatherThanDecides(unittest.TestCase):

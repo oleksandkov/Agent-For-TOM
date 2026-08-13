@@ -325,8 +325,12 @@ def check_sessions(r: Results) -> None:
         path.unlink(missing_ok=True)
 
     agent.reset_session_state()
+    # Every counter is zero, rather than one hardcoded set of keys: the check
+    # is about the session boundary, and pinning the key set turned adding a
+    # cache-hit counter into a false isolation failure.
     r.check(s, "token usage resets per session",
-            agent._session_tokens == {"input": 0, "output": 0, "calls": 0},
+            bool(agent._session_tokens)
+            and all(v == 0 for v in agent._session_tokens.values()),
             str(agent._session_tokens))
 
 

@@ -147,10 +147,27 @@ def test_mcp_connections(max_workers: int = 8) -> dict[str, dict]:
     if pending:
         # stderr is redirected around the whole fan-out: the worker threads
         # write their connection noise through the same process-wide stream.
+        #
+        # `net_probe.fan_out` rather than a pool, because this runs on a
+        # background thread while a menu is drawn and the user may quit at any
+        # moment. A `ThreadPoolExecutor`'s workers are non-daemon and joined by
+        # an atexit hook, so quitting after opening the MCP page waited for
+        # every outstanding handshake with nothing on screen to say why —
+        # measured at 6.2 s of silent delay after main had returned, and that
+        # is with servers that answer.
+        import net_probe
         with redirect_stderr(io.StringIO()):
-            with ThreadPoolExecutor(max_workers=min(max_workers, len(pending))) as pool:
-                for name, row in pool.map(probe, pending):
-                    results[name] = row
+            completed, unfinished = net_probe.fan_out(
+                probe, pending, max_workers=max_workers)
+        for _item, row in completed:
+            if isinstance(row, Exception):
+                continue
+            name, data = row
+            results[name] = data
+        for name, _cfg in unfinished:
+            results[name] = {"connected": False, "disabled": False,
+                             "tool_count": 0,
+                             "error": "still connecting — try Refresh"}
 
     return results
 
@@ -529,8 +546,16 @@ class MCPManager:
                 None if ok else (server._last_error or "unknown error"))
 
         if parallel and len(entries) > 1:
-            with ThreadPoolExecutor(max_workers=min(max_workers, len(entries))) as pool:
-                results = list(pool.map(attempt, entries))
+            # Daemon threads for the same reason `test_mcp_connections` uses
+            # them: this runs at startup, and a server that never answers must
+            # cost the connect budget once, not again at exit.
+            import net_probe
+            completed, unfinished = net_probe.fan_out(
+                attempt, entries, max_workers=max_workers)
+            results = [row for _item, row in completed
+                       if not isinstance(row, Exception)]
+            results += [(name, None, "timed out while connecting")
+                        for name, _cfg in unfinished]
         else:
             results = [attempt(e) for e in entries]
 

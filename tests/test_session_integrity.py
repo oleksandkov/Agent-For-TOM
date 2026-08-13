@@ -117,6 +117,70 @@ class TestIncompleteSessionMarked(SessionFileTestCase):
         self.assertIsNotNone(loaded)
 
 
+class TestTelemetryReachesDisk(SessionFileTestCase):
+    """`session_data` lists its keys explicitly, so anything session_telemetry()
+    grows is silently dropped unless it is added here too.
+
+    context_events was produced correctly for the whole V3/V4 work and never
+    written, which made compaction unobservable in exactly the reports it was
+    added for. These tests assert against the *file*, not against
+    session_telemetry(), because that is the gap the earlier tests missed.
+    """
+
+    def test_context_events_are_written(self):
+        data = self.save(
+            [turn("user", "a"), turn("assistant", "b")],
+            telemetry={"turn_metrics": {}, "tool_log": [], "failed_turns": [],
+                       "context_events": [{"turn": 3, "strategy": "summary",
+                                           "before_tokens": 200_000,
+                                           "after_tokens": 40_000,
+                                           "reclaimed_tokens": 160_000}]})
+        self.assertIn("context_events", data)
+        self.assertEqual(data["context_events"][0]["reclaimed_tokens"], 160_000)
+
+    def test_failed_turns_are_kept_on_a_complete_session(self):
+        """They used to live only inside incomplete_reason, so a session that
+        ended complete threw away the record of turns that produced nothing."""
+        data = self.save([turn("user", "a"), turn("assistant", "b")])
+        self.assertIn("failed_turns", data)
+        self.assertEqual(data["failed_turns"], [])
+
+    def test_low_content_turns_are_written(self):
+        data = self.save(
+            [turn("user", "a"), turn("assistant", "b")],
+            telemetry={"turn_metrics": {}, "tool_log": [], "failed_turns": [],
+                       "low_content_turns": [{"turn": 2, "reply_chars": 8,
+                                              "reply": "My Lord."}]})
+        self.assertEqual(data["low_content_turns"][0]["reply"], "My Lord.")
+
+    def test_a_heuristic_flag_does_not_make_a_session_incomplete(self):
+        """low_content_turns reports, it does not judge — a false positive
+        must not be able to mark good work as unfinished."""
+        data = self.save(
+            [turn("user", "a"), turn("assistant", "b")],
+            telemetry={"turn_metrics": {}, "tool_log": [], "failed_turns": [],
+                       "low_content_turns": [{"turn": 1, "reply_chars": 5,
+                                              "reply": "Done."}]})
+        self.assertTrue(data["complete"])
+
+    def test_missing_keys_default_rather_than_raise(self):
+        """Old telemetry dicts (and any front end that builds its own) must
+        still save."""
+        data = self.save([turn("user", "a"), turn("assistant", "b")],
+                         telemetry={})
+        self.assertEqual(data["context_events"], [])
+        self.assertEqual(data["low_content_turns"], [])
+
+    def test_live_telemetry_supplies_every_saved_key(self):
+        """Guards the other direction: session_telemetry() must not stop
+        producing a key that save_session writes."""
+        import agent
+        telemetry = agent.session_telemetry()
+        for key in ("turn_metrics", "tool_log", "failed_turns",
+                    "context_events", "low_content_turns"):
+            self.assertIn(key, telemetry)
+
+
 class TestTelemetry(SessionFileTestCase):
 
     def test_tool_log_roundtrip(self):
@@ -180,7 +244,12 @@ class TestSessionTokenIsolation(unittest.TestCase):
         second = dict(agent._session_tokens)
 
         self.assertNotEqual(first, second)
-        self.assertEqual(second, {"input": 0, "output": 0, "calls": 0})
+        # Every counter, not one named list of them: asserting the exact key
+        # set made adding a cache-hit counter look like a session-isolation
+        # regression, which is the opposite of what this test is guarding.
+        self.assertTrue(second, "the counters must still exist after a reset")
+        self.assertEqual([k for k, v in second.items() if v != 0], [],
+                         f"a counter survived the session boundary: {second}")
 
     def test_reset_clears_telemetry(self):
         agent.reset_session_state()

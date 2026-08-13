@@ -134,6 +134,20 @@ class TruncatedOutputDiscarded(AgentEvent):
 
 
 @dataclass
+class ToolCallsRecovered(AgentEvent):
+    """The model wrote its tool call as text and the core lifted it back out.
+
+    Adapters SHOULD render this, quietly. It is the difference between a model
+    that works and a model that works *by exception*: a session full of these
+    is a session where the model never once used the tool-call channel, which
+    is worth seeing before it is blamed on the agent. It also tells the user
+    why a tool is about to run when nothing on screen appeared to ask for one.
+    """
+    names: list[str]
+    streamed: bool = False
+
+
+@dataclass
 class ContextCompacted(AgentEvent):
     before_tokens: int
     after_tokens: int
