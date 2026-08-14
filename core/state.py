@@ -174,6 +174,14 @@ class AgentState:
     # Set by the streaming path so the caller can treat truncation the same
     # way it does on the non-streamed one.
     last_stop_reason: Optional[str] = None
+    # A thinking model's chain-of-thought from the last streamed call, if any.
+    # Some upstreams (DeepSeek via Zen) reject the *next* request unless an
+    # assistant turn that reasoned carries this back — see `_reasoning_of` and
+    # `_stream_call` in `core/loop.py`. The streamed path only ever returns
+    # joined text, so without somewhere to report this the reasoning had no
+    # way to reach the assistant message `run_turn` saves for a plain-text
+    # reply, and every following request in the conversation was refused.
+    last_reasoning: str = ""
     # What ended the turn, when something did. Without this a turn that died
     # on a 429 was saved as "empty_reply" with no reason attached, which is
     # exactly the unreadable record P6-11 exists to prevent.

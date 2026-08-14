@@ -124,16 +124,23 @@ class Capabilities:
     vision: bool = False
     context_window: int = 200_000  # standard Claude tier; probing narrows this per-model
     max_tools: int = 128
-    # 8192, not 4096. Nothing probes this field — grep it — so the default is
-    # the value every provider actually runs with, and `agent.py` applies it as
-    # `min(MAX_TOKENS, max_output_tokens)`, i.e. a hard ceiling. A pessimistic
-    # unmeasured guess therefore capped *every* provider at 4096 output tokens
-    # forever, which breaks reasoning models outright: they spend the budget on
-    # internal reasoning, get truncated before emitting any content or tool
-    # call, and the turn comes back empty. That is this class's documented
-    # contract violated by its own default — "defaults are the optimistic case;
-    # probing only ever narrows them".
-    max_output_tokens: int = 8192
+    # 32768, not 8192. Nothing probes this field — grep it — so the default is
+    # what every provider actually runs with, and `agent.py` applies it as
+    # `min(reserve, max_output_tokens)`, i.e. a hard ceiling ahead of whatever
+    # the context budget would otherwise grant. It was 4096, then 8192 (that
+    # change is the comment this replaced): a pessimistic unmeasured guess
+    # capped every provider before a reasoning model got a chance to answer —
+    # it spends the budget on internal reasoning, gets truncated before
+    # emitting content, and the turn comes back empty or is billed twice via
+    # `_escalate`'s retry. 8192 was itself still that same mistake at a
+    # smaller scale: every OpenCode Zen free-tier session in a `deepseek`
+    # sweep hit "No reply within 8192 output tokens" and needed the escalation
+    # round-trip to reach 32768 — a number `_escalate` was already trusting as
+    # safe for these providers before this default did. `core.loop`'s
+    # `MAX_OUTPUT_CEILING` moved to 65536 alongside this so escalation still
+    # has somewhere to go — measured live, deepseek-v4-flash-free accepts
+    # max_tokens up to at least that.
+    max_output_tokens: int = 32_768
     probed_at: float = 0.0
 
     @property

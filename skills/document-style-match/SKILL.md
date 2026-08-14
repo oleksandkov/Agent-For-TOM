@@ -3,145 +3,144 @@ name: document-style-match
 description: Reproduce an example document's exact layout and text formatting when the user provides a PDF or DOCX file as a sample and asks for a similar document with new content.
 triggers: ["зроби схожий", "схожий файл", "схожий", "подібний файл", "подібний", "такий же", "збережи форматування", "зберегти форматування", "зберіг форматування", "форматування тексту", "форматування", "таке саме форматування", "як приклад", "візьми як приклад", "проаналізуй файл", "проаналізуй", "по типу", "як цей", "як у прикладі", "за зразком", "на основі", "шаблон", "зразок", "приклад", "методичні вказівки", "методичка", "like this", "same style", "match formatting", "preserve formatting", "document template", "as an example"]
 source: bundled
-version: 4
+version: 9
 ---
 
-# Matching an Example Document (PDF / DOCX)
+# Matching an Example Document
 
-Used when the user provides a sample document (PDF/DOCX) and asks to reproduce its exact visual formatting (e.g. "зроби схожий файл", "збережи форматування", "як приклад", "same style as this file") with new content.
+Content changes, formatting does not: page size, margins, fonts, sizes,
+alignment, spacing numerically identical to the sample — "looks about
+right" is not the bar. This skill ships scripts next to this file so the
+numbers come from one canonical, tested measurement, not one re-derived
+each session: `analyze_pdf.py`/`analyze_docx.py`, `verify_docx.py`/
+`verify_pdf.py`, `template_generate.py` (reference patterns).
 
-## The Rule: Do Not Build Piecemeal
+Each measured a real failure this skill now catches: generic text read →
+US Letter instead of A4; left margin at the 2.5cm convention vs the
+sample's measured 2.35cm; a *correct* DOCX → PDF with an **invisible
+~0.5pt title** no DOCX-only check catches. Rules:
 
-**Do not construct the document via basic `add_paragraph` / `add_heading` calls.** They omit alignments and indentation, producing plain left-aligned text.
-Instead:
-1. Analyse the reference document via Python.
-2. Build the new document with **one Python script** (`python-docx`) using explicit formatting helpers.
-3. **Verify and compare** the generated document against reference metrics before finalizing.
+1. **Never read the sample with a generic file/text tool** — only Step 1.
+2. **Contract is a file, not a memory** — written/read/diffed in Steps 1/3/4.
+3. **Verify the rendered PDF, not just the DOCX.**
+4. **Step 1 ends at the contract; content research is bounded too.** One
+   session re-audited unrelated files, another re-researched the same names
+   25 times — neither ever reached Step 3. Verify a fact once, move on.
 
 ---
 
-## Step 1 — Analyze the Reference Document
+## Step 1 — Get the Contract
 
-Inspect structural properties using Python scripts via `run_command`:
+**If `<name>_style_contract.json` exists**, read it and skip to Step 2 — a
+prior run already paid this cost.
 
-### DOCX Analysis:
-```python
-import docx
-d = docx.Document(r"<sample.docx>")
-for i, p in enumerate(d.paragraphs):
-    if p.text.strip():
-        runs_info = [(r.text[:20], r.bold, r.italic) for r in p.runs[:3]]
-        print(f"P{i:02d} | align={p.alignment} | indent={p.paragraph_format.first_line_indent} | {runs_info} | {repr(p.text[:50])}")
+Otherwise, run the matching script from this skill's own directory:
 ```
-
-### PDF Analysis:
-```python
-import fitz  # PyMuPDF
-doc = fitz.open(r"<sample.pdf>")
-for i in range(min(len(doc), 3)):
-    p = doc[i]
-    fonts = { (s["font"], round(s["size"], 1)) for b in p.get_text("dict")["blocks"] for l in b.get("lines", []) for s in l.get("spans", []) if s["text"].strip() }
-    print(f"Page {i+1} rect={p.rect} fonts={fonts}")
+python skills/document-style-match/analyze_pdf.py "<sample.pdf>" "<name>_style_contract.json"
 ```
+or, for a DOCX sample:
+```
+python skills/document-style-match/analyze_docx.py "<sample.docx>" "<name>_style_contract.json"
+```
+Read the printed JSON: page size, body/title font+size, left/right margins
+(mode, not min/max — see each docstring). DOCX *also* measures
+indent/line-spacing/heading-space exactly; PDF can't (tested: inferring
+spacing from glyph positions gave a different wrong "rule" per heading —
+Word merges adjacent spacing by *max*, not sum). PDF top/bottom margins and
+all spacing stay convention — **say so in Step 5.** Then stop — rule 4.
+
+## Step 2 — State the Contract
+
+One line: `Contract: A4 21.0×29.7cm, Times New Roman, body 14pt, title
+20pt, margins 2.35/2.1/2.0/2.0cm.`
 
 ---
 
-## Step 2 — State the Style Contract
+## Step 3 — Generate
 
-Document the extracted rules:
-- **Font & size**: e.g., Times New Roman 14 pt (Body), 14 pt Bold (Headings).
-- **Margins**: Top/Bottom 2.0 cm, Left 2.5–3.0 cm, Right 1.5 cm.
-- **Body**: Justified (`A.JUSTIFY`), first-line indent 1.25 cm (`Cm(1.25)`), line spacing 1.15.
-- **Headings & Titles**: Centered (`A.CENTER`), Bold, spacing before/after.
-- **Lists / Numbering**: `List Number` or indented paragraphs with bold lead labels.
-
----
-
-## Step 3 — Generate in One Script
-
-Write a single script with formatting helpers and run it via `run_command`:
+**Several tool calls instead of one script is how alignment/indent end up
+on some paragraphs and not others — measured.** Every content string below
+is illustrative: replace all of them.
 
 ```python
-import docx
+import docx, json
 from docx.enum.text import WD_ALIGN_PARAGRAPH as A
 from docx.shared import Pt, Cm
 
-OUT = r"<output.docx>"
-FONT_NAME, BASE_SIZE = "Times New Roman", Pt(14)
+c = json.load(open(r"<name>_style_contract.json"))
+FONT = c.get("body_font") or "Times New Roman"
+BODY, TITLE = Pt(c["body_size_pt"] or 14), Pt(c["title_size_pt"] or 20)
+INDENT, LS = Cm(c.get("body_indent_cm", 1.25)), c.get("line_spacing", 1.15)
+HSB, HSA = Pt(c.get("heading_space_before_pt", 0)), Pt(c.get("heading_space_after_pt", 4))
 
 doc = docx.Document()
-doc.styles["Normal"].font.name = FONT_NAME
-doc.styles["Normal"].font.size = BASE_SIZE
+doc.styles["Normal"].font.name, doc.styles["Normal"].font.size = FONT, BODY
+m = c.get("margins_cm", {})
+for sec in doc.sections:
+    sec.page_width, sec.page_height = Cm(c["page_width_cm"]), Cm(c["page_height_cm"])
+    sec.top_margin, sec.bottom_margin = Cm(m.get("top_margin", 2.0)), Cm(m.get("bottom_margin", 2.0))
+    sec.left_margin, sec.right_margin = Cm(m.get("left_margin", 2.5)), Cm(m.get("right_margin", 1.5))
 
-for section in doc.sections:
-    section.top_margin, section.bottom_margin = Cm(2.0), Cm(2.0)
-    section.left_margin, section.right_margin = Cm(2.5), Cm(1.5)
-
-def para(text="", *, align=A.JUSTIFY, bold=False, italic=False, indent=None, style=None, space_after=Pt(2), space_before=Pt(0)):
+def para(text="", *, align=A.JUSTIFY, bold=False, indent=None, style=None, size=None, sb=Pt(0), sa=Pt(2)):
     p = doc.add_paragraph(style=style)
-    p.alignment = align
-    p.paragraph_format.line_spacing = 1.15
-    p.paragraph_format.space_before, p.paragraph_format.space_after = space_before, space_after
+    p.alignment, p.paragraph_format.line_spacing = align, LS
+    p.paragraph_format.space_before, p.paragraph_format.space_after = sb, sa
     if indent is not None:
         p.paragraph_format.first_line_indent = indent
     if text:
-        r = p.add_run(text)
-        r.bold, r.italic = bold, italic
-        r.font.name, r.font.size = FONT_NAME, BASE_SIZE
+        r = p.add_run(text); r.bold = bold; r.font.name, r.font.size = FONT, (size or BODY)
     return p
 
-body   = lambda t: para(t, align=A.JUSTIFY, indent=Cm(1.25))
-centre = lambda t, bold=True: para(t, align=A.CENTER, bold=bold, space_before=Pt(4), space_after=Pt(4))
-item   = lambda t: para(t, align=A.JUSTIFY, style="List Number")
+body   = lambda t: para(t, indent=INDENT)
+centre = lambda t, size=None: para(t, align=A.CENTER, bold=True, size=size, sb=HSB, sa=HSA)
+item   = lambda t: para(t, style="List Number")  # ONE list — 2nd list below
 
-def lead(label, rest, indent=Cm(1.25)):
-    p = para(align=A.JUSTIFY, indent=indent)
-    r1 = p.add_run(label); r1.bold = True; r1.font.name, r1.font.size = FONT_NAME, BASE_SIZE
-    r2 = p.add_run(rest); r2.font.name, r2.font.size = FONT_NAME, BASE_SIZE
+def lead(label, rest, indent=None):  # "Мета роботи - текст" ONE line, not a heading
+    p = para(align=A.JUSTIFY, indent=indent or INDENT)
+    r1 = p.add_run(label); r1.bold = True; r1.font.name, r1.font.size = FONT, BODY
+    r2 = p.add_run(rest); r2.font.name, r2.font.size = FONT, BODY
     return p
 
-# Content assembly
-centre("НАЗВА ДОКУМЕНТА", bold=True)
-body("Вступний текст із відступом 1.25 см та вирівнюванням по ширині.")
-lead("Мета роботи: ", "опис мети...")
-centre("Завдання")
-item("Пункт перший")
-item("Пункт другий")
-
-doc.save(OUT)
-print("Saved:", OUT)
+centre("<ACTUAL TITLE — replace this>", size=TITLE)
+lead("<label, e.g. Мета роботи> - ", "<same line, not a new paragraph>")
+body("<actual body text — replace this>")
+doc.save(r"<output.docx>")
 ```
+**2nd numbered list or a table?** Plain `item()` continues numbering
+instead of restarting at 1 (measured: rendered 4,5,6) — read
+`template_generate.py` (same folder) for tested `new_list()`/`table()`.
+
+**`centre` vs `lead` — check the sample, don't assume.** Skipping this once
+rendered `"Мета роботи"` as a heading with the description on the next
+paragraph; the sample has it bold, inline, one line. True headings
+("Загальні відомості", "Контрольні запитання", "Завдання", "Література")
+are centered/standalone; a label + its own text on one line is `lead`.
 
 ---
 
-## Step 4 — Verification and Comparison (Mandatory)
+## Step 4 — Verify
 
-Run an inspection script to compare generated output against the contract:
+Run both scripts before reporting done; on failure, fix Step 3, re-run, up
+to 3 attempts, then report exactly what's wrong, not success.
 
-```python
-import docx
-from docx.enum.text import WD_ALIGN_PARAGRAPH as A
-
-d = docx.Document(r"<output.docx>")
-stats = {
-    "total": len(d.paragraphs),
-    "centred": sum(1 for p in d.paragraphs if p.alignment == A.CENTER),
-    "justified": sum(1 for p in d.paragraphs if p.alignment == A.JUSTIFY),
-    "indented": sum(1 for p in d.paragraphs if p.paragraph_format.first_line_indent),
-    "lists": sum(1 for p in d.paragraphs if p.style.name.startswith("List")),
-    "tables": len(d.tables),
-}
-print("VERIFICATION:", stats)
-assert stats["total"] > 0 and stats["centred"] > 0 and stats["justified"] > 0 and stats["indented"] > 0, "Style check failed!"
+**4a — Diff the DOCX against the contract**, not a self-check (would pass
+the Letter-vs-A4 bug above):
+```
+python skills/document-style-match/verify_docx.py "<name>_style_contract.json" "<output.docx>"
 ```
 
-If PDF is requested, convert via `convert_to_pdf` (MCP `word-docs` or `docx2pdf`/LibreOffice).
+**4b — After `convert_to_pdf`, verify the PDF too**:
+```
+python skills/document-style-match/verify_pdf.py "<name>_style_contract.json" "<output.pdf>"
+```
+Confirm the file exists next to the DOCX (conversion can report success
+while writing elsewhere).
 
----
+**4c — Grep for `"<...>"` brackets** — Step 3's placeholder syntax, left
+over if not replaced.
 
 ## Step 5 — Reporting
 
-In your final reply:
-1. Provide paths to `.docx` (and `.pdf` if generated).
-2. Report verification metrics (centred, justified, indented counts, lists, tables).
-3. Confirm style parity with the sample document.
+State the contract used (Step 2's line), flag anything assumed, and confirm
+both verify scripts passed — not "looks similar". A referenced figure
+("Рис. 1") keeps its caption text — don't fabricate one.

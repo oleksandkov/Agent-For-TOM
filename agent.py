@@ -87,7 +87,8 @@ except ImportError:
 # MCP and skills support
 from mcp_manager import MCPManager
 from skills_manager import (build_skills_section, build_triggered_skills,
-                            discover_skills, cmd_skill_list, cmd_skill_run)
+                            discover_skills, cmd_skill_list, cmd_skill_run,
+                            match_skills)
 
 # Self-improving system
 import self_improve
@@ -1156,12 +1157,21 @@ DEFAULT_TEMPERATURE = 0.3
 #: Wall-clock ceiling for one turn, seconds. `AGENT_MAX_TURN_SECONDS=0` removes
 #: it.
 #:
-#: 15 minutes is chosen from measurement, not taste. Across the labwork sweep
-#: the slowest turn that *finished usefully* was 463 s; the two pathological
-#: ones were 1,986 s (89 tool calls on one instruction) and a 75-minute stall
-#: that produced nothing at all and had to be killed by hand. The ceiling sits
-#: well above real work and well below both failures.
-MAX_TURN_SECONDS = _env_int("AGENT_MAX_TURN_SECONDS", 900, minimum=0)
+#: 20 minutes, from measurement, not taste. Across the labwork sweep the
+#: slowest turn that *finished usefully* was 463 s; the two pathological ones
+#: were 1,986 s (89 tool calls on one instruction) and a 75-minute stall that
+#: produced nothing and had to be killed by hand. Raised from 900s after a
+#: third pathological run: `document-style-match`'s Step 1 (open-ended
+#: "analyze the sample") let a model re-measure margins and audit unrelated
+#: files' conventions for the full 900s and hit the ceiling having never
+#: reached Step 3 — the deadline was not generous, Step 1 had no exit
+#: condition. That gap is now closed in the skill itself (a stop rule once
+#: the four contract numbers are in hand) and the deadline now spends one
+#: bounded call trying to salvage something instead of returning nothing
+#: (`core.loop._deadline_wind_down`) — this bump is headroom for that salvage
+#: call and for legitimately larger documents, not a substitute for either
+#: fix. It still sits well below both pathological failures above.
+MAX_TURN_SECONDS = _env_int("AGENT_MAX_TURN_SECONDS", 1200, minimum=0)
 
 
 def effective_temperature() -> Optional[float]:
@@ -2887,6 +2897,12 @@ def execute_tool(name: str, params: dict) -> str:
     if handler:
         try:
             return handler(params)
+        except KeyError as e:
+            # A bare `Error: 'file_path'` (str(KeyError) is just the missing
+            # key) tells a model something is wrong but not what to send
+            # instead — measured live, a weaker model retried the identical
+            # empty tool call three times before the loop guard stopped it.
+            return f"Error: '{name}' is missing required argument {e}."
         except Exception as e:
             return f"Error: {e}"
     # Try MCP tool dispatch (with name mapping for renamed conflicting tools)
@@ -6725,6 +6741,14 @@ def main() -> int:
             messages = maybe_compact(messages)
             # Retrieve learned knowledge against what the user just asked.
             system_prompt = build_system_prompt(user_input)  # re-inject every turn
+            # An auto-triggered skill was, until now, invisible: its body
+            # went straight into the system prompt tail with nothing printed,
+            # so there was no way to tell from the chat whether one had fired
+            # at all. Same notice style as the explicit `/skill` path.
+            for _triggered_skill in match_skills(user_input):
+                print(f'  {YELLOW}⚡ Skill triggered:{RESET} '
+                      f'{BOLD}{_triggered_skill["name"]}{RESET} '
+                      f'{DIM}[auto-applied]{RESET}')
             # Re-check compaction with the actual system prompt size
             messages = maybe_compact(messages, system_prompt)
             result = agent_loop(system_prompt, messages)

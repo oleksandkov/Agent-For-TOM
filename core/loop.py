@@ -180,8 +180,13 @@ MAX_RETRY_DELAY = 60.0
 
 # Hard ceiling for the one automatic max_tokens escalation. High enough that a
 # reasoning model can think *and* write a real document; low enough that a
-# runaway cannot bill an unbounded completion.
-MAX_OUTPUT_CEILING = 32_768
+# runaway cannot bill an unbounded completion. Raised from 32,768 alongside
+# `provider_manager.Capabilities.max_output_tokens`'s default moving to that
+# same number: escalation needs somewhere to go *above* the new unprobed
+# default, or a model that still truncates at 32,768 has no retry left.
+# Measured live: deepseek-v4-flash-free accepts max_tokens up to at least
+# this.
+MAX_OUTPUT_CEILING = 65_536
 
 
 def backoff_delay(attempt: int, err: Optional[Exception] = None) -> float:
@@ -467,6 +472,39 @@ def _report_deadline(state: AgentState, partial: str) -> Iterator[AgentEvent]:
         detail=state.last_error, recoverable=True)
 
 
+def _deadline_wind_down(state: AgentState) -> Iterator[AgentEvent]:
+    """Out of time: spend one bounded call asking for whatever can be salvaged,
+    instead of returning nothing.
+
+    Checked between steps, so — unlike loop-detection's `_wind_down` — there
+    is no dangling `tool_use` to answer here; every prior one already has its
+    `tool_result` by the time this runs. Measured live: a session spent its
+    full 900s on Step-1 research (re-measuring margins, auditing unrelated
+    files' conventions) and was cut off having never reached the save call —
+    `_report_deadline` alone reported "produced nothing to keep" when one more
+    exchange could plausibly have gotten a file saved, or at least a summary
+    of exactly what's done and what's left. One extra call risks a few more
+    seconds past the deadline; the alternative is certain to have nothing.
+    """
+    state.messages.append({"role": "user", "content": [
+        {"type": "text",
+         "text": "Out of time for this turn. Stop researching — if a file "
+                 "was ready to save, save it now with what you have; "
+                 "otherwise say exactly what's done and what's left, in "
+                 "one short reply, no more tool calls."}
+    ]})
+    closing = yield from _model_call(state)
+    if closing is None:
+        return ""
+    text = "".join(b.text for b in closing.content if hasattr(b, "text"))
+    if text:
+        state.messages.append(
+            {"role": "assistant",
+             "content": _text_reply_content(text, _reasoning_of(closing.content))})
+        yield AssistantMessage(text)
+    return text
+
+
 def _sampling(state: AgentState) -> dict:
     """Sampling knobs for a model call, or `{}` to accept the provider default.
 
@@ -485,6 +523,36 @@ def _sampling(state: AgentState) -> dict:
     return {"temperature": state.temperature}
 
 
+def _reasoning_of(blocks) -> str:
+    """The `reasoning_content` a response's blocks carry, if any.
+
+    Same field `zen_proxy.reasoning_of` reads, duplicated rather than
+    imported so `core/` stays provider-agnostic — this only needs to know the
+    key exists, not which adapter set it. See `AgentState.last_reasoning`.
+    """
+    for block in blocks or []:
+        get = getattr(block, "get", None)
+        if callable(get) and block.get("reasoning_content"):
+            return str(block["reasoning_content"])
+    return ""
+
+
+def _text_reply_content(text: str, reasoning: str):
+    """Content for a plain-text assistant turn, carrying reasoning if any.
+
+    A model that reasoned needs `reasoning_content` back on this exact turn or
+    the *next* request is refused (`zen_proxy.anthropic_to_openai` only reads
+    it off a block list — a plain string skips that branch entirely, which is
+    how this was lost for every text-only reply from a thinking model). A
+    model that did not reason gets the plain string it always got: adding an
+    empty `reasoning_content` key is a new way to be rejected by a provider
+    that does not expect the key at all.
+    """
+    if reasoning:
+        return [{"type": "text", "text": text, "reasoning_content": reasoning}]
+    return text
+
+
 def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
     """Stream one model response, yielding TextDelta as tokens arrive.
 
@@ -495,6 +563,7 @@ def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
     has_tool_use = False
     stop_reason = None
     usage_info = None
+    final_reasoning = ""
 
     _prepare_request(state)
     with state.get_client().messages.stream(
@@ -522,6 +591,7 @@ def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
                 final_msg = stream.get_final_message()
                 stop_reason = final_msg.stop_reason
                 usage_info = getattr(final_msg, "usage", None)
+                final_reasoning = _reasoning_of(getattr(final_msg, "content", None))
 
     wants_tools = has_tool_use or stop_reason == "tool_use"
     # Recorded rather than reported here: truncation is handled identically for
@@ -531,6 +601,10 @@ def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
     # non-streamed branch — never ran for any provider that streams. Which is
     # most of them.
     state.last_stop_reason = stop_reason
+    # Same reason: this function returns joined text, not blocks, so a
+    # reasoning model's chain-of-thought has nowhere else to reach the
+    # assistant message `run_turn` saves for a text-only reply.
+    state.last_reasoning = final_reasoning
     # When tools were requested the caller immediately re-issues the request
     # non-streamed to get complete tool_use blocks. Counting the streamed call
     # too would bill the same turn twice.
@@ -632,10 +706,11 @@ def _client_error(err: Exception) -> ErrorOccurred:
     excerpt = _upstream_excerpt(err)
     if "reasoning_content" in text:
         return ErrorOccurred(
-            "This endpoint answered in thinking mode, and requires the reasoning "
-            "it produced to be passed back with the conversation. TOMAS does not "
-            "carry that field yet, so the turn cannot continue on this model — "
-            "switch with /model, or pick a model without thinking mode. "
+            "This endpoint answered in thinking mode and rejected a request that "
+            "replayed one of its earlier turns without the reasoning it produced "
+            "then. That turn's chain-of-thought was not carried forward, so this "
+            "model cannot continue the conversation from here — switch with "
+            "/model, or start a new session. "
             f"Upstream said: {excerpt}",
             detail=text, recoverable=False)
     if any(k in text for k in ("401", "403", "Unauthorized", "Forbidden",
@@ -766,7 +841,9 @@ def _wind_down(state: AgentState, response, reason: str) -> Iterator[AgentEvent]
         return
     text = "".join(b.text for b in closing.content if hasattr(b, "text"))
     if text:
-        state.messages.append({"role": "assistant", "content": text})
+        state.messages.append(
+            {"role": "assistant",
+             "content": _text_reply_content(text, _reasoning_of(closing.content))})
         yield AssistantMessage(text)
     yield TurnFinished(reply=text, usage=dict(state.usage))
 
@@ -878,7 +955,7 @@ def _escalate(state: AgentState, discarded: str = "") -> Iterator[AgentEvent]:
 
 
 def _recover_written_tool_calls(state: AgentState, text: str,
-                                streamed: bool) -> Iterator[AgentEvent]:
+                                streamed: bool, reasoning: str = "") -> Iterator[AgentEvent]:
     """Lift a tool call the model typed out back into the tool channel.
 
     Returns a response shaped like one that asked for tools, or None when the
@@ -896,10 +973,20 @@ def _recover_written_tool_calls(state: AgentState, text: str,
     Deliberately last, after the truncation branch. A reply cut off at
     max_tokens can end mid-JSON, and half a tool call is not one; escalating
     first means the retry gets the chance to produce a complete call.
+
+    `recover_text_tool_calls` builds its blocks purely from `text` — it has
+    no way to know the call reasoned, so `reasoning_content` never reached
+    the reassembled response without this: a thinking model that wrote its
+    tool call as text (the exact quirk this function exists to recover from)
+    lost its reasoning on the very same turn recovery saved the call on, and
+    the next request replaying that turn was rejected the same way a
+    plain-text reply's dropped reasoning was.
     """
     recovered = recover_text_tool_calls(text, state.tools)
     if recovered is None:
         return None
+    if reasoning and recovered.content:
+        recovered.content[0]["reasoning_content"] = reasoning
     yield ToolCallsRecovered([b.name for b in recovered.recovered],
                              streamed=streamed)
     return recovered
@@ -942,8 +1029,10 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
         # so far and is handed back — a turn stopped on time must not also
         # lose the work it had done.
         if turn_expired(state):
-            yield from _report_deadline(state, discarded)
-            yield TurnFinished(reply=discarded, usage=dict(state.usage),
+            salvaged = yield from _deadline_wind_down(state)
+            reply = salvaged or discarded
+            yield from _report_deadline(state, reply)
+            yield TurnFinished(reply=reply, usage=dict(state.usage),
                                seconds=time.perf_counter() - started)
             return
 
@@ -964,7 +1053,8 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                     # than showing an incomplete answer.
                     if text:
                         state.messages.append(
-                            {"role": "assistant", "content": text})
+                            {"role": "assistant",
+                             "content": _text_reply_content(text, state.last_reasoning)})
                     yield TurnFinished(reply=text, usage=dict(state.usage),
                                        seconds=time.perf_counter() - started,
                                        interrupted=True)
@@ -979,12 +1069,14 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                         text = text or discarded
                         yield from _report_truncation(state, text)
                     recovered = yield from _recover_written_tool_calls(
-                        state, text, streamed=True)
+                        state, text, streamed=True, reasoning=state.last_reasoning)
                     if recovered is None:
                         # Record the reply — without this the streaming path
                         # silently reintroduces the no-memory bug.
                         if text:
-                            state.messages.append({"role": "assistant", "content": text})
+                            state.messages.append(
+                                {"role": "assistant",
+                                 "content": _text_reply_content(text, state.last_reasoning)})
                         elif state.last_stop_reason != "max_tokens":
                             yield from _report_empty_reply(state)
                         yield TurnFinished(reply=text, usage=dict(state.usage),
@@ -1016,7 +1108,8 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                     # attempt that was to supersede it cannot run.
                     if discarded:
                         state.messages.append(
-                            {"role": "assistant", "content": discarded})
+                            {"role": "assistant",
+                             "content": _text_reply_content(discarded, state.last_reasoning)})
                         yield AssistantMessage(discarded)
                     yield TurnFinished(reply=discarded, usage=dict(state.usage),
                                        seconds=time.perf_counter() - started)
@@ -1040,7 +1133,9 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
             # escalation must not be able to leave the user worse off than not
             # escalating would have.
             if discarded:
-                state.messages.append({"role": "assistant", "content": discarded})
+                state.messages.append(
+                    {"role": "assistant",
+                     "content": _text_reply_content(discarded, state.last_reasoning)})
                 yield AssistantMessage(discarded)
             yield TurnFinished(reply=discarded, usage=dict(state.usage),
                                seconds=time.perf_counter() - started)
@@ -1057,10 +1152,17 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                 text = text or discarded
                 yield from _report_truncation(state, text)
             recovered = yield from _recover_written_tool_calls(
-                state, text, streamed=False)
+                state, text, streamed=False, reasoning=_reasoning_of(response.content))
             if recovered is None:
                 if text:
-                    state.messages.append({"role": "assistant", "content": text})
+                    # The non-streamed response's own blocks already carry
+                    # `reasoning_content` if the model reasoned (attached by
+                    # `openai_to_anthropic`); reading it off `response.content`
+                    # here is what used to get skipped by rebuilding a plain
+                    # string unconditionally.
+                    state.messages.append(
+                        {"role": "assistant",
+                         "content": _text_reply_content(text, _reasoning_of(response.content))})
                     yield AssistantMessage(text)
                 elif response.stop_reason != "max_tokens":
                     yield from _report_empty_reply(state)
