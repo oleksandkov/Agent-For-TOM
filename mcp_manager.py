@@ -47,9 +47,58 @@ def _write_claude_json(data: dict) -> None:
     )
 
 
-def read_mcp_servers() -> dict[str, dict]:
-    """Return the {name: config} dict from the global mcpServers section."""
-    return _read_claude_json().get("mcpServers", {})
+def _project_key(data: dict, project_dir: Path) -> Optional[str]:
+    """The `projects` key describing this directory, whatever its spelling.
+
+    Claude Code keys `projects` by the literal path string it was launched
+    with, and on Windows the same directory has as many keys as it has
+    spellings. Measured on this machine: `C:/Github/Agent-For-TOM` carries
+    nine servers while `C:/Github/agent-for-tom`, `C:/github/agent-for-tom`
+    and two more case variants of the same folder carry none. Comparing
+    normalised paths is what makes the lookup answer about the directory
+    rather than about how someone typed `cd`.
+
+    Prefers the entry that actually has servers: several variants can match
+    and picking the first would hand back an empty one at random.
+    """
+    projects = data.get("projects")
+    if not isinstance(projects, dict):
+        return None
+    try:
+        want = os.path.normcase(os.path.realpath(project_dir))
+    except OSError:
+        want = os.path.normcase(str(project_dir))
+    best = None
+    for key, value in projects.items():
+        try:
+            if os.path.normcase(os.path.realpath(key)) != want:
+                continue
+        except (OSError, TypeError, ValueError):
+            continue
+        if isinstance(value, dict) and value.get("mcpServers"):
+            return key
+        best = best or key
+    return best
+
+
+def read_mcp_servers(project_dir: Optional[Path] = None) -> dict[str, dict]:
+    """The {name: config} servers available here: global plus this project's.
+
+    Project scope was not read at all. Everything under `projects` in
+    claude.json — nine servers for this directory, including the
+    `stealthy_fetch` that three measured sessions needed and never saw —
+    was invisible to the agent, which only ever looked at the top-level
+    `mcpServers`. A project entry with the same name as a global one wins,
+    which is the point of configuring it per project.
+    """
+    data = _read_claude_json()
+    servers = dict(data.get("mcpServers", {}))
+    key = _project_key(data, project_dir or Path.cwd())
+    if key:
+        scoped = data["projects"][key].get("mcpServers")
+        if isinstance(scoped, dict):
+            servers.update(scoped)
+    return servers
 
 
 def write_mcp_server(name: str, config: dict) -> None:

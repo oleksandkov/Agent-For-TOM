@@ -3,144 +3,195 @@ name: document-style-match
 description: Reproduce an example document's exact layout and text formatting when the user provides a PDF or DOCX file as a sample and asks for a similar document with new content.
 triggers: ["зроби схожий", "схожий файл", "схожий", "подібний файл", "подібний", "такий же", "збережи форматування", "зберегти форматування", "зберіг форматування", "форматування тексту", "форматування", "таке саме форматування", "як приклад", "візьми як приклад", "проаналізуй файл", "проаналізуй", "по типу", "як цей", "як у прикладі", "за зразком", "на основі", "шаблон", "зразок", "приклад", "методичні вказівки", "методичка", "like this", "same style", "match formatting", "preserve formatting", "document template", "as an example"]
 source: bundled
-version: 9
+version: 17
 ---
-
 # Matching an Example Document
 
-Content changes, formatting does not: page size, margins, fonts, sizes,
-alignment, spacing numerically identical to the sample — "looks about
-right" is not the bar. This skill ships scripts next to this file so the
-numbers come from one canonical, tested measurement, not one re-derived
-each session: `analyze_pdf.py`/`analyze_docx.py`, `verify_docx.py`/
-`verify_pdf.py`, `template_generate.py` (reference patterns).
+Content changes, formatting does not. **The route depends on the sample:**
 
-Each measured a real failure this skill now catches: generic text read →
-US Letter instead of A4; left margin at the 2.5cm convention vs the
-sample's measured 2.35cm; a *correct* DOCX → PDF with an **invisible
-~0.5pt title** no DOCX-only check catches. Rules:
+| Sample | Route | Why |
+|---|---|---|
+| **.docx** | **A — copy & replace** | Formatting carried, never re-derived |
+| **.pdf** | B — measure & rebuild | Nothing to copy; must be reconstructed |
 
-1. **Never read the sample with a generic file/text tool** — only Step 1.
-2. **Contract is a file, not a memory** — written/read/diffed in Steps 1/3/4.
+Rules, both routes:
+
+1. **Never read the sample with a generic file/text tool.**
+2. **A failing check is never a success.** Fix, re-run (3 attempts), then
+   say exactly what is still wrong.
 3. **Verify the rendered PDF, not just the DOCX.**
-4. **Step 1 ends at the contract; content research is bounded too.** One
-   session re-audited unrelated files, another re-researched the same names
-   25 times — neither ever reached Step 3. Verify a fact once, move on.
+4. **Research is bounded.** One session re-researched the same names 25
+   times and never generated anything. Verify a fact once, move on.
+5. **Clean up (Step Z) before the final answer.**
+6. **Reach a rendered, verified pair on a short plan first, then grow the
+   text.** Two of three sessions built the whole generator up front, spent
+   the turn on index arithmetic, and ended with a script never run and no
+   deliverable. A turn is 1200s / 40 calls.
 
 ---
 
-## Step 1 — Get the Contract
+# The block schema
 
-**If `<name>_style_contract.json` exists**, read it and skip to Step 2 — a
-prior run already paid this cost.
+Read this instead of the scripts — sessions spend ~11k tokens on their
+source otherwise.
 
-Otherwise, run the matching script from this skill's own directory:
+```jsonc
+{"text": "…", "align": "justify"|"center"|"left"|"right",
+ "bold": true, "size_pt": 14.0, "indent_cm": 1.25,
+ "source_index": 12,          // position in the structure — carry it through
+ "page_break_before": true,   // optional
+ "style_name": "Heading 1",   // optional, a real Word style
+ "list_id": 3, "list_level": 0}   // optional, numbering restarts per list_id
+{"kind": "spacer"}                    // empty paragraph = the vertical rhythm
+{"kind": "table", "rows": [["a","b"], …]}
+```
+
+- **Indices are 0-based into `blocks`**, not `read_file`'s line numbers.
+  Hand-subtracting the JSON header cost two sessions their turn. Enumerate
+  in code, or use `source_index`.
+- **`indent_cm: 0.0` means flush left** and is honoured. Never write
+  `0.001` to defeat a fallback — that turned indentation off for a whole
+  document. Only an *absent* `indent_cm` falls back.
+- **A spacer has no `text`.** Check `kind` before reading `b["text"]`.
+- **A block is a paragraph, not a line.** `source_rows` = how many rendered
+  lines it was, `target_chars` = how much text it held. Write about that
+  much: a block given one sentence where the sample had five ends on a
+  half-empty line, and a page of those reads broken.
+
+## What each check enforces, with its numbers
+
+| Script | Passes when |
+|---|---|
+| `check_plan` | blocks ≥ 50 % of sample; each category (spacers, tables, breaks, headings, lists) ≥ 50 %; ≥ 80 % of plan blocks carry a `source_index`; total text within ±35 % of the summed `target_chars` |
+| `verify_docx` | every contract field within ±0.05 cm / ±0.5 pt; prints `NOT checked: …` for fields the contract lacks — that line is part of the result |
+| `verify_pdf` | no page-1 block narrower than 15 pt (collapsed text) |
+| `verify_render` | split-line rate ≤ 1.5× the sample's; blank lines per 100 rows within ±30 %; characters per row within ±30 % |
+
+---
+
+# Route A — DOCX sample: copy and replace
+
+Rebuilding reproduces only what a contract describes: on a real coursework
+it kept 57 of 400 blocks and lost **all 4 tables, all 22 heading styles and
+2 of 3 sections**, while passing every style check. Copying loses none.
+
+**A1 — see the blocks** (indices are what you edit):
+```
+python skills/document-style-match/edit_copy.py --list "<sample.docx>" [start] [count]
+```
+
+**A2 — write `<name>_edits.json`**, keyed by those indices. Only listed
+blocks change.
+```json
+{ "9": "Ілон Маск",
+  "11": ["Мета роботи - ", "новий текст"],
+  "12": null,
+  "31": {"rows": [["ВСТУП", "4"]]} }
+```
+string = replace text · list = one entry per run (keeps a bold label bold)
+· `null` = delete · `{"rows": …}` = table cell text.
+
+**A3 — apply:**
+```
+python skills/document-style-match/edit_copy.py "<sample.docx>" "<name>_edits.json" "<output.docx>"
+```
+Exits 1 counting **long paragraphs still holding the sample's own text**,
+and separately anything the copy **lost** — formulas, images, hyperlinks,
+tables. Copying carries those but cannot edit them, and deleting is the easy
+way out: one run shipped a paper with **0 of its sample's 28 formulas** and
+passed every other check. Removing them can be right; it must be deliberate
+and stated. Then Step V.
+
+---
+
+# Route B — PDF sample: measure and rebuild
+
+**B1 — contract + structure:**
 ```
 python skills/document-style-match/analyze_pdf.py "<sample.pdf>" "<name>_style_contract.json"
 ```
-or, for a DOCX sample:
-```
-python skills/document-style-match/analyze_docx.py "<sample.docx>" "<name>_style_contract.json"
-```
-Read the printed JSON: page size, body/title font+size, left/right margins
-(mode, not min/max — see each docstring). DOCX *also* measures
-indent/line-spacing/heading-space exactly; PDF can't (tested: inferring
-spacing from glyph positions gave a different wrong "rule" per heading —
-Word merges adjacent spacing by *max*, not sum). PDF top/bottom margins and
-all spacing stay convention — **say so in Step 5.** Then stop — rule 4.
+Contract (~2 KB): page size, margins, fonts, `line_spacing`,
+`body_indent_cm`, `style_signatures` — printed, read it. State it in one
+line: `A4 21.0×29.7cm, Times New Roman, body 14pt, title 20pt, margins
+2.35/2.1/2.0/2.0cm.`
 
-## Step 2 — State the Contract
+Check `truncated_reason`, not just `truncated`:
 
-One line: `Contract: A4 21.0×29.7cm, Times New Roman, body 14pt, title
-20pt, margins 2.35/2.1/2.0/2.0cm.`
+- `block_limit` — whole document walked, 400-block cap stopped it. The
+  rest is more of the same.
+- `page_window` — only `pages_scanned` of `page_count` opened. **Before
+  building the plan**, list the rest of the sample's sections:
+  ```
+  python -c "import pymupdf;d=pymupdf.open(r'<sample.pdf>');print(chr(10).join(l for p in d for l in p.get_text().splitlines() if l.strip() and l.strip()==l.strip().upper())[:3000])"
+  ```
+  Then name, in your final answer, every section of the sample your
+  document does not contain. Not a choice: three of three runs read this
+  field, said nothing, and shipped a document missing those sections.
+
+Spacers and breaks are *inferred* from geometry — say so. Then stop
+researching the sample.
+
+**B2 — build `<name>_content_plan.json` from the structure**: load its
+`blocks`, replace each `"text"`, keep everything else — **including
+`source_index`** (how `check_plan` tells an adapted plan from an invented
+one) and honouring `target_chars`. Do not author from scratch: one such run
+gave 57 blocks against 400 with no tables or headings. For a long sample
+write a generator — a 1599-block literal cost one session 29k tokens.
+
+**B3 — check the shape, before rendering:**
+```
+python skills/document-style-match/check_plan.py "<name>_structure.json" "<name>_content_plan.json"
+```
+
+**B4 — render:**
+```
+python skills/document-style-match/render_from_structure.py "<name>_style_contract.json" "<name>_content_plan.json" "<output.docx>"
+```
+Covers paragraphs, spacers, page breaks, heading styles, tables, lists.
+Images, footnotes, TOC fields and merged cells are not — add those with
+`python-docx` and re-save; `template_generate.py` has tested patterns.
+
+**A label plus its own text is one line, not a heading.** The sample has
+`"Мета роботи"` bold, inline, justified — not a heading with the
+description below it.
 
 ---
 
-## Step 3 — Generate
+# Step V — Verify (both routes)
 
-**Several tool calls instead of one script is how alignment/indent end up
-on some paragraphs and not others — measured.** Every content string below
-is illustrative: replace all of them.
-
-```python
-import docx, json
-from docx.enum.text import WD_ALIGN_PARAGRAPH as A
-from docx.shared import Pt, Cm
-
-c = json.load(open(r"<name>_style_contract.json"))
-FONT = c.get("body_font") or "Times New Roman"
-BODY, TITLE = Pt(c["body_size_pt"] or 14), Pt(c["title_size_pt"] or 20)
-INDENT, LS = Cm(c.get("body_indent_cm", 1.25)), c.get("line_spacing", 1.15)
-HSB, HSA = Pt(c.get("heading_space_before_pt", 0)), Pt(c.get("heading_space_after_pt", 4))
-
-doc = docx.Document()
-doc.styles["Normal"].font.name, doc.styles["Normal"].font.size = FONT, BODY
-m = c.get("margins_cm", {})
-for sec in doc.sections:
-    sec.page_width, sec.page_height = Cm(c["page_width_cm"]), Cm(c["page_height_cm"])
-    sec.top_margin, sec.bottom_margin = Cm(m.get("top_margin", 2.0)), Cm(m.get("bottom_margin", 2.0))
-    sec.left_margin, sec.right_margin = Cm(m.get("left_margin", 2.5)), Cm(m.get("right_margin", 1.5))
-
-def para(text="", *, align=A.JUSTIFY, bold=False, indent=None, style=None, size=None, sb=Pt(0), sa=Pt(2)):
-    p = doc.add_paragraph(style=style)
-    p.alignment, p.paragraph_format.line_spacing = align, LS
-    p.paragraph_format.space_before, p.paragraph_format.space_after = sb, sa
-    if indent is not None:
-        p.paragraph_format.first_line_indent = indent
-    if text:
-        r = p.add_run(text); r.bold = bold; r.font.name, r.font.size = FONT, (size or BODY)
-    return p
-
-body   = lambda t: para(t, indent=INDENT)
-centre = lambda t, size=None: para(t, align=A.CENTER, bold=True, size=size, sb=HSB, sa=HSA)
-item   = lambda t: para(t, style="List Number")  # ONE list — 2nd list below
-
-def lead(label, rest, indent=None):  # "Мета роботи - текст" ONE line, not a heading
-    p = para(align=A.JUSTIFY, indent=indent or INDENT)
-    r1 = p.add_run(label); r1.bold = True; r1.font.name, r1.font.size = FONT, BODY
-    r2 = p.add_run(rest); r2.font.name, r2.font.size = FONT, BODY
-    return p
-
-centre("<ACTUAL TITLE — replace this>", size=TITLE)
-lead("<label, e.g. Мета роботи> - ", "<same line, not a new paragraph>")
-body("<actual body text — replace this>")
-doc.save(r"<output.docx>")
 ```
-**2nd numbered list or a table?** Plain `item()` continues numbering
-instead of restarting at 1 (measured: rendered 4,5,6) — read
-`template_generate.py` (same folder) for tested `new_list()`/`table()`.
-
-**`centre` vs `lead` — check the sample, don't assume.** Skipping this once
-rendered `"Мета роботи"` as a heading with the description on the next
-paragraph; the sample has it bold, inline, one line. True headings
-("Загальні відомості", "Контрольні запитання", "Завдання", "Література")
-are centered/standalone; a label + its own text on one line is `lead`.
-
----
-
-## Step 4 — Verify
-
-Run both scripts before reporting done; on failure, fix Step 3, re-run, up
-to 3 attempts, then report exactly what's wrong, not success.
-
-**4a — Diff the DOCX against the contract**, not a self-check (would pass
-the Letter-vs-A4 bug above):
+python skills/document-style-match/verify_docx.py "<contract>.json" "<output.docx>" ["<structure>.json"]
 ```
-python skills/document-style-match/verify_docx.py "<name>_style_contract.json" "<output.docx>"
+Route A needs a contract first, via `analyze_docx.py` on the **sample**.
+Without the structure file the spacer/page-break check says `NOT checked` —
+not a full pass.
+
+After `convert_to_pdf`, confirm the PDF landed beside the DOCX, then:
 ```
-
-**4b — After `convert_to_pdf`, verify the PDF too**:
+python skills/document-style-match/verify_pdf.py "<contract>.json" "<output.pdf>"
+python skills/document-style-match/verify_render.py "<sample.pdf>" "<output.pdf>"
 ```
-python skills/document-style-match/verify_pdf.py "<name>_style_contract.json" "<output.pdf>"
+`verify_render` is the only check comparing the **result with the sample**
+rather than with the contract — it catches a document whose every style
+number is right and whose page still reads wrong. Read its NOTE about page
+1: a cover page you filled on purpose is expected to move, and saying so is
+part of the report.
+
+Grep the output for `"<...>"` — leftover `template_generate.py` placeholders.
+
+# Step Z — Clean up
+
+The deliverables are the `.docx` and `.pdf`. Everything else this skill
+made is scaffolding and must not be left in the user's folder:
 ```
-Confirm the file exists next to the DOCX (conversion can report success
-while writing elsewhere).
+del "<name>_style_contract.json" "<name>_structure.json" "<name>_content_plan.json" "<name>_edits.json"
+```
+plus any scratch scripts. Delete after the last check passes, in the same
+turn as the final answer — one run left six such files beside two
+deliverables. If the turn ends early, still say where your working files are.
 
-**4c — Grep for `"<...>"` brackets** — Step 3's placeholder syntax, left
-over if not replaced.
+# Reporting
 
-## Step 5 — Reporting
-
-State the contract used (Step 2's line), flag anything assumed, and confirm
-both verify scripts passed — not "looks similar". A referenced figure
-("Рис. 1") keeps its caption text — don't fabricate one.
+State the contract, flag what was assumed, name anything `NOT checked`,
+name any section of the sample you could not reproduce, confirm the checks
+passed — not "looks similar". A referenced figure keeps its caption.

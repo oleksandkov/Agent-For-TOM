@@ -16,6 +16,7 @@ from typing import Iterator, Optional
 
 from .events import (
     AgentEvent,
+    AnnouncedWithoutActing,
     AssistantMessage,
     ContinuationGranted,
     ContinuationNeeded,
@@ -412,6 +413,42 @@ def _record_usage(state: AgentState, usage) -> None:
     state.usage["calls"] = state.usage.get("calls", 0) + 1
 
 
+def _stream_can_serve(final_msg) -> bool:
+    """Whether the streamed assembly can stand in for a non-streamed repeat.
+
+    The adapter builds complete `tool_use` blocks from the stream; the only
+    thing it cannot do is recover arguments whose JSON never parsed, which it
+    counts as `malformed_tool_args`. When that count is zero the second call
+    has nothing left to contribute — measured across three live sessions,
+    58 discarded streams, `would_have_served == duplicate_calls` and
+    `stream_malformed_tool_args == 0` on every one of them: 2.9M input tokens
+    re-sent to be told the same thing.
+
+    The real Anthropic SDK sets no such attribute; `getattr(..., 0)` reads as
+    "nothing was malformed", which is correct — its own stream assembly is
+    authoritative, and that path never needed the second call either.
+    """
+    if final_msg is None:
+        return False
+    malformed = getattr(final_msg, "malformed_tool_args", 0)
+    if not isinstance(malformed, int) or isinstance(malformed, bool):
+        malformed = 0
+    if malformed:
+        return False
+    # A reply cut off at the output limit may have stopped cleanly *between*
+    # two tool calls, so nothing parsed badly and a call was still lost. Fall
+    # through in that case: the non-streamed retry gets a fresh budget and is
+    # the existing path for handling truncation.
+    if getattr(final_msg, "output_truncated", False):
+        return False
+    # And it must actually carry the calls it claims. A provider that reports
+    # `tool_calls` while assembling none leaves a response that is neither a
+    # reply nor a tool step, and serving it would spend a turn going nowhere;
+    # the non-streamed call is the existing answer to "ask again".
+    content = getattr(final_msg, "content", None) or []
+    return any(getattr(b, "type", None) == "tool_use" for b in content)
+
+
 def _record_discarded_stream(state: AgentState, usage, final_msg) -> None:
     """Account for a streamed answer that is about to be thrown away.
 
@@ -488,10 +525,21 @@ def _deadline_wind_down(state: AgentState) -> Iterator[AgentEvent]:
     """
     state.messages.append({"role": "user", "content": [
         {"type": "text",
+         # The scaffolding clause is not tidiness. Cleanup was tied to
+         # finishing, so a turn that ran out of time left its working files
+         # in the user's own output folder and said nothing about them —
+         # measured: two of three sessions ended this way, one leaving two
+         # scaffolding JSONs beside zero deliverables and four scratch
+         # scripts elsewhere, with the final reply describing neither.
+         # Naming them costs one line and is the difference between leftovers
+         # and litter.
          "text": "Out of time for this turn. Stop researching — if a file "
                  "was ready to save, save it now with what you have; "
                  "otherwise say exactly what's done and what's left, in "
-                 "one short reply, no more tool calls."}
+                 "one short reply, no more tool calls. In that reply also "
+                 "list any scratch scripts or intermediate files you created "
+                 "and where they are, so nothing of yours is left behind "
+                 "unannounced."}
     ]})
     closing = yield from _model_call(state)
     if closing is None:
@@ -556,14 +604,25 @@ def _text_reply_content(text: str, reasoning: str):
 def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
     """Stream one model response, yielding TextDelta as tokens arrive.
 
-    Returns (full_text, has_tool_use) to the caller via `yield from`. Raises
-    on providers that cannot stream so the caller can fall back.
+    Returns `(full_text, has_tool_use, served)` to the caller via `yield
+    from`. Raises on providers that cannot stream so the caller can fall back.
+
+    `served` is the assembled response when it can stand in for the
+    non-streamed repeat (see `_stream_can_serve`), and None when the caller
+    must make that second call. It is *reported*, not acted on: `run_turn`
+    still decides, and still runs permissions, loop detection and the budget
+    over whichever response it ends up with — the single place that handling
+    lives.
     """
     text_parts: list[str] = []
     has_tool_use = False
     stop_reason = None
     usage_info = None
     final_reasoning = ""
+    # Bound before the loop: an interrupt between `content_block_start` and
+    # `message_stop` leaves a stream that wanted tools with no final message,
+    # and the usage branch below reads it either way.
+    final_msg = None
 
     _prepare_request(state)
     with state.get_client().messages.stream(
@@ -605,14 +664,18 @@ def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
     # reasoning model's chain-of-thought has nowhere else to reach the
     # assistant message `run_turn` saves for a text-only reply.
     state.last_reasoning = final_reasoning
-    # When tools were requested the caller immediately re-issues the request
-    # non-streamed to get complete tool_use blocks. Counting the streamed call
-    # too would bill the same turn twice.
-    if not wants_tools:
+    # When tools were requested and the stream could not be trusted to carry
+    # them whole, the caller re-issues the request non-streamed; counting the
+    # streamed call too would bill the same turn twice. When it *can* be
+    # trusted there is no second call, so this is the only call there is and
+    # it is counted like any other.
+    served = final_msg if (wants_tools and not state.interrupted()
+                           and _stream_can_serve(final_msg)) else None
+    if not wants_tools or served is not None:
         _record_usage(state, usage_info)
     else:
         _record_discarded_stream(state, usage_info, final_msg)
-    return "".join(text_parts), wants_tools
+    return "".join(text_parts), wants_tools, served
 
 
 def _quota_error(err: Exception) -> ErrorOccurred:
@@ -728,6 +791,39 @@ def _client_error(err: Exception) -> ErrorOccurred:
         detail=text, recoverable=False)
 
 
+def _overrun(state: AgentState, started: float) -> float:
+    """Seconds the turn spent past its ceiling, or 0.0 if it stayed inside.
+
+    `turn_expired` is checked *between* steps, so a step starting one second
+    inside the allowance can finish well outside it — measured, 1279.8s
+    against a 1200s ceiling, saved as a clean success. Declining that step
+    would be worse (it is usually the one writing the file), so the overrun
+    is reported instead of prevented.
+    """
+    if not state.max_turn_seconds:
+        return 0.0
+    return max(0.0, (time.perf_counter() - started) - state.max_turn_seconds)
+
+
+def _is_empty_response(response) -> bool:
+    """Nothing to show and nothing to run.
+
+    Not the same as a truncation (`stop_reason == "max_tokens"` carries
+    partial text) and not the same as an error — the provider returned a
+    well-formed message with no text, no tool call and nothing to act on.
+    """
+    if response is None:
+        return True
+    if getattr(response, "stop_reason", None) == "max_tokens":
+        return False
+    for block in getattr(response, "content", None) or []:
+        if getattr(block, "type", None) == "tool_use":
+            return False
+        if (getattr(block, "text", "") or "").strip():
+            return False
+    return True
+
+
 def _model_call(state: AgentState) -> Iterator[AgentEvent]:
     """One model call with retry. Returns the response, or None if it failed
     (an ErrorOccurred / TurnFinished will already have been yielded)."""
@@ -745,6 +841,11 @@ def _model_call(state: AgentState) -> Iterator[AgentEvent]:
         # call costs the full 300 s socket timeout, timeouts are classified
         # retryable, and four attempts plus backoff is over twenty minutes for
         # one step of one turn.
+        #
+        # Only retries, never the first attempt: `_deadline_wind_down` calls
+        # this deliberately *after* the deadline to salvage the turn's work,
+        # and blocking that would trade a reported overrun for a lost
+        # document.
         if attempt and turn_expired(state):
             yield fail(ErrorOccurred(
                 "Out of time for this turn before the retry could run.",
@@ -762,6 +863,19 @@ def _model_call(state: AgentState) -> Iterator[AgentEvent]:
                 **_sampling(state),
             )
             _record_usage(state, getattr(response, "usage", None))
+            # An empty response is a provider hiccup, not a refusal: the
+            # request was accepted and well-formed, so the identical payload
+            # has a real chance the second time — unlike a 4xx, which is why
+            # that one is never retried. Measured on deepseek-v4-flash-free
+            # via Zen: a session that had already written both deliverables
+            # lost only its closing report to this, and was saved
+            # `complete: false` for it.
+            if _is_empty_response(response) and attempt < MAX_RETRIES:
+                delay = backoff_delay(attempt)
+                yield RetryScheduled(attempt + 1, MAX_RETRIES, delay,
+                                     "empty reply from the provider")
+                time.sleep(delay)
+                continue
             return response
         except anthropic.InternalServerError as e:
             # Checked before the retryable test on purpose: a missing model is
@@ -906,6 +1020,60 @@ def _report_empty_reply(state: AgentState) -> Iterator[AgentEvent]:
         detail=state.last_error, recoverable=True)
 
 
+#: Phrases that promise the *next* action rather than describe a finished one.
+#: Deliberately narrow: these announce work about to start, in the two
+#: languages this agent is used in. A reply that merely mentions "let me know"
+#: or ends "готово" must not match.
+_ANNOUNCEMENT_RE = re.compile(
+    r"(?:^|[\s\"'(«])(?:"
+    r"let me\s+(?!know|have)\w+|now\s+(?:i'?ll|let me|i\s+will)|"
+    r"i'?ll\s+(?:now\s+)?(?!know)\w+|"
+    r"i\s+will\s+now|next[,\s]+i'?ll|let'?s\s+(?:now\s+)?\w+|"
+    r"зараз\s+я|тепер\s+я|далі\s+я|перейду\s+до|почну\s+з|"
+    r"давайте\s+\w+|створю|побудую|запущу|сформую"
+    r")\b",
+    re.IGNORECASE)
+
+
+def announces_without_acting(text: str, tool_calls_made: int) -> bool:
+    """A reply that says what it is about to do, and then does nothing.
+
+    Measured on `hy3-free`, twice inside one session: the turn ended with
+    "Now I understand the structure: …" and, after a `continue`, with "I now
+    fully understand the workflow. Let me create the target directory and
+    build the content plan JSON…" — no tool call either time. The session was
+    saved `complete: true` with `failed_turns: []` and produced no file at
+    all, because the integrity check looks for orphaned *user* turns and this
+    turn has a perfectly good assistant reply on the end of it.
+
+    `tool_calls_made` guards the common false positive: a first reply that
+    proposes a plan and waits for approval is a legitimate answer, and the
+    user asked for a plan. A turn that has already run tools and *then*
+    announces the next one has stopped mid-work instead.
+    """
+    if not tool_calls_made or not text:
+        return False
+    tail = text.strip()[-400:]
+    return bool(_ANNOUNCEMENT_RE.search(tail))
+
+
+def _nudge_to_act(state: AgentState) -> None:
+    """Ask for the announced step, once, in the transcript itself.
+
+    The same mechanism `_deadline_wind_down` uses: a user-role message the
+    model answers on the next pass. Cheaper and far more reliable than
+    prompting the model not to do it in the first place, which the system
+    prompt already asks for.
+    """
+    state.messages.append({"role": "user", "content": [
+        {"type": "text",
+         "text": "You described the next step but did not take it. Do it now "
+                 "with the tools — no more planning, no restating the plan. "
+                 "If you genuinely cannot proceed, say exactly what is "
+                 "blocking you."}
+    ]})
+
+
 def _can_escalate(state: AgentState, text: str, escalated: bool) -> bool:
     """Is this a truncation worth one more attempt with a bigger budget?
 
@@ -1005,6 +1173,10 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
     budget = state.tool_budget
     signatures: list[str] = []
     escalated = False    # max_tokens has been raised once for this turn
+    # Once per turn, like escalation and for the same reason: a nudge that
+    # can fire repeatedly is a way to loop forever on a model that keeps
+    # narrating.
+    nudged = False
     # A partial reply thrown away to retry with more room. Kept so that a
     # retry which then fails outright (quota, 5xx) does not leave the user with
     # less than they had before it — half a document beats nothing.
@@ -1021,6 +1193,7 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
         if state.interrupted():
             yield TurnFinished(reply="", usage=dict(state.usage),
                                seconds=time.perf_counter() - started,
+                               overran_by=_overrun(state, started),
                                interrupted=True)
             return
 
@@ -1033,7 +1206,8 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
             reply = salvaged or discarded
             yield from _report_deadline(state, reply)
             yield TurnFinished(reply=reply, usage=dict(state.usage),
-                               seconds=time.perf_counter() - started)
+                               seconds=time.perf_counter() - started,
+                               overran_by=_overrun(state, started))
             return
 
         yield ThinkingStarted(state.get_model())
@@ -1041,11 +1215,14 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
         # A response rebuilt from a tool call the model wrote as text, when
         # there is one. Reset per iteration: the next step gets its own answer.
         recovered = None
+        # The streamed assembly, when it was complete enough to use as-is.
+        # Same lifetime and the same reason: per-iteration, never carried over.
+        served = None
 
         # ── Streaming attempt ──
         if state.streaming_enabled:
             try:
-                text, wants_tools = yield from _stream_call(state)
+                text, wants_tools, served = yield from _stream_call(state)
                 if state.interrupted():
                     # Whatever text arrived stays; a tool_use block that had
                     # started is dropped rather than completed non-streamed —
@@ -1057,6 +1234,7 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                              "content": _text_reply_content(text, state.last_reasoning)})
                     yield TurnFinished(reply=text, usage=dict(state.usage),
                                        seconds=time.perf_counter() - started,
+                               overran_by=_overrun(state, started),
                                        interrupted=True)
                     return
                 if not wants_tools:
@@ -1077,10 +1255,16 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                             state.messages.append(
                                 {"role": "assistant",
                                  "content": _text_reply_content(text, state.last_reasoning)})
+                            if not nudged and announces_without_acting(text, calls_used):
+                                nudged = True
+                                yield AnnouncedWithoutActing(text)
+                                _nudge_to_act(state)
+                                continue
                         elif state.last_stop_reason != "max_tokens":
                             yield from _report_empty_reply(state)
                         yield TurnFinished(reply=text, usage=dict(state.usage),
-                                           seconds=time.perf_counter() - started)
+                                           seconds=time.perf_counter() - started,
+                               overran_by=_overrun(state, started))
                         return
                     # A recovered call needs no second request: the stream ran
                     # to completion, so its text is whole and the blocks built
@@ -1088,8 +1272,11 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                     # does not fall through, and the reason is that there is
                     # nothing a non-streamed repeat could add — it would re-ask
                     # the same question and be answered in text again.
-                # Tools requested: fall through to the non-streamed call, which
-                # returns complete tool_use blocks.
+                # Tools requested: use the streamed assembly when it is whole
+                # (`served`), otherwise fall through to the non-streamed call,
+                # which returns complete tool_use blocks. Either way the same
+                # code below runs permissions, loop detection and the budget —
+                # this chooses the response, it does not handle it.
             except Exception as e:
                 # Two streaming failures that falling through cannot fix — the
                 # non-streamed call spends another request to be told the same
@@ -1112,7 +1299,8 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                              "content": _text_reply_content(discarded, state.last_reasoning)})
                         yield AssistantMessage(discarded)
                     yield TurnFinished(reply=discarded, usage=dict(state.usage),
-                                       seconds=time.perf_counter() - started)
+                                       seconds=time.perf_counter() - started,
+                               overran_by=_overrun(state, started))
                     return
                 # Any other streaming failure is recoverable the same way: a
                 # provider whose streaming endpoint 5xxs (or that has no
@@ -1124,7 +1312,7 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                 state.streaming_error_retryable = is_retryable_error(e)
                 yield StreamingDisabled(str(e))
 
-        response = recovered
+        response = recovered or served
         if response is None:
             response = yield from _model_call(state)
         if response is None:
@@ -1138,7 +1326,8 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                      "content": _text_reply_content(discarded, state.last_reasoning)})
                 yield AssistantMessage(discarded)
             yield TurnFinished(reply=discarded, usage=dict(state.usage),
-                               seconds=time.perf_counter() - started)
+                               seconds=time.perf_counter() - started,
+                               overran_by=_overrun(state, started))
             return
 
         if response.stop_reason != "tool_use":
@@ -1164,14 +1353,39 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                         {"role": "assistant",
                          "content": _text_reply_content(text, _reasoning_of(response.content))})
                     yield AssistantMessage(text)
+                    if not nudged and announces_without_acting(text, calls_used):
+                        nudged = True
+                        yield AnnouncedWithoutActing(text)
+                        _nudge_to_act(state)
+                        continue
                 elif response.stop_reason != "max_tokens":
                     yield from _report_empty_reply(state)
                 yield TurnFinished(reply=text, usage=dict(state.usage),
-                                   seconds=time.perf_counter() - started)
+                                   seconds=time.perf_counter() - started,
+                               overran_by=_overrun(state, started))
                 return
             response = recovered
 
         tool_blocks = [b for b in response.content if b.type == "tool_use"]
+        if not tool_blocks:
+            # `stop_reason == "tool_use"` with nothing to run. The loop below
+            # would record an assistant turn and an empty result turn, change
+            # nothing, and come back here — forever, since a turn that runs no
+            # tool never reaches the budget checkpoint that would stop it.
+            # Treat it as the reply it actually is and end the turn.
+            text = "".join(b.text for b in response.content if hasattr(b, "text"))
+            if text:
+                state.messages.append(
+                    {"role": "assistant",
+                     "content": _text_reply_content(text, _reasoning_of(response.content))})
+                yield AssistantMessage(text)
+            else:
+                yield from _report_empty_reply(state)
+            yield TurnFinished(reply=text, usage=dict(state.usage),
+                               seconds=time.perf_counter() - started,
+                               overran_by=_overrun(state, started))
+            return
+
         for b in tool_blocks:
             signatures.append(call_signature(b.name, b.input))
         calls_used += len(tool_blocks)

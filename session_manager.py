@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import hashlib
 from pathlib import Path
@@ -128,6 +129,39 @@ def _summarize_messages(messages: list) -> str:
 #  CRUD operations
 # ═══════════════════════════════════════════════════════════════════════
 
+#: Phrases that promise the next step rather than report a finished one.
+#: Kept in step with `core.loop._ANNOUNCEMENT_RE`, but duplicated rather than
+#: imported: this module is the *record* of what happened and must be able to
+#: audit a transcript it did not run, including one written by an older build.
+_ANNOUNCEMENT_RE = re.compile(
+    r"(?:^|[\s\"'(«])(?:"
+    r"let me\s+(?!know|have)\w+|now\s+(?:i'?ll|let me|i\s+will)|"
+    r"i'?ll\s+(?:now\s+)?(?!know)\w+|"
+    r"i\s+will\s+now|next[,\s]+i'?ll|let'?s\s+(?:now\s+)?\w+|"
+    r"зараз\s+я|тепер\s+я|далі\s+я|перейду\s+до|почну\s+з|"
+    r"давайте\s+\w+|створю|побудую|запущу|сформую"
+    r")\b",
+    re.IGNORECASE)
+
+
+def _final_text(messages: list) -> str:
+    """The text of the last assistant turn, if it is text-only."""
+    for message in reversed(messages):
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            if any(isinstance(b, dict) and b.get("type") == "tool_use"
+                   for b in content):
+                return ""
+            return "\n".join(b.get("text", "") for b in content
+                             if isinstance(b, dict) and b.get("type") == "text")
+        return ""
+    return ""
+
+
 def audit_transcript(messages: list) -> dict:
     """Report whether a transcript actually completed.
 
@@ -135,15 +169,26 @@ def audit_transcript(messages: list) -> dict:
     nothing — the model errored, retries were exhausted, or the harness moved
     on. Saving that as an ordinary session is how eight prompts and zero
     replies came to be reported as eight turns of finished work.
+
+    The second question is newer and cost more: a turn can end with a
+    perfectly well-formed assistant reply that *announces* the next step
+    instead of taking it. Measured on `hy3-free`, twice in one session —
+    "I now fully understand the workflow. Let me create the target directory
+    and build the content plan JSON…" — saved `complete: true`,
+    `failed_turns: []`, and not one file written. Nothing here could see it,
+    because the reply exists and reads like work.
     """
     roles = [m.get("role") for m in messages]
     orphaned = [
         i for i, r in enumerate(roles)
         if r == "user" and (i + 1 >= len(roles) or roles[i + 1] == "user")
     ]
+    tail = _final_text(messages)
+    announced = bool(tail) and bool(_ANNOUNCEMENT_RE.search(tail.strip()[-400:]))
     return {
-        "complete": not orphaned,
+        "complete": not orphaned and not announced,
         "orphaned_user_turns": orphaned,
+        "ended_on_announcement": announced,
         "user_messages": roles.count("user"),
         "assistant_messages": roles.count("assistant"),
     }
@@ -156,6 +201,15 @@ def backfill_completeness() -> list[str]:
     reader cannot distinguish an abandoned run from a finished one. Files
     that audit clean are left untouched; only genuinely incomplete ones are
     annotated. Safe to call repeatedly.
+
+    A stored `complete: true` is also re-examined, because the audit gets
+    stricter over time and the corpus is the evidence later analysis is done
+    on. When `ended_on_announcement` was added, one session on disk flipped:
+    saved as a clean success, it had in fact ended by describing the step it
+    was about to take and written no file at all. Leaving it marked finished
+    would have kept that failure invisible in exactly the record used to
+    find it. A stored `complete: false` is never overturned — this only ever
+    demotes.
     """
     marked: list[str] = []
     for path in sorted(get_session_dir().glob("*.json")):
@@ -163,18 +217,22 @@ def backfill_completeness() -> list[str]:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if "complete" in data:
+        if data.get("complete") is False:
             continue
         audit = audit_transcript(data.get("messages", []))
         if audit["complete"]:
             continue
+        note = ("backfilled: saved before completeness was recorded"
+                if "complete" not in data else
+                "re-audited: saved as complete under an earlier, looser check")
         data["complete"] = False
         data["incomplete_reason"] = {
             "orphaned_user_turns": audit["orphaned_user_turns"],
+            "ended_on_announcement": audit["ended_on_announcement"],
             "user_messages": audit["user_messages"],
             "assistant_messages": audit["assistant_messages"],
             "failed_turns": [],
-            "note": "backfilled: saved before completeness was recorded",
+            "note": note,
         }
         path.write_text(_serialize_session_data(data), encoding="utf-8")
         marked.append(path.stem)
@@ -274,6 +332,7 @@ def save_session(
     if not complete:
         session_data["incomplete_reason"] = {
             "orphaned_user_turns": audit["orphaned_user_turns"],
+            "ended_on_announcement": audit["ended_on_announcement"],
             "user_messages": audit["user_messages"],
             "assistant_messages": audit["assistant_messages"],
             "failed_turns": failed_turns,

@@ -268,6 +268,15 @@ class _Stream:
                       "cached_input_tokens": cached_prompt_tokens(usage)},
         })
         self._final.malformed_tool_args = malformed
+        # `stop_reason` above deliberately reports "tool_use" for a truncated
+        # reply that still carried tool calls — the caller's job is to run
+        # them. But truncation is also the one thing that can silently *lose*
+        # a call the model meant to make, and a cut-off argument list is not
+        # always cut off mid-JSON: it can stop cleanly between two calls, so
+        # `malformed_tool_args` stays 0 and the loss is invisible. Recorded
+        # separately so `core.loop` can decline to serve the turn from an
+        # assembly it knows is incomplete.
+        self._final.output_truncated = (finish_reason == "length")
         yield _Event("message_stop")
 
     def get_final_message(self) -> Message:

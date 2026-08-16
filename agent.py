@@ -35,6 +35,7 @@ import threading
 import subprocess
 import urllib.request
 import urllib.error
+import html as html_module
 from pathlib import Path
 import dataclasses
 from typing import Any, Callable, Optional
@@ -1700,13 +1701,14 @@ TOOLS: list[dict] = [
     },
     {
         "name": "fetch_url",
-        "description": "Fetch content from a URL (HTTP/HTTPS). Returns the response body as text.",
+        "description": "Fetch a URL (HTTP/HTTPS). HTML is returned as readable text with scripts and styles removed. Retries once without TLS verification if the certificate cannot be validated, and labels the result. PDFs are not decoded — it says how to read them instead.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "URL to fetch"},
-                "timeout": {"type": "integer", "description": "Timeout in seconds. Default 30."},
-                "max_size": {"type": "integer", "description": "Max response size in bytes. Default 50000000."},
+                "timeout": {"type": "integer", "description": "Timeout in seconds. Default 15."},
+                "max_size": {"type": "integer", "description": "Max bytes to read. Default 200000; the response is clipped, not refused."},
+                "raw": {"type": "boolean", "description": "Return HTML markup instead of extracted text. Default false — only set this when you need the tags themselves."},
             },
             "required": ["url"],
         },
@@ -2263,7 +2265,15 @@ def _normalise_windows_command(cmd: str) -> tuple[str, Optional[str]]:
     if m and ("\n" in m.group("code") or "'" in m.group("code")):
         temp_dir = tempfile.mkdtemp(prefix="tomas_exec_")
         script = Path(temp_dir) / "_exec.py"
-        script.write_text(m.group("code"), encoding="utf-8")
+        # The code reached us still escaped for cmd.exe's outer double quotes
+        # (a caller who needs a literal `"` inside `-c "..."` has to write
+        # `\"`, e.g. `f'{d[\"x\"]}'`), but the temp file has no outer quoting
+        # to survive — writing `\"` verbatim leaves a bare backslash inside
+        # an f-string expression, a SyntaxError. Measured live: two separate
+        # sessions each hit exactly this and burned a run_command call before
+        # working around it by hand. Unescape before writing.
+        code = m.group("code").replace('\\"', '"')
+        script.write_text(code, encoding="utf-8")
         named = m.group("exe").strip('"')
         # A pathed interpreter is a choice; a bare one is a guess we can improve.
         exe = named if ("\\" in named or "/" in named) else sys.executable
@@ -2321,12 +2331,64 @@ def _kill_process_tree(proc: "subprocess.Popen") -> None:
         proc.kill()
 
 
+def _console_codepages() -> list[str]:
+    """Encodings a Windows console command might actually have written in.
+
+    `PYTHONIOENCODING=utf-8` makes *Python* children emit UTF-8, and the pipe
+    was decoded as UTF-8 on that basis. But `dir`, `type` and the rest of
+    cmd.exe's builtins emit the OEM codepage regardless — 866 on a Ukrainian
+    or Russian Windows — so every Cyrillic filename came back as replacement
+    characters. Measured in two live sessions, both of which were looking at
+    a directory whose one interesting file was named
+    `Коваль_Олександр_Дмитрович_CURSOVA.docx` and saw
+    `������_����ᠭ��_����஢��_CURSOVA.docx`.
+    """
+    pages = ["utf-8"]
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            for fn in ("GetOEMCP", "GetACP"):
+                cp = getattr(ctypes.windll.kernel32, fn)()
+                if cp:
+                    pages.append(f"cp{cp}")
+        except Exception:
+            pages += ["cp866", "cp1251"]
+    return pages
+
+
+def _decode_console(data: bytes) -> str:
+    """Decode command output, line by line, best encoding first.
+
+    Per line rather than per stream because one command can produce both:
+    `dir & python -c "print('привіт')"` writes OEM bytes and then UTF-8 bytes
+    into the same pipe, and any single whole-stream choice mangles one half.
+    A line that decodes as UTF-8 was UTF-8 — the encoding is
+    self-validating, and ASCII (most output) decodes identically either way.
+    """
+    if not data:
+        return ""
+    pages = _console_codepages()
+    out = []
+    for line in data.split(b"\n"):
+        for page in pages:
+            try:
+                out.append(line.decode(page))
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+        else:
+            out.append(line.decode("utf-8", errors="replace"))
+    return "\n".join(out)
+
+
 def _run_command_foreground(cmd: str, env: dict, timeout: int) -> str:
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+    # Binary pipes: the encoding is decided per line afterwards, because it
+    # is not one encoding. See `_decode_console`.
     proc = subprocess.Popen(
         cmd, shell=True, cwd=str(PROJECT_DIR), env=env,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        encoding="utf-8", errors="replace", creationflags=creationflags,
+        creationflags=creationflags,
     )
     deadline = time.monotonic() + timeout
     stdout = stderr = ""
@@ -2335,7 +2397,8 @@ def _run_command_foreground(cmd: str, env: dict, timeout: int) -> str:
             # Polled in short slices rather than one blocking wait, so an Esc
             # interrupt takes effect within a fraction of a second instead of
             # only at the timeout.
-            stdout, stderr = proc.communicate(timeout=0.25)
+            raw_out, raw_err = proc.communicate(timeout=0.25)
+            stdout, stderr = _decode_console(raw_out), _decode_console(raw_err)
             break
         except subprocess.TimeoutExpired:
             if _CURRENT_INTERRUPT is not None and _CURRENT_INTERRUPT.is_set():
@@ -2351,7 +2414,9 @@ def _run_command_foreground(cmd: str, env: dict, timeout: int) -> str:
                 # the pipes after the kill, or a 120 s test run reports the
                 # bare fact that time ran out and nothing it printed.
                 try:
-                    stdout, stderr = proc.communicate(timeout=5)
+                    raw_out, raw_err = proc.communicate(timeout=5)
+                    stdout = _decode_console(raw_out)
+                    stderr = _decode_console(raw_err)
                 except Exception:
                     stdout = stderr = ""
                 timed_out = []
@@ -2377,8 +2442,35 @@ def _run_command_foreground(cmd: str, env: dict, timeout: int) -> str:
         body = body[:15000] + "\n\n... [truncated] ...\n\n" + body[-15000:]
     # The exit code is always reported. A command that fails while still
     # writing to stdout used to be indistinguishable from one that succeeded.
-    status = "ok" if proc.returncode == 0 else f"FAILED (exit {proc.returncode})"
+    if proc.returncode == 0:
+        status = "ok"
+    elif _is_compound(cmd):
+        # A shell chain exits with the status of its *last* command, so
+        # `dir existing & dir missing` is reported as a failure even though
+        # the first half produced exactly what was asked for. Measured: a
+        # session read that banner, treated the whole result as void, and
+        # spent its next turn re-running the half that had already worked.
+        status = (f"last command in the chain failed (exit {proc.returncode}) "
+                  f"— earlier commands may have succeeded; their output is below")
+    else:
+        status = f"FAILED (exit {proc.returncode})"
     return f"[exit {proc.returncode} — {status}]\n{body}"
+
+
+#: Shell separators that chain several commands into one call. `&&` and `||`
+#: are covered by the `&` and `|` members: this only needs to know that more
+#: than one command ran, not how they were joined.
+_COMPOUND_SEPARATORS = ("&", "|", ";", "\n")
+
+
+def _is_compound(cmd: str) -> bool:
+    """Whether this call ran more than one command.
+
+    Quoted separators do not count — `python -c "print('a&b')"` is one
+    command — so anything inside quotes is blanked before looking.
+    """
+    outside = re.sub(r'"[^"]*"|\'[^\']*\'', "", cmd)
+    return any(sep in outside for sep in _COMPOUND_SEPARATORS)
 
 
 def handle_run_command(params: dict) -> str:
@@ -2657,6 +2749,83 @@ def handle_ask_user_question(params: dict) -> str:
     return json.dumps({"answers": answered}, ensure_ascii=False)
 
 
+def _ssl_context_with_certifi():
+    """Default SSL context, pointed at certifi's CA bundle when available.
+
+    Bare `urlopen` on this project's Windows/MSYS2 Python builds fails every
+    HTTPS request with CERTIFICATE_VERIFY_FAILED — that interpreter has no
+    usable system CA store wired into `ssl`. Measured in two live sessions:
+    every `fetch_url` call hit the error and fell back to the much slower
+    `fetch_url_with_browser` (or was abandoned). certifi is already present
+    as a transitive dependency; reuse its bundle instead of adding one.
+    """
+    import ssl
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+#: Default read ceiling. Was 50,000,000 — a number that never once stopped
+#: anything, while the thing actually worth limiting went unbounded: measured
+#: across three live sessions, tool results occupied 110-134k characters of a
+#: ~250k-character transcript, and the largest single one was 15,681
+#: characters of HTML whose text content was 2,152 (14%). The transcript is
+#: re-sent on every subsequent step, so one fetch is paid for many times.
+_FETCH_MAX_BYTES = 200_000
+
+_UNREADABLE_ELEMENTS = ("script", "style", "noscript", "template")
+_SCRIPT_STYLE_RES = {
+    tag: re.compile(rf"<{tag}\b[^>]*>.*?</{tag}\s*>", re.IGNORECASE | re.DOTALL)
+    for tag in _UNREADABLE_ELEMENTS
+}
+_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_BLANK_LINES_RE = re.compile(r"\n\s*\n\s*\n+")
+
+
+def _html_to_text(html: str) -> str:
+    """Readable text from a page, with the parts nobody can read removed.
+
+    `fetch_url` returned the raw bytes. On the VNTU department pages that
+    every measured session went to, that is 10-14 `<script>` blocks, inline
+    CSS and Google Analytics wrapped around the five names the agent came
+    for. The names were genuinely there — this is not a correctness fix — but
+    the model had to find them inside markup, and every later step paid for
+    the markup again.
+
+    Deliberately not a parser: no dependency, and a malformed page still
+    yields its text. `<script>`/`<style>` bodies go first (their *contents*
+    are the noise, so dropping only the tags would keep the JavaScript), then
+    tags, then entities, then runs of blank lines.
+    """
+    text = _HTML_COMMENT_RE.sub(" ", html)
+    for tag, pattern in _SCRIPT_STYLE_RES.items():
+        # Guarded on the closing tag: a document with many *unclosed*
+        # `<script>` makes the non-greedy body scan to end-of-input once per
+        # opener — 2.0s on a 169 KB adversarial input, against 8ms on a
+        # realistic 234 KB page. If nothing closes, there is no pair to
+        # remove and the generic tag pass below handles the orphans.
+        if f"</{tag}" in text or f"</{tag.upper()}" in text:
+            text = pattern.sub(" ", text)
+    # Keep block boundaries as newlines so a list of names does not come back
+    # as one run-on line.
+    text = re.sub(r"(?i)<(br|/p|/div|/li|/tr|/h[1-6])\b[^>]*>", "\n", text)
+    text = _TAG_RE.sub(" ", text)
+    text = html_module.unescape(text)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r" ?\n ?", "\n", text)
+    return _BLANK_LINES_RE.sub("\n\n", text).strip()
+
+
+def _looks_like_html(data: bytes, content_type: str) -> bool:
+    if "html" in content_type.lower():
+        return True
+    head = data[:2048].lstrip().lower()
+    return head.startswith(b"<!doctype html") or head.startswith(b"<html")
+
+
 def handle_fetch_url(params: dict) -> str:
     """Fetch content from a URL."""
     import urllib.request
@@ -2664,7 +2833,11 @@ def handle_fetch_url(params: dict) -> str:
 
     url = params["url"]
     timeout = int(params.get("timeout", 15))
-    max_size = int(params.get("max_size", 50000000))  # matches the schema (fetch_url_with_browser uses the same default)
+    max_size = int(params.get("max_size", _FETCH_MAX_BYTES))
+    # Opt-out for the rare caller that genuinely wants markup (scraping a
+    # specific attribute, checking a meta tag). Text is the default because
+    # every measured use of this tool wanted the text.
+    want_raw = bool(params.get("raw"))
 
     # Basic URL validation
     if not url.startswith(("http://", "https://")):
@@ -2676,29 +2849,74 @@ def handle_fetch_url(params: dict) -> str:
         if pattern in url:
             return f"Error: blocked URL pattern: {pattern}"
 
-    try:
+    def _get(context, note: str) -> str:
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "Agent-for-TOM/1.0 (fetch_url tool)"},
         )
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            # Check content length if available
-            content_length = response.headers.get("Content-Length")
-            if content_length and int(content_length) > max_size:
-                return f"Error: response too large ({content_length} bytes, max {max_size})"
-
-            # Read with size limit
+        with urllib.request.urlopen(req, timeout=timeout, context=context) as response:
+            content_type = response.headers.get("Content-Type", "")
+            # Read one byte past the limit so truncation is detectable, then
+            # keep what fits rather than refusing the whole response. A hard
+            # error here sent one session to a headless browser for a page it
+            # already had the useful half of.
             data = response.read(max_size + 1)
-            if len(data) > max_size:
-                return f"Error: response exceeds max size ({max_size} bytes)"
+            clipped = len(data) > max_size
+            data = data[:max_size]
 
-            # Decode
-            content = data.decode("utf-8", errors="replace")
-            return content
+        if "pdf" in content_type.lower() or url.lower().endswith(".pdf"):
+            # A PDF is not text and must not be decoded as if it were. The
+            # browser tool cannot help either — it aborts with "Download is
+            # starting" — so say what to do instead of returning mojibake.
+            return (f"{note}[{len(data)} bytes of application/pdf — not decoded]\n"
+                    f"Read it with PyMuPDF instead:\n"
+                    f"  python -c \"import pymupdf,urllib.request,ssl;"
+                    f"ctx=ssl.create_default_context();ctx.check_hostname=False;"
+                    f"ctx.verify_mode=ssl.CERT_NONE;"
+                    f"d=urllib.request.urlopen({url!r},context=ctx).read();"
+                    f"doc=pymupdf.open(stream=d,filetype='pdf');"
+                    f"print(doc[0].get_text())\"")
+
+        text = data.decode("utf-8", errors="replace")
+        if not want_raw and _looks_like_html(data, content_type):
+            stripped = _html_to_text(text)
+            saved = len(text) - len(stripped)
+            if saved > 0:
+                note += (f"[html→text: {len(text)}→{len(stripped)} chars; "
+                         f"pass raw=true for markup]\n")
+            text = stripped
+        if clipped:
+            note += (f"[clipped at {max_size} bytes — raise max_size if the "
+                     f"rest is needed]\n")
+        return note + text
+
+    try:
+        return _get(_ssl_context_with_certifi(), "")
     except urllib.error.HTTPError as e:
         return f"Error: HTTP {e.code} {e.reason}"
     except urllib.error.URLError as e:
-        return f"Error: {e.reason}"
+        # A host whose certificate chain is broken is not a transient failure,
+        # and retrying it verified never works. Measured across three
+        # sessions: 12 fetch_url calls, 8 failures, 7 of them
+        # CERTIFICATE_VERIFY_FAILED against the same host — after which one
+        # session wrote its own urllib script with CERT_NONE and got the file,
+        # and the other two abandoned the source. Retry once unverified and
+        # label the result, so the model can weigh it rather than be blocked
+        # by it. Labelled, not silent: an unauthenticated page is a weaker
+        # source and the reader has to know which one they got.
+        if "CERTIFICATE_VERIFY_FAILED" not in str(e.reason):
+            return f"Error: {e.reason}"
+        try:
+            import ssl
+            unverified = ssl.create_default_context()
+            unverified.check_hostname = False
+            unverified.verify_mode = ssl.CERT_NONE
+            return _get(unverified,
+                        "[cert-unverified: this host's TLS certificate could "
+                        "not be validated; content fetched anyway]\n")
+        except Exception as retry_error:
+            return (f"Error: {e.reason} (retry without certificate "
+                    f"verification also failed: {retry_error})")
     except Exception as e:
         return f"Error: {e}"
 
@@ -2784,6 +3002,21 @@ def handle_fetch_url_with_browser(params: dict) -> str:
         return f"Error: {e}"
 
 
+def _usable_result(title: str, href: str) -> bool:
+    """Whether a search hit is something the model can act on.
+
+    The `ddgs` backend rotates between engines, and the Startpage one
+    occasionally yields its own click-tracking entry instead of a result:
+    empty title, empty snippet, and a relative
+    `/clev?event=StartpageResultClick&...&payload={...}` href carrying a few
+    hundred characters of session JSON. Seen three times across three
+    measured sessions, always as result #1, which is the one a model reads
+    most carefully. Nothing downstream can fetch a relative URL, so this is
+    pure cost.
+    """
+    return bool(title.strip()) and href.strip().startswith(("http://", "https://"))
+
+
 def handle_search_web(params: dict) -> str:
     """Search the internet using DDGS / Playwright by default, with fallbacks."""
     query = params["query"]
@@ -2797,15 +3030,23 @@ def handle_search_web(params: dict) -> str:
             from duckduckgo_search import DDGS
 
         results = []
+        skipped = 0
         with DDGS() as ddgs:
-            for i, r in enumerate(ddgs.text(query, max_results=max_results)):
-                title = r.get("title", "?")
-                body = r.get("body", "?")
-                href = r.get("href", "?")
-                results.append(f"{i+1}. {title}\n   {body}\n   URL: {href}")
+            for r in ddgs.text(query, max_results=max_results):
+                title = r.get("title") or ""
+                body = r.get("body") or ""
+                href = r.get("href") or ""
+                if not _usable_result(title, href):
+                    skipped += 1
+                    continue
+                results.append(f"{len(results)+1}. {title}\n   {body}\n   URL: {href}")
 
         if results:
-            return f"Search results for '{query}':\n\n" + "\n\n".join(results)
+            # Counted rather than hidden: a query that returns two usable hits
+            # out of eight is a query worth rewording, and silently showing
+            # two looks like the engine simply had little to say.
+            note = f" ({skipped} unusable result(s) skipped)" if skipped else ""
+            return f"Search results for '{query}'{note}:\n\n" + "\n\n".join(results)
 
     except Exception:
         pass
@@ -2862,13 +3103,19 @@ def handle_search_web(params: dict) -> str:
             f"https://html.duckduckgo.com/html/?q={encoded}",
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10, context=_ssl_context_with_certifi()) as resp:
             html = resp.read().decode('utf-8', errors='ignore')
             results = []
             matches = re.findall(r'<a class="result__a" href="([^"]+)">(.*?)</a>', html)
-            for i, (href, title_html) in enumerate(matches[:max_results]):
+            for href, title_html in matches:
                 clean_title = re.sub(r'<[^>]+>', '', title_html).strip()
-                results.append(f"{i+1}. {clean_title}\n   URL: {href}")
+                # Same filter as the primary path — this fallback scrapes a
+                # results page and can pick up the same relative redirects.
+                if not _usable_result(clean_title, href):
+                    continue
+                results.append(f"{len(results)+1}. {clean_title}\n   URL: {href}")
+                if len(results) >= max_results:
+                    break
             if results:
                 return f"Search results for '{query}':\n\n" + "\n\n".join(results)
     except Exception as e:
@@ -3115,7 +3362,22 @@ MAX_INSTRUCTIONS_CHARS = 40000      # AGENTS.md + CLAUDE.md + global instruction
 MAX_DIRECTIVES_CHARS = 1000         # standing rules (bounded by MAX_DIRECTIVES too)
 MAX_LEARNED_CHARS = 1500            # retrieved facts (bounded by k, not by store size)
 MAX_SKILLS_CHARS = 4000             # skills section
-MAX_TRIGGERED_SKILL_CHARS = 6000    # full body of a skill this message triggers
+#: Full body of a skill this message triggers. Raised twice, both times on the
+#: same measurement: whatever SKILL.md does not state, the model goes and
+#: reads out of the scripts, and that text then sits in the transcript and is
+#: re-sent on every later step.
+#:
+#:   6000 -> 7200  the block schema. Three sessions each read 4-5 source
+#:                 files — ~44,000 characters, ~11k tokens — to learn it.
+#:   7200 -> 8600  the per-check thresholds. A later session read *ten*
+#:                 files, 39,849 characters, and finished its turn having
+#:                 produced no document at all.
+#:
+#: ~350 tokens of skill body, only when the skill triggers, against ~10k of
+#: source reading is not a close call. It is still bounded by
+#: MAX_TOTAL_SYSTEM_PROMPT; if this needs raising a third time, the answer is
+#: probably to split the reference half into a file the model opens once.
+MAX_TRIGGERED_SKILL_CHARS = 8600
 MAX_TOTAL_SYSTEM_PROMPT = 44000     # hard cap on the entire system prompt.
 # ~11k tokens against the 200k context the default models actually have.
 #
@@ -4007,6 +4269,63 @@ def _recent_user_text(messages: list, turns: int = TOOL_CONTEXT_TURNS) -> str:
     return "\n".join(weighted)[:TOOL_CONTEXT_CHARS]
 
 
+#: How many of the most recent messages are scanned for a failed tool result.
+#: Small: the point is the failure the turn is *stuck on* right now, not every
+#: error the session ever produced.
+FAILURE_CONTEXT_MESSAGES = 4
+
+#: Error text → words describing the capability that gets past it.
+#:
+#: Selection scores tools against the user's message, and a user asking for a
+#: lab report says nothing about TLS. So when a call fails, the capability
+#: needed to recover is exactly the one that cannot be scored — measured
+#: across three sessions: 7 CERTIFICATE_VERIFY_FAILED against one host, after
+#: which one session wrote its own urllib script with CERT_NONE and two
+#: abandoned the source, while `stealthy_fetch` sat in the pool unselected
+#: the whole time.
+#:
+#: These add *words to the query*, never tool names to the result. Relevance
+#: still decides, so a mapping that guesses wrong costs a few keywords rather
+#: than a wrong tool in the payload.
+_FAILURE_HINTS: tuple[tuple[str, str], ...] = (
+    ("CERTIFICATE_VERIFY_FAILED", "stealthy fetch browser page html certificate tls"),
+    ("SSLError", "stealthy fetch browser page html certificate tls"),
+    ("Download is starting", "pdf download extract text document"),
+    ("HTTP 403", "stealthy fetch browser page bypass"),
+    ("HTTP 429", "stealthy fetch browser page"),
+    ("HTTP 999", "stealthy fetch browser page"),
+    ("no such file", "list files directory search"),
+    ("file not found", "list files directory search"),
+    ("FileNotFoundError", "list files directory search"),
+    ("ModuleNotFoundError", "install package documentation library"),
+    ("is not recognized as an internal", "list files directory search"),
+)
+
+
+def _failure_context(messages: list) -> str:
+    """Words describing what would get past the most recent tool failures.
+
+    Returns "" when nothing recent failed, which is the common case and must
+    stay free: adding keywords on a healthy turn would pull unrelated tools
+    into a payload that is deliberately under-filled.
+    """
+    hints: list[str] = []
+    for m in reversed((messages or [])[-FAILURE_CONTEXT_MESSAGES:]):
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            body = block.get("content")
+            if not isinstance(body, str):
+                continue
+            for needle, words in _FAILURE_HINTS:
+                if needle.lower() in body.lower() and words not in hints:
+                    hints.append(words)
+    return " ".join(hints)
+
+
 def tools_for_turn(messages: list) -> tuple[list[dict], list[dict]]:
     """Pick this turn's tool payload.
 
@@ -4020,6 +4339,12 @@ def tools_for_turn(messages: list) -> tuple[list[dict], list[dict]]:
         context = f"{context}\n{self_improve.get_session_analysis().get('purpose', '')}"
     except Exception:
         pass
+    # Appended, not substituted: the turn is still about what the user asked
+    # for, and the recovery capability is an addition to that, not a
+    # replacement for it.
+    failure = _failure_context(messages)
+    if failure:
+        context = f"{context}\n{failure}"
     return select_tools(pool, context, tool_ceiling())
 
 

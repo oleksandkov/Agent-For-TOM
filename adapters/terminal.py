@@ -33,6 +33,7 @@ from core.events import (
     RetryScheduled,
     StreamingDisabled,
     TextDelta,
+    AnnouncedWithoutActing,
     ToolCallsRecovered,
     ToolFinished,
     ToolResultTruncated,
@@ -329,6 +330,14 @@ class TerminalAdapter:
             names = ', '.join(event.names)
             print(f'  {YELLOW}↻{RESET} {DIM}the model wrote its tool call as text '
                   f'— recovered: {names}{RESET}')
+
+        elif isinstance(event, AnnouncedWithoutActing):
+            # The announcement is already on screen. Without this line the
+            # user watches the model restate its plan and cannot tell that
+            # the turn is still going.
+            self._end_stream_line()
+            print(f'  {YELLOW}↻{RESET} {DIM}the reply described the next step '
+                  f'instead of taking it — asking for it once{RESET}')
 
         elif isinstance(event, StreamingDisabled):
             print(f'\n  {YELLOW}⚠{RESET} {DIM}streaming unavailable on this provider '

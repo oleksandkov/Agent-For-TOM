@@ -134,6 +134,20 @@ class TruncatedOutputDiscarded(AgentEvent):
 
 
 @dataclass
+class AnnouncedWithoutActing(AgentEvent):
+    """The reply described the next step instead of taking it, and the turn
+    is asking for it once rather than ending there.
+
+    Adapters SHOULD render this: the announcement itself has already reached
+    the screen, so without a line saying the turn is continuing, the user
+    sees the model repeat its plan and cannot tell whether anything is
+    happening. Measured on `hy3-free`: two turns in one session ended this
+    way, the session was saved `complete: true`, and no file was produced.
+    """
+    announcement: str
+
+
+@dataclass
 class ToolCallsRecovered(AgentEvent):
     """The model wrote its tool call as text and the core lifted it back out.
 
@@ -171,6 +185,12 @@ class TurnFinished(AgentEvent):
     # natural end_turn/error. Adapters use it to render "stopped" rather
     # than "finished".
     interrupted: bool = False
+    #: Seconds spent past `max_turn_seconds`, when the ceiling was passed.
+    #: The ceiling is checked between steps, so a step that starts just
+    #: inside it can finish well outside — measured, 1279.8s against a
+    #: 1200s limit, saved as a clean success with nothing saying so. Zero
+    #: when the turn stayed inside its allowance or had none.
+    overran_by: float = 0.0
 
 
 @dataclass
