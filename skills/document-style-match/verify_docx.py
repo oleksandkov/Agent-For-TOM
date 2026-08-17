@@ -18,10 +18,28 @@ import os
 import sys
 import json
 
-from analyze_docx import analyze
+from analyze_docx import analyze, style_signatures
 
 CM_TOLERANCE = 0.05
 PT_TOLERANCE = 0.5
+
+#: A formatting combination this share of the document is structural — it is
+#: how a section heading, a body paragraph or a numbered item is set, and the
+#: output is expected to use it too. Below this, one block happened to be
+#: formatted that way and reproducing it is not required.
+PROMINENT_SHARE = 0.05
+
+#: How far a structural signature's share may fall in the output before it
+#: counts as lost. Generous, because the output is a different document: the
+#: sample's five centered headings may legitimately become four.
+UNDERUSE_RATIO = 0.4
+
+#: …and it has to be at least this many paragraphs, whatever the share says.
+#: A share alone makes every single paragraph "structural" in a short
+#: document — in an eleven-block one, a lone 9pt caption is 9% and got
+#: reported as an invented formatting. Two is the smallest number that can be
+#: a pattern rather than an instance.
+PROMINENT_MIN_BLOCKS = 2
 
 
 def _flatten(contract: dict) -> dict:
@@ -66,6 +84,109 @@ def verify_rhythm(structure_path: str, docx_path: str) -> list[str]:
     if want_breaks and got_breaks == 0:
         problems.append(f"page breaks: got 0, sample has {want_breaks} "
                         f"— sections that should start on a new page do not")
+    return problems
+
+
+def _triple(sig: dict) -> tuple:
+    """A signature reduced to what must survive into the output.
+
+    `align: None` is python-docx for "inherited", which renders left — and a
+    heading that lost its centering arrives here as None, not as "left", so
+    normalising is what makes the two comparable at all. Indent is bucketed to
+    a millimetre because the renderer writes the contract's own number back
+    and an exact float compare would fail on rounding, not on layout.
+    """
+    align = sig.get("align") or "left"
+    indent = sig.get("indent_cm")
+    return (str(align), bool(sig.get("bold")), sig.get("size_pt"),
+            round(indent, 1) if isinstance(indent, (int, float)) else None)
+
+
+def _describe(triple: tuple) -> str:
+    align, bold, size, indent = triple
+    return (f"{align}{'+bold' if bold else ''} at {size}pt"
+            f"{f', indent {indent}cm' if indent else ''}")
+
+
+def _profile(signatures: list[dict]) -> dict[tuple, tuple[float, int]]:
+    """Each formatting combination's (share, count) over the real paragraphs.
+
+    Shares carry the comparison: the output is a different document about a
+    different topic and is entitled to a different length, and a count
+    comparison called a correct 63-paragraph rebuild of a 41-paragraph sample
+    "too many headings". Counts are kept alongside only to floor it — see
+    `PROMINENT_MIN_BLOCKS`.
+    """
+    total = sum(s.get("count", 0) for s in signatures)
+    if not total:
+        return {}
+    merged: dict[tuple, int] = {}
+    for s in signatures:
+        merged[_triple(s)] = merged.get(_triple(s), 0) + s.get("count", 0)
+    return {t: (n / total, n) for t, n in merged.items()}
+
+
+def verify_signatures(contract: dict, blocks: list) -> list[str]:
+    """Did the output keep the sample's *formatting vocabulary*?
+
+    Every other check here compares a number that is the same everywhere in
+    the document — page size, body font, line spacing. None of them can see
+    the thing a reader notices first, which is a heading that stopped being
+    centered, and one measured run proves the gap is not theoretical: a
+    rebuild set `Загальні відомості` flush left, dropped bold from the topic
+    line and lost the 20pt title style altogether, and reported success
+    because every scalar field it *did* set was right.
+
+    Measured on that pair, sample against output:
+
+        center+bold 20.0pt   7.3%  ->   absent   (title style gone)
+        center+bold 14.0pt  12.2%  ->     1.6%   (headings no longer centered)
+        justify 14.0pt/1.73  19.5% ->   absent   (numbered items lost indent)
+        left+bold 14.0pt     absent ->    6.3%   (what they became instead)
+
+    against a correct rebuild of the same sample, whose eight signatures all
+    landed within about one percentage point. So the check is symmetric: a
+    structural signature of the sample must survive into the output, and the
+    output may not invent a prominent one the sample never uses. Anything
+    rarer than `PROMINENT_SHARE` is left alone — that is one block formatted
+    oddly, not a pattern.
+    """
+    want = _profile(contract.get("style_signatures") or [])
+    got = _profile(style_signatures(blocks))
+    if not want or not got:
+        return []
+
+    problems = []
+    for triple, (share, count) in sorted(want.items(), key=lambda kv: -kv[1][0]):
+        if share < PROMINENT_SHARE or count < PROMINENT_MIN_BLOCKS:
+            continue
+        mine = got.get(triple, (0.0, 0))[0]
+        if mine >= share * UNDERUSE_RATIO:
+            continue
+        # Name what the output used instead. "center+bold 14pt is missing"
+        # sends you looking for a lost paragraph; "the output sets those
+        # left+bold" names the line to change. Candidates that kept the weight
+        # rank first — a heading that lost its centering is still bold, and
+        # pointing at the body paragraphs instead answered the wrong question.
+        instead = sorted(
+            (t for t in got if t[2] == triple[2] and t != triple),
+            key=lambda t: (t[1] != triple[1], -got[t][0]))
+        alternative = (f" — the output sets {_describe(instead[0])} instead"
+                       if instead else "")
+        problems.append(
+            f"formatting lost: the sample sets {_describe(triple)} for "
+            f"{share:.0%} of its paragraphs, the output for {mine:.0%}"
+            f"{alternative}")
+
+    for triple, (share, count) in sorted(got.items(), key=lambda kv: -kv[1][0]):
+        if share < PROMINENT_SHARE or count < PROMINENT_MIN_BLOCKS:
+            continue
+        if triple in want:
+            continue
+        problems.append(
+            f"formatting invented: {count} of the output's paragraphs "
+            f"({share:.0%}) are {_describe(triple)}, which the sample never "
+            f"uses")
     return problems
 
 
@@ -119,6 +240,13 @@ def verify(contract_path: str, docx_path: str) -> tuple[list[str], list[str]]:
         tolerance = PT_TOLERANCE if key.endswith("_pt") else CM_TOLERANCE
         if abs(actual - expected) > tolerance:
             problems.append(f"{key}: got {actual}, contract {expected}")
+
+    # Runs last so the scalar mismatches — page size, fonts, spacing — read
+    # first. They are usually the cause, and a document built on Letter paper
+    # has bigger problems than its heading alignment.
+    problems += verify_signatures(contract, measured.get("blocks", []))
+    if not contract.get("style_signatures"):
+        unchecked.append("style_signatures")
     return problems, unchecked
 
 

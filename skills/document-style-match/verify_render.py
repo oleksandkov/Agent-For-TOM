@@ -40,7 +40,27 @@ ROW_TOLERANCE_PT = 1.5
 MAX_SPLIT_RATIO = 1.5
 
 #: Blank lines per 100 text rows, as a share of the sample's rate.
-BLANK_DENSITY_TOLERANCE = 0.30
+#:
+#: Wide, and deliberately so. The metric divides by rows, and rows scale with
+#: how much prose each section holds — so an output that reproduced every one
+#: of the sample's spacers still reads low when its sections are longer than
+#: the sample's. Measured: two rebuilds of the same methodichka, one correct
+#: and one built on the wrong paper size, came in at 10.7% and 9.9% against a
+#: sample's 15.5% — the metric failed both and separated neither. At 0.45 the
+#: failure this was written for (a rebuild carrying a *third* of the sample's
+#: blank lines) is still caught, and the absolute spacer count — which does
+#: not have the coupling — is checked properly by `verify_docx.verify_rhythm`
+#: against the structure file.
+BLANK_DENSITY_TOLERANCE = 0.45
+
+#: Median row-to-row distance, as a share of the sample's. This is line
+#: spacing as the page actually renders it, and nothing else here could see
+#: it: a rebuild left at python-docx's default 1.15 against a sample's 1.5
+#: measured 18.60 against 24.12 — a fifth of the page's vertical rhythm gone —
+#: while `split_rate`, `blank_density` and `chars_per_row` all passed it. The
+#: band is tight because pitch follows from body size and line spacing, both
+#: of which the contract fixes; drift here means one of them was not applied.
+PITCH_TOLERANCE = 0.12
 
 #: Mean characters per rendered row, as a share of the sample's.
 ROW_FILL_TOLERANCE = 0.30
@@ -135,18 +155,45 @@ def compare(sample: dict, output: dict) -> tuple[list[str], list[str]]:
             f"stretched lines: {output['splits']} of {output['rows']} rows "
             f"({output['split_rate']:.0%}) against the sample's "
             f"{sample['split_rate']:.0%} — paragraphs are ending on a "
-            f"partly-filled line. Usually means each block holds about one "
-            f"line of text instead of a whole paragraph.")
+            f"partly-filled line, and justification is stretching the word "
+            f"gaps to fill it. FIX THE TEXT, NOT THE RENDERER: give the short "
+            f"blocks more prose, up to their `target_chars`. Every PDF "
+            f"converter splits an over-stretched line, so swapping converters "
+            f"cannot move this number — one session spent half its turn "
+            f"proving that, tried reportlab and Word COM in turn, and "
+            f"finished with the same 26% and a wrong explanation.")
 
     if sample["blank_density"]:
         low, high = _band(sample["blank_density"], BLANK_DENSITY_TOLERANCE)
-        if not low <= output["blank_density"] <= high:
+        if output["blank_density"] < low:
             problems.append(
                 f"vertical rhythm: {output['blank_density'] * 100:.1f} blank "
                 f"lines per 100 rows against the sample's "
-                f"{sample['blank_density'] * 100:.1f} — "
-                f"{'too few' if output['blank_density'] < low else 'too many'} "
-                f"empty paragraphs.")
+                f"{sample['blank_density'] * 100:.1f} — too few empty "
+                f"paragraphs, so sections run into each other.")
+        elif output["blank_density"] > high:
+            # Not a failure. Extra breathing room is what a filled cover page
+            # and a shorter body look like, and failing it sent one run
+            # deleting spacers it had correctly reproduced.
+            notes.append(
+                f"{output['blank_density'] * 100:.1f} blank lines per 100 rows "
+                f"against the sample's {sample['blank_density'] * 100:.1f} — "
+                f"more open than the sample. Expected if your sections are "
+                f"shorter than its; worth a look if they are not.")
+
+    if sample["pitch"] and output["pitch"]:
+        low, high = _band(sample["pitch"], PITCH_TOLERANCE)
+        if not low <= output["pitch"] <= high:
+            ratio = output["pitch"] / sample["pitch"]
+            problems.append(
+                f"line pitch: {output['pitch']:.2f}pt between rows against the "
+                f"sample's {sample['pitch']:.2f} ({ratio:.0%}) — the rendered "
+                f"line spacing is "
+                f"{'tighter' if ratio < 1 else 'looser'} than the sample's. "
+                f"Check `line_spacing` and `body_size_pt` reached the "
+                f"document: python-docx defaults to 1.15 and writes nothing "
+                f"unless told, which is exactly this number against a 1.5 "
+                f"sample.")
 
     if sample["chars_per_row"]:
         low, high = _band(sample["chars_per_row"], ROW_FILL_TOLERANCE)

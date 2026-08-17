@@ -41,6 +41,7 @@ from core.events import (
     TruncatedOutputDiscarded,
     TurnFinished,
 )
+from core.console import CONSOLE, console_is_busy
 from core.permissions import Decision
 from text_display import (
     StreamWrap, display_width, shorten, strip_ansi, term_width, wrap,
@@ -96,15 +97,33 @@ def _poll_esc() -> bool:
 
     Windows-only — matches the msvcrt-based input handling the rest of this
     codebase already uses (see the "Windows-only REPL" note in CLAUDE.md).
-    Safe to call from a background thread: it only ever runs while the main
-    thread is blocked inside a model/tool call, never while input() is also
-    reading the console (every prompt stops the spinner first), so there is
-    no concurrent reader to race with.
+
+    Runs on a background thread, so it takes `CONSOLE` before touching the
+    keyboard and gives up immediately if it cannot. The old version reasoned
+    that it "only ever runs while the main thread is blocked inside a
+    model/tool call, never while input() is also reading the console" — which
+    was true of every prompt the *adapter* owns, and false of the one tool
+    that prompts from inside itself. Measured: throughout
+    `ask_user_question`, this stole a keystroke every 80ms, so typed
+    characters vanished and arrow keys lost half of their two-byte sequence.
+
+    `blocking=False` and not a wait: a poller that queues behind the menu is
+    a poller that reads the *next* keystroke instead, which is the same bug
+    displaced by one press.
     """
     try:
         import msvcrt
     except ImportError:
         return False
+    if not CONSOLE.acquire(blocking=False):
+        return False
+    try:
+        return _read_esc(msvcrt)
+    finally:
+        CONSOLE.release()
+
+
+def _read_esc(msvcrt) -> bool:
     if not msvcrt.kbhit():
         return False
     ch = msvcrt.getwch()
@@ -163,6 +182,13 @@ class Thinking:
                 except Exception:
                     pass
                 return
+            # Nothing is drawn while something is reading the console. The
+            # frame is written with `\r\033[2K`, which erases the line the
+            # reader is echoing into — as destructive as a stolen keystroke
+            # and harder to notice, because the text was there a moment ago.
+            if console_is_busy():
+                i += 1
+                continue
             frame = self.FRAMES[i % len(self.FRAMES)]
             secs = time.monotonic() - started
             elapsed = f" {secs:.0f}s" if secs >= 3 else ""
@@ -284,8 +310,16 @@ class TerminalAdapter:
             # The tool call itself is a blocking wait — a slow run_command
             # used to leave the screen dead between this line and the result,
             # which is exactly what read as "stuck".
-            self._thinking = Thinking(label=event.name, interrupt=self.esc_interrupt)
-            self._thinking.start()
+            #
+            # Except when the tool is the one doing the reading. The spinner
+            # polls the keyboard and rewrites its line; over an interactive
+            # prompt that means stolen keystrokes and an invisible answer.
+            # Same rule as `ask()` below — "never prompt underneath a spinner"
+            # — applied to a tool that prompts from the inside.
+            if not event.interactive:
+                self._thinking = Thinking(label=event.name,
+                                          interrupt=self.esc_interrupt)
+                self._thinking.start()
 
         elif isinstance(event, ToolFinished):
             result = event.result
@@ -336,8 +370,10 @@ class TerminalAdapter:
             # user watches the model restate its plan and cannot tell that
             # the turn is still going.
             self._end_stream_line()
-            print(f'  {YELLOW}↻{RESET} {DIM}the reply described the next step '
-                  f'instead of taking it — asking for it once{RESET}')
+            why = ('the reply was cut off before it acted'
+                   if event.reason == 'truncated'
+                   else 'the reply described the next step instead of taking it')
+            print(f'  {YELLOW}↻{RESET} {DIM}{why} — asking for it once{RESET}')
 
         elif isinstance(event, StreamingDisabled):
             print(f'\n  {YELLOW}⚠{RESET} {DIM}streaming unavailable on this provider '

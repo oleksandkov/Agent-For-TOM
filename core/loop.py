@@ -35,6 +35,7 @@ from .events import (
     TurnFinished,
     TurnStarted,
 )
+from .console import is_interactive_tool
 from .state import CYCLE_WINDOW, REPEATED_CALL_LIMIT, AgentState
 from .toolcall_text import recover as recover_text_tool_calls
 
@@ -671,6 +672,11 @@ def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
     # it is counted like any other.
     served = final_msg if (wants_tools and not state.interrupted()
                            and _stream_can_serve(final_msg)) else None
+    # Reported, never acted on here. See `AgentState.last_tool_args_truncated`.
+    state.last_tool_args_truncated = bool(
+        wants_tools and served is None and final_msg is not None
+        and (getattr(final_msg, "malformed_tool_args", 0)
+             or getattr(final_msg, "output_truncated", False)))
     if not wants_tools or served is not None:
         _record_usage(state, usage_info)
     else:
@@ -1029,10 +1035,80 @@ _ANNOUNCEMENT_RE = re.compile(
     r"let me\s+(?!know|have)\w+|now\s+(?:i'?ll|let me|i\s+will)|"
     r"i'?ll\s+(?:now\s+)?(?!know)\w+|"
     r"i\s+will\s+now|next[,\s]+i'?ll|let'?s\s+(?:now\s+)?\w+|"
-    r"зараз\s+я|тепер\s+я|далі\s+я|перейду\s+до|почну\s+з|"
-    r"давайте\s+\w+|створю|побудую|запущу|сформую"
+    r"(?:зараз|тепер|далі|потім)\s+(?:я\s+)?(?=\w)|"
+    r"перейду\s+до|почну\s+з|давайте\s+\w+|"
+    r"створю|побудую|запущу|сформую|перевірю|прочитаю|згенерую|напишу|"
+    r"додам|виправлю|оновлю|порівняю|проаналізую|відкрию|збережу|видалю|"
+    r"розгляну|зроблю|складу|підготую|виміряю|відрендерю|сконвертую"
     r")\b",
     re.IGNORECASE)
+#: The Ukrainian half above needed widening after a measured loss. `тепер я`
+#: required the pronoun and Ukrainian drops it — the reply that ended one
+#: session was "Тепер перевірю обсяги тексту…", announcement, no pronoun, and
+#: `перевірю` was not in the verb list either. The first-person perfective
+#: futures are listed explicitly rather than matched by an `-ю` suffix rule,
+#: because that suffix also ends ordinary nouns and adjectives ("з
+#: навігацією", "цією моделлю") and a suffix rule fired on almost every
+#: sentence.
+
+
+#: Shortest final line that can still be read as a sentence cut off in
+#: flight. Below it, an unpunctuated last line is a sign-off, a heading, a
+#: filename or a list item. Shared with `session_manager.audit_transcript`,
+#: which must reach the same verdict about the same transcript.
+MIN_UNFINISHED_LINE = 40
+
+
+def _ends_mid_sentence(text: str) -> bool:
+    """Does this text stop in the middle of a sentence?"""
+    stripped = (text or "").rstrip()
+    if not stripped or not stripped[-1].isalpha():
+        return False
+    return len(stripped.rsplit("\n", 1)[-1].strip()) >= MIN_UNFINISHED_LINE
+
+
+def ended_mid_work(text: str, tool_calls_made: int,
+                   stop_reason: Optional[str]) -> bool:
+    """The turn stopped in the middle of doing something, rather than finishing.
+
+    Sibling of `announces_without_acting`, for the case where the reply is not
+    a well-formed announcement because it is not well-formed at all. Measured
+    on `deepseek-v4-flash-free`, the turn ended on
+
+        "Структура повністю зрозуміла. Тепер перевірю обсяги тексту
+         (target_chars) для кожного блоку, щоб написати відповідний"
+
+    — cut off mid-phrase, no tool call, alongside 4,000 characters of
+    `reasoning_content` carrying a complete eight-step plan. The model had
+    decided what to do and spent its output budget deciding it. Nineteen of
+    forty tool calls and 394 of 1200 seconds were still unspent, and the
+    session was saved `complete: true` with two scaffolding files and no
+    deliverable.
+
+    Two signals, either of which is enough once the turn has already run
+    tools:
+
+    * `max_tokens` — the provider says it was cut off. Checked even when the
+      visible text is empty, which is the shape a reasoning model truncates
+      in, and why this cannot live inside an `if text:` branch.
+    * the last line is long and ends on a letter — no full stop, no closing
+      bracket, no code fence. A sentence that finished does not.
+
+    The length floor is not decoration. "Ends on a letter" alone flagged a
+    complete, correct session whose report closed with the user's own
+    required sign-off, `My Lord` — seven characters, no period. Sign-offs,
+    headings, bare filenames and list items are all short; a clause cut off
+    in flight is not. `MIN_UNFINISHED_LINE` sits above all of them.
+
+    `tool_calls_made` is the same guard `announces_without_acting` uses and
+    for the same reason: a first reply that answers in prose and stops is an
+    answer, not an interruption.
+    """
+    if not tool_calls_made:
+        return False
+    if stop_reason == "max_tokens":
+        return True
+    return _ends_mid_sentence(text)
 
 
 def announces_without_acting(text: str, tool_calls_made: int) -> bool:
@@ -1057,21 +1133,67 @@ def announces_without_acting(text: str, tool_calls_made: int) -> bool:
     return bool(_ANNOUNCEMENT_RE.search(tail))
 
 
-def _nudge_to_act(state: AgentState) -> None:
-    """Ask for the announced step, once, in the transcript itself.
+#: What to say back, per reason a turn is being continued instead of ended.
+_NUDGE_TEXT = {
+    "announced":
+        "You described the next step but did not take it. Do it now "
+        "with the tools — no more planning, no restating the plan. "
+        "If you genuinely cannot proceed, say exactly what is "
+        "blocking you.",
+    "truncated":
+        "Your last reply was cut off before you finished it, and no tool "
+        "was called. Do not repeat what you already wrote and do not "
+        "restate the plan — take the next action now, with the tools. If "
+        "you were about to write a long file, write it in pieces. If you "
+        "genuinely cannot proceed, say exactly what is blocking you.",
+}
+
+
+def _nudge_to_act(state: AgentState, reason: str = "announced") -> None:
+    """Ask for the interrupted step, once, in the transcript itself.
 
     The same mechanism `_deadline_wind_down` uses: a user-role message the
     model answers on the next pass. Cheaper and far more reliable than
     prompting the model not to do it in the first place, which the system
     prompt already asks for.
+
+    The truncation wording differs on one point that matters: a cut-off reply
+    is *already* in the transcript, so "carry on" reads as "write it again"
+    and the model re-emits the same paragraph into the same limit. It has to
+    be told to move, not to resume.
     """
     state.messages.append({"role": "user", "content": [
-        {"type": "text",
-         "text": "You described the next step but did not take it. Do it now "
-                 "with the tools — no more planning, no restating the plan. "
-                 "If you genuinely cannot proceed, say exactly what is "
-                 "blocking you."}
+        {"type": "text", "text": _NUDGE_TEXT.get(reason, _NUDGE_TEXT["announced"])}
     ]})
+
+
+def _maybe_continue(state: AgentState, text: str, calls_used: int,
+                    stop_reason: Optional[str],
+                    nudged: bool) -> Iterator[AgentEvent]:
+    """Continue a turn that stopped mid-work. Returns True when it did.
+
+    One place, called from both model paths, because "may the turn keep
+    going?" is a question the core owns — the same reasoning that put the
+    budget checkpoint's `needs_continuation_approval()` here rather than in a
+    responder. Both callers pass their own `stop_reason` (the streamed path
+    reports it on `state`, the non-streamed one on the response) and act on
+    the same answer, which is what `PathParity` asserts.
+
+    Fires at most once per turn: `nudged` is the caller's flag, and an
+    unbounded "keep asking" is a way to loop forever on a model that keeps
+    narrating.
+    """
+    if nudged:
+        return False
+    if announces_without_acting(text, calls_used):
+        reason = "announced"
+    elif ended_mid_work(text, calls_used, stop_reason):
+        reason = "truncated"
+    else:
+        return False
+    yield AnnouncedWithoutActing(text, reason=reason)
+    _nudge_to_act(state, reason)
+    return True
 
 
 def _can_escalate(state: AgentState, text: str, escalated: bool) -> bool:
@@ -1255,13 +1377,17 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                             state.messages.append(
                                 {"role": "assistant",
                                  "content": _text_reply_content(text, state.last_reasoning)})
-                            if not nudged and announces_without_acting(text, calls_used):
-                                nudged = True
-                                yield AnnouncedWithoutActing(text)
-                                _nudge_to_act(state)
-                                continue
                         elif state.last_stop_reason != "max_tokens":
                             yield from _report_empty_reply(state)
+                        # Outside the `if text` above: a reasoning model that
+                        # spends its whole budget thinking truncates with no
+                        # visible text at all, and that is the case with the
+                        # most left to salvage.
+                        if (yield from _maybe_continue(
+                                state, text, calls_used,
+                                state.last_stop_reason, nudged)):
+                            nudged = True
+                            continue
                         yield TurnFinished(reply=text, usage=dict(state.usage),
                                            seconds=time.perf_counter() - started,
                                overran_by=_overrun(state, started))
@@ -1272,6 +1398,18 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                     # does not fall through, and the reason is that there is
                     # nothing a non-streamed repeat could add — it would re-ask
                     # the same question and be answered in text again.
+                elif state.last_tool_args_truncated and _can_escalate(
+                        state, text, escalated):
+                    # The arguments were cut off, and the non-streamed repeat
+                    # below is made at the *same* output limit — which is how
+                    # three `write_file` calls carrying ~12 KB of content
+                    # arrived empty twice each, once streamed and once not.
+                    # Raise the limit and let the fall-through happen anyway:
+                    # the second call is still the right answer for a mangled
+                    # assembly, it just needed room. Re-streaming instead would
+                    # discard the existing recovery for the ordinary case.
+                    escalated = True
+                    yield from _escalate(state)
                 # Tools requested: use the streamed assembly when it is whole
                 # (`served`), otherwise fall through to the non-streamed call,
                 # which returns complete tool_use blocks. Either way the same
@@ -1353,13 +1491,17 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                         {"role": "assistant",
                          "content": _text_reply_content(text, _reasoning_of(response.content))})
                     yield AssistantMessage(text)
-                    if not nudged and announces_without_acting(text, calls_used):
-                        nudged = True
-                        yield AnnouncedWithoutActing(text)
-                        _nudge_to_act(state)
-                        continue
                 elif response.stop_reason != "max_tokens":
                     yield from _report_empty_reply(state)
+                # Same position and same reasoning as the streamed path: the
+                # empty-text truncation is the one worth continuing, so this
+                # cannot sit inside the `if text` branch. `PathParity` asserts
+                # the two behave identically.
+                if (yield from _maybe_continue(
+                        state, text, calls_used,
+                        response.stop_reason, nudged)):
+                    nudged = True
+                    continue
                 yield TurnFinished(reply=text, usage=dict(state.usage),
                                    seconds=time.perf_counter() - started,
                                overran_by=_overrun(state, started))
@@ -1432,7 +1574,8 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
             for block in parallel:
                 yield ToolStarted(block.id, block.name, block.input,
                                   state.risk_of(block.name, block.input),
-                                  origin=state.origin_of(block.name))
+                                  origin=state.origin_of(block.name),
+                                  interactive=is_interactive_tool(block.name))
             precomputed = _run_parallel(state, parallel)
 
         for block in tool_blocks:
@@ -1454,7 +1597,8 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
             risk = state.risk_of(block.name, block.input)
             if done is None:
                 yield ToolStarted(block.id, block.name, block.input, risk,
-                                  origin=state.origin_of(block.name))
+                                  origin=state.origin_of(block.name),
+                                  interactive=is_interactive_tool(block.name))
 
             approved = True
             if done is None and state.needs_permission(block.name, block.input):

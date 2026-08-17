@@ -286,6 +286,7 @@ if ($hasLocalSource) {
     $runtimeModules = @(
         'agent.py', 'agent_cli.py',
         'instructions_manager.py', 'mcp_manager.py', 'net_probe.py',
+        'onboarding.py',
         'openai_adapter.py', 'pdf_report_skill.py', 'provider_manager.py',
         'self_improve.py', 'self_notes.py', 'session_manager.py',
         'skills_manager.py', 'text_display.py', 'zen_catalog.py',

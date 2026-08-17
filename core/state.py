@@ -182,6 +182,17 @@ class AgentState:
     # way to reach the assistant message `run_turn` saves for a plain-text
     # reply, and every following request in the conversation was refused.
     last_reasoning: str = ""
+    # The last streamed call asked for a tool and its arguments did not
+    # survive: the JSON never parsed, or the reply was cut off at the output
+    # limit part-way through building the calls. Reported here rather than
+    # acted on in `_stream_call`, for the same reason `last_stop_reason` is —
+    # `run_turn` decides. It needs its own field because a truncated *tool*
+    # call still reports `stop_reason: "tool_use"`, so the max_tokens branch
+    # never sees it: measured across two sessions, three `write_file` calls
+    # carrying ~12 KB of content arrived as `{}` or without their `content`
+    # argument, were re-requested non-streamed at the same output limit, and
+    # truncated again.
+    last_tool_args_truncated: bool = False
     # What ended the turn, when something did. Without this a turn that died
     # on a 429 was saved as "empty_reply" with no reason attached, which is
     # exactly the unreadable record P6-11 exists to prevent.

@@ -138,10 +138,28 @@ _ANNOUNCEMENT_RE = re.compile(
     r"let me\s+(?!know|have)\w+|now\s+(?:i'?ll|let me|i\s+will)|"
     r"i'?ll\s+(?:now\s+)?(?!know)\w+|"
     r"i\s+will\s+now|next[,\s]+i'?ll|let'?s\s+(?:now\s+)?\w+|"
-    r"зараз\s+я|тепер\s+я|далі\s+я|перейду\s+до|почну\s+з|"
-    r"давайте\s+\w+|створю|побудую|запущу|сформую"
+    r"(?:зараз|тепер|далі|потім)\s+(?:я\s+)?(?=\w)|"
+    r"перейду\s+до|почну\s+з|давайте\s+\w+|"
+    r"створю|побудую|запущу|сформую|перевірю|прочитаю|згенерую|напишу|"
+    r"додам|виправлю|оновлю|порівняю|проаналізую|відкрию|збережу|видалю|"
+    r"розгляну|зроблю|складу|підготую|виміряю|відрендерю|сконвертую"
     r")\b",
     re.IGNORECASE)
+
+
+#: Kept in step with `core.loop.MIN_UNFINISHED_LINE`, and duplicated for the
+#: same reason as the regex above: this module audits transcripts it did not
+#: run. Below this length an unpunctuated last line is a sign-off, not a
+#: truncation — "ends on a letter" alone marked a finished session incomplete
+#: because its report closed with the user's required `My Lord`.
+MIN_UNFINISHED_LINE = 40
+
+
+def _ends_mid_sentence(text: str) -> bool:
+    stripped = (text or "").rstrip()
+    if not stripped or not stripped[-1].isalpha():
+        return False
+    return len(stripped.rsplit("\n", 1)[-1].strip()) >= MIN_UNFINISHED_LINE
 
 
 def _final_text(messages: list) -> str:
@@ -177,6 +195,16 @@ def audit_transcript(messages: list) -> dict:
     and build the content plan JSON…" — saved `complete: true`,
     `failed_turns: []`, and not one file written. Nothing here could see it,
     because the reply exists and reads like work.
+
+    The third question is the one the second missed. A reply can be cut off
+    before it becomes an announcement at all: measured on
+    `deepseek-v4-flash-free`, a session ended on "…щоб написати відповідний",
+    mid-phrase, with two scaffolding files and no deliverable in the output
+    directory — and was saved `complete: true`, `incomplete_reason: null`,
+    `failed_turns: []`. Prose that finished does not end on a letter, so a
+    transcript whose last word is unpunctuated did not finish either. A
+    transcript ending on a tool call with no reply after it is the same
+    failure with even less to show for it.
     """
     roles = [m.get("role") for m in messages]
     orphaned = [
@@ -185,10 +213,23 @@ def audit_transcript(messages: list) -> dict:
     ]
     tail = _final_text(messages)
     announced = bool(tail) and bool(_ANNOUNCEMENT_RE.search(tail.strip()[-400:]))
+    truncated = _ends_mid_sentence(tail)
+    # `_final_text` returns "" for a turn that only called tools, which is
+    # indistinguishable here from a turn with no text — so the last message's
+    # own shape is what separates them.
+    last = messages[-1] if messages else {}
+    unanswered_call = (
+        last.get("role") == "assistant"
+        and isinstance(last.get("content"), list)
+        and any(isinstance(b, dict) and b.get("type") == "tool_use"
+                for b in last["content"]))
     return {
-        "complete": not orphaned and not announced,
+        "complete": not orphaned and not announced and not truncated
+                    and not unanswered_call,
         "orphaned_user_turns": orphaned,
         "ended_on_announcement": announced,
+        "ended_mid_sentence": truncated,
+        "ended_on_unanswered_tool_call": unanswered_call,
         "user_messages": roles.count("user"),
         "assistant_messages": roles.count("assistant"),
     }

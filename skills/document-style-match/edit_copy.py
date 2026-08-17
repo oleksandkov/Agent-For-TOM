@@ -55,6 +55,11 @@ from docx.table import Table
 
 from analyze_docx import iter_body_items
 
+#: Kept in step with `run.TODO_PREFIX`, and duplicated rather than imported:
+#: `run.py` imports *this* module's siblings, so importing back would close a
+#: cycle, and both scripts are run standalone as often as they are imported.
+TODO_PREFIX = "<<TODO:"
+
 
 def _clip(text: str, n: int = 70) -> str:
     text = " ".join(text.split())
@@ -80,8 +85,79 @@ def list_blocks(sample_path: str, start: int = 0, count: int = 60) -> None:
             print(f"{i:5}  [spacer]")
 
 
-def _set_runs(p, value) -> None:
-    values = [value] if isinstance(value, str) else list(value)
+def _coerce_runs(value, index) -> list[str]:
+    """An edit value -> the texts to write into a paragraph's runs.
+
+    This is the one line that produced a whole broken document. It used to be
+
+        values = [value] if isinstance(value, str) else list(value)
+
+    and `list()` on a **dict** yields its *keys*. Handed a block object like
+    `{"text": "…", "align": "center", "bold": true, "size_pt": 16.0,
+    "indent_cm": 0.0}` it wrote `text`, `align`, `bold`, `size_pt`,
+    `indent_cm` into successive runs — so every paragraph of a real 52-block
+    coursework rendered as `textalignboldsize_ptindent_cm`, and every spacer
+    as `kind`. Nothing raised: `list()` succeeds on anything iterable, which
+    is exactly why the wrong shape travelled all the way to a PDF.
+
+    `list()` on an unknown type is not parsing. Anything that is not the
+    documented shape is an error, said out loud, before a file is touched.
+    """
+    if isinstance(value, str):
+        if value.lstrip().startswith(TODO_PREFIX):
+            raise ValueError(
+                f"block {index}: still holds the placeholder `{TODO_PREFIX}…` "
+                f"that `run.py measure` wrote. Replace it with the text this "
+                f"section should contain.")
+        return [value]
+    if isinstance(value, list):
+        if all(isinstance(v, str) for v in value):
+            return list(value)
+        raise ValueError(
+            f"block {index}: a list value must hold strings, one per run — "
+            f"got {[type(v).__name__ for v in value][:4]}")
+    if isinstance(value, dict):
+        if "text" in value:
+            raise ValueError(
+                f"block {index}: the value is a content-plan block "
+                f"({sorted(value)[:5]}…), but this route wants the new text "
+                f"itself. Use the block's \"text\" as the value, or — if the "
+                f"sample is a PDF — build a content plan and let run.py take "
+                f"route B.")
+        raise ValueError(
+            f"block {index}: an object value is only meaningful for a table, "
+            f"as {{\"rows\": [[…]]}} — got keys {sorted(value)[:5]}")
+    raise ValueError(
+        f"block {index}: expected a string, a list of strings, or null — "
+        f"got {type(value).__name__}")
+
+
+def validate_edits(edits: dict) -> None:
+    """Check every value before anything is copied or written.
+
+    Failing here costs nothing; failing after `shutil.copyfile` leaves a
+    plausible-looking .docx on disk that a later step converts to PDF and
+    reports as a deliverable. One measured run shipped exactly that.
+    """
+    problems = []
+    for index, value in sorted(edits.items()):
+        if value is None:
+            continue
+        if isinstance(value, dict) and "rows" in value:
+            continue          # table; checked against the real item later
+        try:
+            _coerce_runs(value, index)
+        except ValueError as e:
+            problems.append(str(e))
+    if problems:
+        raise ValueError("the edit file does not match the documented shape:\n"
+                         + "\n".join(f"  - {p}" for p in problems[:10])
+                         + (f"\n  … and {len(problems) - 10} more"
+                            if len(problems) > 10 else ""))
+
+
+def _set_runs(p, value, index="?") -> None:
+    values = _coerce_runs(value, index)
     runs = p.runs
     if not runs:
         for v in values:
@@ -107,7 +183,7 @@ def _set_table(table, rows) -> None:
             cell = table.cell(ri, ci)
             para = cell.paragraphs[0]
             if para.runs:
-                _set_runs(para, text)
+                _set_runs(para, text, f"table r{ri}c{ci}")
             else:
                 para.add_run(text)
 
@@ -116,7 +192,14 @@ def apply_edits(sample_path: str, edits_path: str, output_path: str) -> dict:
     edits = json.load(open(edits_path, encoding="utf-8"))
     if isinstance(edits, dict) and "replacements" in edits:
         edits = edits["replacements"]
+    if not isinstance(edits, dict):
+        raise ValueError(
+            f"{edits_path} holds a {type(edits).__name__}, but this route "
+            f"wants an object keyed by block index: "
+            f'{{"0": "new text", "3": null}}. A list of blocks is a *content '
+            f"plan* — that is route B, for a PDF sample.")
     edits = {int(k): v for k, v in edits.items()}
+    validate_edits(edits)          # before anything is written. See above.
 
     shutil.copyfile(sample_path, output_path)
     d = docx.Document(output_path)
@@ -136,7 +219,7 @@ def apply_edits(sample_path: str, edits_path: str, output_path: str) -> dict:
                 _set_table(item, value["rows"])
                 replaced += 1
         else:
-            _set_runs(item, value)
+            _set_runs(item, value, i)
             replaced += 1
 
     for item in to_delete:

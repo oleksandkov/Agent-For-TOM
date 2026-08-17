@@ -50,3 +50,10 @@ _scratch/
 
 nextjs-site/
 .playwright-mcp/
+
+
+labwork/
+labwork_sessions/
+labwork_sessions_v2/
+docs/
+tests/

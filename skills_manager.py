@@ -107,6 +107,13 @@ def validate_frontmatter(frontmatter: dict, fallback_name: str) -> tuple[dict, l
         "name": (frontmatter.get("name") or fallback_name).strip(),
         "description": (frontmatter.get("description") or "").strip(),
         "triggers": _parse_list_value(frontmatter.get("triggers", "")),
+        # Optional, and the other half of the retrieval gate: `description`
+        # says when a skill applies, this says when a keyword match is a false
+        # positive. Written by the skill's author, because only they know
+        # which of their own triggers are ambiguous — "проаналізуй" retrieves
+        # document-style-match for anyone asking a question *about* a
+        # document. Absent is fine; the gate still asks the model to decide.
+        "skip_when": (frontmatter.get("skip_when") or "").strip(),
         "source": (frontmatter.get("source") or "").strip().lower(),
         "version": 1,
     }
@@ -132,6 +139,8 @@ def render_frontmatter(meta: dict) -> str:
     if triggers:
         rendered = ", ".join(f'"{t}"' for t in triggers)
         lines.append(f"triggers: [{rendered}]")
+    if meta.get("skip_when"):
+        lines.append(f"skip_when: {meta['skip_when']}")
     lines.append(f"source: {meta.get('source') or 'user'}")
     lines.append(f"version: {int(meta.get('version', 1))}")
     lines.append("---")
@@ -241,6 +250,7 @@ def discover_skills(warn: bool = False) -> list[Skill]:
                 "file": skill_file,
                 "description": meta["description"] or meta["name"] or name,
                 "triggers": meta["triggers"],
+                "skip_when": meta["skip_when"],
                 "source": meta["source"] or default_source,
                 "version": meta["version"],
                 "learned": learned,
@@ -272,6 +282,46 @@ def match_skills(message: str, skills: Optional[list] = None) -> list:
     return matched
 
 
+#: The gate that turns a keyword match into a decision.
+#:
+#: `match_skills` is substring matching, and substrings do not know what a
+#: sentence is asking for. Measured: "проаналізуй це і порадь як можна
+#: усучаснити цю програму" — a request for an opinion about a document —
+#: matched `document-style-match` on the word "проаналізуй" and the whole
+#: 8.5 KB procedure for *producing* a document was injected under the heading
+#: "Triggered by this message. Follow them." The model was told to follow a
+#: procedure for a job it had not been given, including a rule ("never read
+#: the sample with read_file") that directly contradicted the actual task.
+#:
+#: The fix is not a longer keyword list. Keywords cannot answer "is this what
+#: the user wants?" and the model already can — it has the message in front of
+#: it. So retrieval stays cheap and imprecise, and the *decision* moves to the
+#: one reader that can make it. This costs nothing: no extra call, no round
+#: trip, just an instruction ahead of text that was being sent anyway.
+_GATE = """# Possibly-applicable skill instructions
+
+The skill(s) below were retrieved because a word in the user's message matched
+one of their triggers. Keyword matching cannot tell a request to *produce*
+something from a question *about* something, so treat this as a suggestion,
+not an instruction.
+
+**Before using any of it, decide whether it applies to what was actually
+asked.** If it does not, ignore it completely, answer the real question
+normally, and do not mention the skill. Applying a procedure the user did not
+ask for is worse than not having retrieved it.
+"""
+
+
+def _skill_scope(skill: Skill) -> str:
+    """The one-line "use this when / not when", if the skill declares it."""
+    lines = []
+    if skill.get("description"):
+        lines.append(f"Use when: {str(skill['description']).strip()}")
+    if skill.get("skip_when"):
+        lines.append(f"Do NOT use when: {str(skill['skip_when']).strip()}")
+    return "\n".join(lines)
+
+
 def build_triggered_skills(message: str, max_chars: int) -> str:
     """Bodies of the skills this message triggers, for the system prompt.
 
@@ -279,17 +329,24 @@ def build_triggered_skills(message: str, max_chars: int) -> str:
     worthless summarised to one line. Budgeted by whole skills — half a
     procedure is worse than none, because the model cannot tell it is reading
     half.
+
+    Retrieved, then *offered* — see `_GATE`. What arrives here is the output
+    of a substring match; what leaves is a question for the model.
     """
     matched = match_skills(message)
     if not matched or max_chars <= 0:
         return ""
     out: list[str] = []
-    used = 0
+    # The gate is part of what gets sent, so it is part of the budget. Left
+    # out, `max_chars` silently stopped meaning "how big this section may be".
+    used = len(_GATE) + 1
     for skill in matched:
         body = (skill.get("content") or "").strip()
         if not body:
             continue
-        block = f"## Skill: {skill['name']}\n\n{body}"
+        scope = _skill_scope(skill)
+        block = (f"## Skill: {skill['name']}\n\n"
+                 + (f"{scope}\n\n" if scope else "") + body)
         if used + len(block) > max_chars:
             # Dropping the skill whole and saying nothing is how a skill
             # silently stops applying when someone edits it past the budget —
@@ -306,8 +363,7 @@ def build_triggered_skills(message: str, max_chars: int) -> str:
         used += len(block)
     if not out:
         return ""
-    return ("# Applicable skill instructions\n\n"
-            "Triggered by this message. Follow them.\n\n" + "\n\n".join(out))
+    return _GATE + "\n" + "\n\n".join(out)
 
 
 def find_skill(name: str) -> Optional[Skill]:

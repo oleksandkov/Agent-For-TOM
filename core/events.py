@@ -45,11 +45,23 @@ class AssistantMessage(AgentEvent):
 
 @dataclass
 class ToolStarted(AgentEvent):
+    """A tool is about to run.
+
+    `interactive` means the tool reads the console itself (see
+    `core.console.INTERACTIVE_TOOLS`). An adapter MUST NOT draw a spinner or
+    poll the keyboard while one of these runs: measured on a live session, the
+    `Thinking` spinner ran throughout `ask_user_question`, stealing a keystroke
+    and erasing the input line twelve times a second. The rule already existed
+    for permission prompts — `TerminalAdapter.ask` stops the spinner first —
+    and this is what extends it to a tool that prompts from the inside, where
+    the adapter cannot otherwise tell.
+    """
     tool_use_id: str
     name: str
     args: dict
     risk: str
     origin: str = "built-in"  # or "MCP: <server>"
+    interactive: bool = False
 
 
 @dataclass
@@ -143,8 +155,15 @@ class AnnouncedWithoutActing(AgentEvent):
     sees the model repeat its plan and cannot tell whether anything is
     happening. Measured on `hy3-free`: two turns in one session ended this
     way, the session was saved `complete: true`, and no file was produced.
+
+    `reason` says which shape it was: `"announced"` for a well-formed reply
+    that describes the next step, `"truncated"` for one cut off before it
+    could take it — measured on `deepseek-v4-flash-free`, which ended a turn
+    mid-phrase with nineteen of forty tool calls unspent. They read very
+    differently on screen and an adapter should say which happened.
     """
     announcement: str
+    reason: str = "announced"
 
 
 @dataclass

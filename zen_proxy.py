@@ -311,9 +311,50 @@ def attach_reasoning(blocks: list, reasoning: str) -> list:
     return blocks
 
 
+#: Replay `reasoning_content` for assistant turns this far back from the end,
+#: and drop it from everything older. `0` would send none and `None` all.
+#:
+#: The requirement `reasoning_of` documents is real but narrow: the provider
+#: validates the reasoning attached to the assistant turn it is being asked to
+#: continue. Replaying *every* historical turn's chain-of-thought satisfies
+#: that and then keeps paying for it — measured on one `hy3-free` session,
+#: 146,000 characters (~36k tokens) of superseded reasoning re-sent on all 51
+#: requests, growing with every step. Prompt caching hides most of the bill
+#: and none of the context-window cost.
+#:
+#: Four is a margin, not a measurement: what the provider needs is the last
+#: one, and the three before it are there because "the active chain" is not
+#: something this function can see. Raise it, or set it to None, if an
+#: upstream ever rejects a request for reasoning it was not given —
+#: `TOMAS_REPLAY_REASONING` does that without a code change.
+def _reasoning_window() -> "int | None":
+    raw = os.environ.get("TOMAS_REPLAY_REASONING", "").strip().lower()
+    if raw in ("all", "-1"):
+        return None
+    if raw.isdigit():
+        return int(raw)
+    return 4
+
+
 def anthropic_to_openai(ant_body: dict) -> dict:
     """Convert an Anthropic-format request body to OpenAI format."""
     messages = []
+
+    # Which assistant turns still carry their reasoning. Counted from the end
+    # over the *source* list, before any splitting into tool/assistant
+    # entries, so the window means the same thing whatever a turn contained.
+    window = _reasoning_window()
+    source = ant_body.get("messages", [])
+    if window is None:
+        keep_reasoning_from = 0
+    else:
+        assistant_positions = [i for i, m in enumerate(source)
+                               if m.get("role") == "assistant"]
+        keep_reasoning_from = (assistant_positions[-window]
+                               if len(assistant_positions) > window else 0)
+
+    def _reasoning_at(index: int, content) -> str:
+        return reasoning_of(content) if index >= keep_reasoning_from else ""
 
     # System message
     if ant_body.get("system"):
@@ -324,7 +365,7 @@ def anthropic_to_openai(ant_body: dict) -> dict:
             messages.append({"role": "system", "content": sys_text})
 
     # Conversation messages
-    for msg in ant_body.get("messages", []):
+    for index, msg in enumerate(source):
         role = msg["role"]
         content = msg.get("content", "")
 
@@ -370,9 +411,11 @@ def anthropic_to_openai(ant_body: dict) -> dict:
                         call["extra_content"] = t["extra_content"]
                     calls.append(call)
                 msg_entry["tool_calls"] = calls
-                # Thinking models reject the next request without it.
-                if reasoning_of(content):
-                    msg_entry["reasoning_content"] = reasoning_of(content)
+                # Thinking models reject the next request without it — for the
+                # turn being continued. See `_reasoning_window`.
+                thought = _reasoning_at(index, content)
+                if thought:
+                    msg_entry["reasoning_content"] = thought
                 messages.append(msg_entry)
             elif any(b.get("type") == "tool_result" for b in content):
                 for b in content:
@@ -392,8 +435,9 @@ def anthropic_to_openai(ant_body: dict) -> dict:
                 # An assistant turn that reasoned and then answered in prose,
                 # with no tool call. Same requirement, different branch — and
                 # the branch a short session is most likely to hit first.
-                if role == "assistant" and reasoning_of(content):
-                    entry["reasoning_content"] = reasoning_of(content)
+                thought = _reasoning_at(index, content) if role == "assistant" else ""
+                if thought:
+                    entry["reasoning_content"] = thought
                 messages.append(entry)
 
     # Tools

@@ -104,6 +104,48 @@ TOMAS (Terminal Operated Modular Agent System) — a self-hosted AI coding agent
   `(path, mtime, size)` fingerprint — call `invalidate_prompt_cache()` if you
   change instructions in-process. Tests live in
   `tests/test_context_economy.py::StablePrefix`.
+- **A turn cut off mid-work is not a finished turn.** `run_turn` ended on any
+  reply carrying no tool call, so a model that spent its output budget
+  reasoning and truncated mid-phrase closed the turn with 21 of 40 tool calls
+  and 800 of 1200 seconds unspent — saved `complete: true`, `failed_turns:
+  []`, no deliverable. `_maybe_continue` decides, in the core, on **both**
+  paths, once (`ended_mid_work`: `stop_reason == max_tokens`, or a last line
+  ≥ `MIN_UNFINISHED_LINE` ending on a letter).
+  `session_manager.audit_transcript` answers the same question about a stored
+  transcript and duplicates the rule rather than importing it — it must audit
+  files written by older builds — so `test_session_integrity` asserts they
+  agree. The length floor is load-bearing: without it the user's required
+  `My Lord` sign-off marked every finished session incomplete.
+- **A check that cannot see the defect is not a check.** Four scripts in
+  `skills/document-style-match` compared page size, fonts, spacing and row
+  density, and all four passed a rebuild whose headings were flush left where
+  the sample centres them — none looked at alignment.
+  `verify_docx.verify_signatures` compares the *share* of each
+  `(align, bold, size, indent)` combination against the sample's, separating a
+  correct rebuild (eight signatures, all within a point) from that one (title
+  style absent, centred headings 12% → 1.6%, left+bold 0% → 6.3%). A share
+  alone makes every paragraph structural in a short document, so
+  `PROMINENT_MIN_BLOCKS` floors it at two.
+- **The gate has to be cheaper than going round it.** That skill was nine
+  scripts and a numbered list; one session ran none of them, wrote its own
+  generator, checked the result by extracting its *text*, and shipped a
+  US-Letter document at 1.15 spacing. Skipping cost nothing; complying cost
+  eight sequential tool calls. `run.py measure` / `run.py build` is now the
+  whole procedure — one command, one `VERDICT: PASS|FAIL`, scaffolding
+  deleted on a pass — and the individual scripts are for reading a failure.
+- **A tool that returns less than it was asked for must say so.** `read_file`
+  extracted a PDF's words unlabelled; a session read them, saw the right text
+  in the right order, and rebuilt the document on the wrong paper size — page
+  geometry is not in the text and nothing said it was missing. Extraction now
+  carries a banner, and formats with no text at all (`_UNREADABLE_AS_TEXT`)
+  are refused rather than decoded to replacement characters: a PNG read as
+  UTF-8 is not an error, so nothing stopped that session doing it twice.
+- **The cut has to be a constant.** `build_system_prompt` capped the stable
+  half at `MAX_TOTAL_SYSTEM_PROMPT - len(tail)`, which varies per message: two
+  prompts trimmed 8,600 chars apart, no shared prefix, whole conversation
+  re-billed. `MAX_STABLE_PROMPT_CHARS` bounds it alone and the tail sits on
+  top. Instruction files must fit under it — over the cap, the skills
+  catalogue is what falls off the end.
 - **Count JSON as JSON and prose as prose.** `CHARS_PER_TOKEN_JSON` (3.5) for
   tool schemas, `CHARS_PER_TOKEN_PROSE` (4) for messages and the system prompt.
   These decide when compaction fires. Tool schemas were counted at `// 6` and
@@ -208,6 +250,7 @@ TOMAS (Terminal Operated Modular Agent System) — a self-hosted AI coding agent
 | `session_manager.py` | Auto-saves sessions to `~/.tomas/sessions/` on exit; browse/continue/delete via TUI or `/session`. Records `complete`, `turn_metrics`, and `tool_log`; a transcript with a user turn that produced no reply is saved with `complete: false` and an `incomplete_reason` |
 | `instructions_manager.py` | Loads global (`~/.tomas/instructions/`) and project-level (`AGENT.md`/`agent.md`) instructions into the system prompt |
 | `skills_manager.py` | Discovers skills for `/skills` and `/skill <name>`. One format everywhere (`name`/`description`/`triggers`/`source`/`version`); malformed frontmatter is reported, never fatal; bodies load on demand; `improve_skill()` bumps the version and keeps provenance |
+| `skills/document-style-match/` | Reproduces a sample document's layout with new content. `run.py` is the entry point — `measure` then `build`, one verdict; the other scripts are its steps and are read when one fails |
 | `core/budget.py` | Context budget policy — presets as shares of the window, section toggles, per-tool/server enable. Pure: computes and persists, never draws. `/budget` and the TUI page both render `agent.render_budget`, so they cannot disagree |
 | `mcp_manager.py` | MCP server management (shared config with Claude Code at `~/.claude.json`); tools, resources and prompts |
 | `provider_manager.py` | UI-free provider config, activation, and **probed** `Capabilities` (streaming, tool use, system prompt, context window, tool ceiling). Nothing infers behaviour from substrings in a URL or model name at runtime |

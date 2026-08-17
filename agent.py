@@ -42,6 +42,7 @@ from typing import Any, Callable, Optional
 
 from core import budget as core_budget
 from core import context as core_context
+from core.console import CONSOLE
 from core.context import ContextWindow
 
 # ── Windows console setup ──
@@ -1918,13 +1919,85 @@ def _resolve(path: str) -> Path:
     # Only the home form is expanded. expanduser() maps "~weird" to
     # C:\Users\weird without complaint, so a file genuinely named "~weird"
     # must keep resolving inside the project.
-    s = str(path)
+    s = _repair_drive(str(path))
     p = Path(s)
     if s[:1] == "~" and (len(s) == 1 or s[1] in "/\\"):
         p = p.expanduser()
     if not p.is_absolute():
         p = PROJECT_DIR / p
     return p.resolve()
+
+
+def _repair_drive(s: str) -> str:
+    """Put back a drive letter the path lost on its way here.
+
+    A path pasted or dragged into the prompt can arrive a character short:
+    measured, three sessions were handed `:\\Github\\Agent-For-TOM\\...` with
+    the leading `C` gone, and each spent between three and seven tool calls
+    hunting for a file that was exactly where it said it was. `:` cannot
+    begin a relative path on Windows — it is not a legal filename character —
+    so a string starting with it is unambiguously a mangled absolute path and
+    repairing it cannot shadow a real file. A leading separator with no drive
+    is the same case one character further along.
+
+    Only ever *offered*: the repaired path is returned as a string and still
+    has to exist. Nothing here decides a file is present.
+    """
+    if not s:
+        return s
+    drive = PROJECT_DIR.drive           # 'C:' on Windows, '' elsewhere
+    if not drive:
+        return s
+    if s[0] == ":" and len(s) > 1 and s[1] in "/\\":
+        # Unconditional: `:` is not a legal filename character, so this string
+        # cannot name anything relative. Repairing even when the result does
+        # not exist is what makes the *error* readable — left alone it was
+        # joined to the project directory and reported as
+        # `C:\...\Agent-For-TOM\:\Github\...`, which names no file anyone typed.
+        return drive[0] + s
+    if s[0] in "/\\" and not s.startswith("//") and not s.startswith("\\\\"):
+        candidate = drive + s
+        if Path(candidate).exists():
+            return candidate
+    return s
+
+
+#: How many same-named files a not-found error may list. Enough to disambiguate
+#: a real duplicate, few enough that a common name does not fill the reply.
+_NOT_FOUND_SUGGESTIONS = 5
+
+
+def _not_found_error(path: Path) -> str:
+    """"Not found" plus where it actually is, when that is answerable.
+
+    A bare "file not found" is a dead end the model can only leave by
+    guessing: measured across three sessions handed a slightly wrong sample
+    path, the recoveries cost 3, 4 and 7 tool calls — `dir /s /b`, `list_files`
+    on three directories, a `search_code`, and in one case two more reads of
+    a path that had already failed once. The name is almost always right and
+    only the directory is wrong, so one bounded search by basename ends it in
+    the same call that reported the problem.
+    """
+    suggestions: list[Path] = []
+    name = path.name
+    if name and not any(c in name for c in "*?"):
+        try:
+            for found in PROJECT_DIR.rglob(name):
+                if found.is_file():
+                    suggestions.append(found)
+                    if len(suggestions) >= _NOT_FOUND_SUGGESTIONS:
+                        break
+        except OSError:
+            pass
+    if not suggestions:
+        return f"Error: file not found: {path}"
+    if len(suggestions) == 1:
+        return (f"Error: file not found: {path}\n"
+                f"There is one file named {name} in the project: "
+                f"{suggestions[0]}")
+    listed = "\n".join(f"  {s}" for s in suggestions)
+    return (f"Error: file not found: {path}\n"
+            f"Files named {name} in the project:\n{listed}")
 
 # All user state lives under ~/.tomas (sessions, notes, memory, learned
 # skills). Locking the agent out of it does not make anything safer — it just
@@ -2023,16 +2096,67 @@ _DOCUMENT_EXTRACTORS = {
     ".xlsx": _extract_xlsx_text,
 }
 
+# Formats with no text in them at all. Decoding these as UTF-8 with
+# replacement produces pages of "�PNG IHDR ... IDATx^" — which is not an
+# error, so nothing stops the model reading a second one. Measured: a session
+# trying to see a sample document's layout read two page renders this way,
+# spent two tool calls on the mojibake, and concluded it had seen the page.
+_UNREADABLE_AS_TEXT = {
+    ".png": "an image", ".jpg": "an image", ".jpeg": "an image",
+    ".gif": "an image", ".bmp": "an image", ".webp": "an image",
+    ".tif": "an image", ".tiff": "an image", ".ico": "an image",
+    ".zip": "an archive", ".gz": "an archive", ".tar": "an archive",
+    ".7z": "an archive", ".rar": "an archive",
+    ".exe": "a binary", ".dll": "a binary", ".so": "a binary",
+    ".pyc": "compiled bytecode", ".pyd": "a binary",
+    ".mp3": "audio", ".wav": "audio", ".mp4": "video", ".mov": "video",
+    ".woff": "a font", ".woff2": "a font", ".ttf": "a font", ".otf": "a font",
+}
+
+
+def _unreadable_error(path: Path, kind: str) -> str:
+    """Say what it is and which tool can actually look at it."""
+    if kind == "an image":
+        how = ("Attach it to the conversation to have it looked at, or "
+               "measure it with Pillow/PyMuPDF through run_command. To see a "
+               "*document's* layout, measure the document itself — "
+               "skills/document-style-match/run.py measure — not a picture "
+               "of it")
+    elif kind == "an archive":
+        how = "list or extract it with run_command, then read the members"
+    else:
+        how = "inspect it with run_command if you need its bytes"
+    return (f"Error: {path.name} is {kind}, not text. Reading it here would "
+            f"return its raw bytes as replacement characters and nothing "
+            f"else. {how}.")
+
+
+#: Prepended to every extracted document. The extraction is genuinely useful
+#: and stays — but a session read a PDF this way, saw its words in the right
+#: order, and rebuilt it on US Letter paper at 1.15 line spacing with its
+#: headings flush left, because none of that is in the text and nothing said
+#: so. One line is cheaper than the six defects.
+_EXTRACTED_TEXT_BANNER = (
+    "[text only — extracted from {kind}. Page size, margins, fonts, sizes, "
+    "alignment, bold and images are NOT in this output and cannot be judged "
+    "from it. To reproduce this document's formatting, measure it: "
+    "skills/document-style-match/run.py measure]"
+)
+
 
 def handle_read_file(params: dict) -> str:
     path = _resolve(params["file_path"])
     if not _safe(path):
         return _outside_project_error(path)
     if not path.exists():
-        return f"Error: file not found: {path}"
+        return _not_found_error(path)
+    suffix = path.suffix.lower()
+    unreadable = _UNREADABLE_AS_TEXT.get(suffix)
+    if unreadable:
+        return _unreadable_error(path, unreadable)
     offset = max(0, int(params.get("offset", 1)) - 1)
     limit = int(params.get("limit", 2000))
-    suffix = path.suffix.lower()
+    banner = ""
     if suffix in _DOCUMENT_EXTRACTORS:
         try:
             text = _DOCUMENT_EXTRACTORS[suffix](path)
@@ -2041,6 +2165,10 @@ def handle_read_file(params: dict) -> str:
                      f"that isn't installed ({e}). Run: pip install -r requirements.txt")
         except Exception as e:
             return f"Error: could not extract text from {path.name}: {e}"
+        # Only on the first page of a paginated read: repeating it at
+        # offset=2000 would be noise, and the caller has already seen it.
+        if offset == 0:
+            banner = _EXTRACTED_TEXT_BANNER.format(kind=f"a {suffix[1:]}") + "\n"
         lines = [line + "\n" for line in text.split("\n")]
     else:
         with path.open("r", encoding="utf-8", errors="replace") as f:
@@ -2062,7 +2190,7 @@ def handle_read_file(params: dict) -> str:
             break
         out.append(entry)
         used += len(entry)
-    return "".join(out)
+    return banner + "".join(out)
 
 # Formats whose files are containers, not text: .docx/.pptx/.xlsx are zip
 # archives of XML parts, .pdf has an object table and xref. Writing a string
@@ -2662,13 +2790,69 @@ def handle_ask_user_question(params: dict) -> str:
 
     OTHER_LABEL = "Other"
 
-    def _ask_custom() -> str:
-        try:
-            return input(f'  {DIM}Your answer:{RESET} ').strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return ""
+    def _ask_custom(prompt_text: str) -> Optional[str]:
+        """Read a free-text answer, visibly. `None` means "go back to the list".
 
+        Not `input()`. Three things went wrong with it, and only the first was
+        the spinner's fault: the menu was left on screen so you typed
+        underneath a dead list; there was no way back to the options once
+        "Other" was chosen; and Esc did nothing. This reads the same way the
+        main prompt does — one line, echoed as you type, Ctrl+U/Ctrl+W to
+        correct, Esc to change your mind.
+        """
+        try:
+            import msvcrt
+        except ImportError:                      # not Windows: no raw reader
+            try:
+                got = input(f'  {DIM}{prompt_text}{RESET} ').strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
+            return got
+
+        buf: list[str] = []
+        with CONSOLE:
+            sys.stdout.write(f'  {DIM}{prompt_text}{RESET}\n  {GREEN}›{RESET} ')
+            sys.stdout.flush()
+            while True:
+                ch = msvcrt.getwch()
+                if ch == '\r':
+                    sys.stdout.write('\n')
+                    sys.stdout.flush()
+                    return ''.join(buf).strip()
+                if ch == '\x1b':                 # Esc — back to the options
+                    sys.stdout.write('\r\033[2K')
+                    sys.stdout.flush()
+                    return None
+                if ch in ('\x08', '\x7f'):       # Backspace
+                    if buf:
+                        buf.pop()
+                elif ch == '\x15':               # Ctrl+U — clear the line
+                    buf.clear()
+                elif ch == '\x17':               # Ctrl+W — delete a word
+                    while buf and buf[-1].isspace():
+                        buf.pop()
+                    while buf and not buf[-1].isspace():
+                        buf.pop()
+                elif ch in ('\xe0', '\x00'):     # arrows: consume the pair
+                    msvcrt.getwch()
+                    continue
+                elif ch == '\x03':               # Ctrl+C — treat as cancel
+                    sys.stdout.write('\n')
+                    return None
+                elif ch.isprintable():
+                    buf.append(ch)
+                else:
+                    continue
+                # One redraw per keystroke, one line: `\r` + erase + reprint is
+                # exact here because the answer is a single line by
+                # construction (Enter ends it).
+                sys.stdout.write(f'\r\033[2K  {GREEN}›{RESET} ' + ''.join(buf))
+                sys.stdout.flush()
+
+    # Each picker and the free-text editor take `CONSOLE` themselves, and the
+    # adapter is told not to spin over this tool at all (ToolStarted.interactive),
+    # so nothing else reaches for the keyboard while any of this is on screen.
     answered = []
     for q in questions:
         text = str(q.get("question") or "").strip()
@@ -2696,15 +2880,15 @@ def handle_ask_user_question(params: dict) -> str:
         raw = [str(opt.get("label", "")).strip() for opt in options]
         width = max((display_width(r) for r in raw + [OTHER_LABEL]), default=0)
 
-        def _row(label: str, desc: str) -> str:
-            pad = " " * max(0, width - display_width(label))
-            return f'{label}{pad}   {DIM}{desc}{RESET}' if desc else label
-
-        labels = [_row(label, str(opt.get("description", "")).strip())
+        # `_fit_label` clips the description to what the terminal can show on
+        # one row. A wrapped row is not merely ugly — it breaks the picker's
+        # rewind arithmetic, which is the "I switch and it disappears" defect.
+        labels = [_fit_label(label, str(opt.get("description", "")).strip(), width)
                   for opt, label in zip(options, raw)]
-        labels.append(_row(OTHER_LABEL, 'type your own answer'))
+        labels.append(_fit_label(OTHER_LABEL, 'type your own answer', width))
         other_idx = len(options)
 
+        ask_own = 'Type your answer · Esc goes back to the options'
         if multi:
             picked = _arrow_checklist(
                 "", labels,
@@ -2712,21 +2896,30 @@ def handle_ask_user_question(params: dict) -> str:
             chosen = []
             for i in picked:
                 if i == other_idx:
-                    custom = _ask_custom()
+                    custom = _ask_custom(ask_own)
                     if custom:
                         chosen.append(custom)
                 else:
                     chosen.append(str(options[i].get("label", "")))
         else:
-            idx = _arrow_menu("", labels,
-                              footer='↑↓ move · Enter select · Esc skip')
+            # Loops so that Esc in the free-text field returns to the list
+            # rather than silently skipping the question. Choosing "Other" by
+            # accident used to be unrecoverable.
             chosen = []
-            if idx == other_idx:
-                custom = _ask_custom()
-                if custom:
-                    chosen.append(custom)
-            elif idx != -1:
-                chosen.append(str(options[idx].get("label", "")))
+            while True:
+                idx = _arrow_menu(
+                    "", labels,
+                    footer='↑↓ move · Enter select · Esc skip',
+                    erase_on_exit=True)
+                if idx == other_idx:
+                    custom = _ask_custom(ask_own)
+                    if custom is None:
+                        continue          # Esc — show the options again
+                    if custom:
+                        chosen.append(custom)
+                elif idx != -1:
+                    chosen.append(str(options[idx].get("label", "")))
+                break
 
         if chosen:
             print(f'  {GREEN}→{RESET} ' + ', '.join(chosen))
@@ -3149,7 +3342,19 @@ def execute_tool(name: str, params: dict) -> str:
             # key) tells a model something is wrong but not what to send
             # instead — measured live, a weaker model retried the identical
             # empty tool call three times before the loop guard stopped it.
-            return f"Error: '{name}' is missing required argument {e}."
+            hint = ""
+            if not params:
+                # Every argument gone, not one forgotten. Measured twice in one
+                # session: `write_file {}` where the model meant to send a
+                # 12 KB script. Arguments that large are the ones the output
+                # limit truncates mid-JSON, and the parser then substitutes an
+                # empty object — so "you forgot an argument" is the wrong
+                # diagnosis and re-sending the same call is the wrong fix.
+                hint = (" No arguments arrived at all, which usually means "
+                        "they were cut off at the output limit rather than "
+                        "omitted. If you were sending a large value, write it "
+                        "in several smaller calls.")
+            return f"Error: '{name}' is missing required argument {e}.{hint}"
         except Exception as e:
             return f"Error: {e}"
     # Try MCP tool dispatch (with name mapping for renamed conflicting tools)
@@ -3377,9 +3582,30 @@ MAX_SKILLS_CHARS = 4000             # skills section
 #: source reading is not a close call. It is still bounded by
 #: MAX_TOTAL_SYSTEM_PROMPT; if this needs raising a third time, the answer is
 #: probably to split the reference half into a file the model opens once.
-MAX_TRIGGERED_SKILL_CHARS = 8600
-MAX_TOTAL_SYSTEM_PROMPT = 44000     # hard cap on the entire system prompt.
-# ~11k tokens against the 200k context the default models actually have.
+#:
+#:   8600 -> 9800  the retrieval gate. Triggers are substrings and they match
+#:                 questions *about* a document as readily as orders to
+#:                 produce one; the body is now prefixed with the instruction
+#:                 to decide whether it applies, plus each skill's own
+#:                 "use when / do NOT use when". ~700 characters of fixed
+#:                 overhead that turns a keyword match into a decision the
+#:                 model makes — cheaper than the extra round trip a separate
+#:                 classifier call would cost, and it applies to every skill.
+MAX_TRIGGERED_SKILL_CHARS = 9800
+MAX_TOTAL_SYSTEM_PROMPT = 46000     # hard cap on the entire system prompt.
+# ~11.5k tokens against the 200k context the default models actually have.
+#
+# Raised from 44,000 when the stable half reached 44,530 and the truncator
+# started eating the end of the skills catalogue — the section that lets the
+# model *find* a skill — to stay under a round number. The trade is stated two
+# paragraphs down and had already been made: this content sits in the stable
+# prefix, so it is served from cache rather than re-tokenised, and 2,000 more
+# characters there cost almost nothing per turn. Trimming conventions to fit an
+# arbitrary constant would have cost more.
+#
+# It is not headroom to spend freely. AGENTS.md and CLAUDE.md overlap by an
+# estimated 2,000-3,000 characters in this repo; dedupe them before raising
+# this again.
 #
 # Raised from 8000/28000 when CLAUDE.md started being loaded alongside AGENTS.md
 # (it had been documented as loaded for a long time without being loaded at
@@ -3402,6 +3628,29 @@ MAX_TOTAL_SYSTEM_PROMPT = 44000     # hard cap on the entire system prompt.
 # unusually large. BASE_PROMPT plus the environment section is what the agent
 # *is*; below this the rules it operates by start disappearing.
 MIN_STABLE_CHARS = 6000
+
+#: Ceiling on the *stable* half, and the only thing the truncator reads.
+#:
+#: The cut has to be decided by a constant. It used to be
+#: `MAX_TOTAL_SYSTEM_PROMPT - len(tail)`, which is message-dependent — so once
+#: the stable half grew past the cap, every message trimmed it in a different
+#: place. Measured after adding 2.3 KB to CLAUDE.md: "what time is it in
+#: Tokyo" kept 43,822 characters of it and "зроби схожий файл" — whose tail
+#: carries a triggered skill body — kept 35,230. Two prompts with no shared
+#: prefix, and prefix caching matches on an exact byte prefix, so *every* turn
+#: billed the whole conversation at full price. That is precisely the failure
+#: the ordering rule in CLAUDE.md exists to prevent, arriving through the
+#: truncation path instead of the ordering one.
+#:
+#: The tail then sits on *top* of this rather than inside it, so the worst
+#: case is this plus the tail's own budgets (standing rules 1000 + retrieved
+#: facts 1500 + a triggered skill body 8600) — about 14k tokens against the
+#: 200k context the default models have. Subtracting the reserve instead was
+#: tried and is worse: it caps the stable half at 32.5k whether or not a skill
+#: triggered, and the first thing that falls off the end is the skills
+#: catalogue — so the prompt loses the ability to *find* the skill in exchange
+#: for room to quote one.
+MAX_STABLE_PROMPT_CHARS = MAX_TOTAL_SYSTEM_PROMPT
 
 # Cached stable prefix, and the filesystem signature it was built from.
 _stable_prefix: Optional[str] = None
@@ -3536,6 +3785,14 @@ def build_system_prompt(user_message: str = "") -> str:
                           if "skills_catalogue" in allowed else "")
         if skills_section:
             stable += f"\n\n{skills_section}"
+        # Capped here, once, rather than per message: the cut is decided by a
+        # constant (TAIL_RESERVE_CHARS), so doing it inside the memoised half
+        # keeps the cached value equal to what is actually emitted. It used to
+        # be applied below against `MAX_TOTAL_SYSTEM_PROMPT - len(tail)`, and a
+        # message-dependent cut is a message-dependent prefix.
+        room = max(MIN_STABLE_CHARS, MAX_STABLE_PROMPT_CHARS)
+        if len(stable) > room:
+            stable = _truncate_section(stable, room, "system prompt")
         _stable_prefix = stable
         _stable_signature = signature
 
@@ -3601,15 +3858,12 @@ def build_system_prompt(user_message: str = "") -> str:
     # changed nothing about the model's behaviour. Reflection replaces it; the
     # generator code is still in self_improve.py pending deletion.
 
-    # ── Hard cap on the total system prompt ──
-    # The tail is what the model must act on *now* — the user's standing rules
-    # and the procedure for the job in hand — so the cap is taken out of the
-    # stable half, from the end (the skills catalogue), and never out of the
-    # tail. Trimming from the end of the joined string, as this used to, made
-    # the triggered skill body the first thing dropped.
-    if len(stable) + len(tail) > MAX_TOTAL_SYSTEM_PROMPT:
-        room = max(MIN_STABLE_CHARS, MAX_TOTAL_SYSTEM_PROMPT - len(tail))
-        stable = _truncate_section(stable, room, "system prompt")
+    # The total cap is applied to the stable half where it is built and
+    # memoised, not here: it is decided by a constant, so it belongs with the
+    # thing it bounds. The tail is never trimmed for it — it is what the model
+    # must act on *now*, the user's standing rules and the procedure for the
+    # job in hand, and trimming from the end of the joined string (as this
+    # once did) made the triggered skill body the first thing dropped.
     return stable + tail
 
 # ---------------------------------------------------------------------------
@@ -4947,6 +5201,7 @@ SLASH_COMMANDS = {
     "config":       {"desc": "Interactive menu: provider, model, mode", "icon": "🛠"},
     "compact":      {"desc": "Force compact conversation now",    "icon": "⚙"},
     "budget":       {"desc": "Context budget: /budget [economy|balanced|full|auto|tools N|output N|on|off <section>]", "icon": "▣"},
+    "setup":        {"desc": "Tell TOMAS about you; tunes instructions and defaults", "icon": "🧭"},
     "skills":       {"desc": "List installed skills",            "icon": "⚡"},
     "skill":        {"desc": "Run a skill: /skill <name>",        "icon": "⚡"},
     "mcp-prompt":   {"desc": "MCP prompt templates: /mcp-prompt [name]", "icon": "◈"},
@@ -5048,7 +5303,8 @@ def _numbered_menu_fallback(title: str, items: list[str], footer: str = "") -> i
     return n - 1 if 1 <= n <= len(items) else -1
 
 
-def _arrow_menu(title: str, items: list[str], footer: str = "") -> int:
+def _arrow_menu(title: str, items: list[str], footer: str = "",
+                erase_on_exit: bool = False) -> int:
     """A minimal arrow-key picker for slash-command menus (e.g. /config).
 
     Deliberately not `agent_cli.arrow_menu` — that lives in the TUI
@@ -5066,6 +5322,16 @@ def _arrow_menu(title: str, items: list[str], footer: str = "") -> int:
     except ImportError:
         return _numbered_menu_fallback(title, items, footer)
 
+    # `\n` is a *line feed*. With virtual-terminal processing enabled — which
+    # is how this prompt renders colour at all — it moves down one row and
+    # leaves the cursor in the column it was already in. `\033[2K` erases the
+    # row but does not move the cursor either. So every item after the first
+    # was drawn starting at the column the previous item ended on, and every
+    # redraw pushed it further right: the staircase of repeated, ever-more-
+    # indented labels a user reported was not a redraw bug, it was the cursor
+    # never returning to column 0. Same for the rewind below — `\033[{n}A`
+    # preserves the column too.
+    RETURN = '\r'
     CLEAR_LINE = '\033[2K'
     CURSOR_UP_N = '\033[{}A'
     ERASE_DOWN = '\033[J'
@@ -5082,25 +5348,35 @@ def _arrow_menu(title: str, items: list[str], footer: str = "") -> int:
         # then opens the picker; passing the same text through as a title put
         # that sentence on screen twice, one line apart.
         if title:
-            sys.stdout.write(CLEAR_LINE + f'  {BOLD}{title}{RESET}\n')
-            rows += 1
+            line = f'  {BOLD}{title}{RESET}'
+            sys.stdout.write(RETURN + CLEAR_LINE + line + '\n')
+            rows += _drawn_rows(line)
         for i, label in enumerate(items):
             marker = f'{GREEN}▶{RESET} ' if i == selected else '  '
             body = f'{BOLD}{label}{RESET}' if i == selected else label
-            sys.stdout.write(CLEAR_LINE + f'  {marker}{body}\n')
-            rows += 1
+            line = f'  {marker}{body}'
+            sys.stdout.write(RETURN + CLEAR_LINE + line + '\n')
+            # Physical rows, not one per item: a wrapped label made the rewind
+            # below land mid-menu and erase the rest. See `_drawn_rows`.
+            rows += _drawn_rows(line)
         foot = footer or '↑↓ move · Enter select · Esc cancel'
-        sys.stdout.write(CLEAR_LINE + f'  {DIM}{foot}{RESET}\n')
-        rows += 1
+        line = f'  {DIM}{foot}{RESET}'
+        sys.stdout.write(RETURN + CLEAR_LINE + line + '\n')
+        rows += _drawn_rows(line)
         return rows
 
     def redraw():
         nonlocal last_rows
         if last_rows:
-            sys.stdout.write(CURSOR_UP_N.format(last_rows) + ERASE_DOWN)
+            sys.stdout.write(CURSOR_UP_N.format(last_rows) + RETURN + ERASE_DOWN)
         last_rows = draw()
         sys.stdout.flush()
 
+    # One reader on the console at a time. Without this the adapter's Esc
+    # poller keeps calling getwch() from its spinner thread and swallows a
+    # byte of every two-byte arrow sequence, so the selection stops moving
+    # and the screen fills with half-drawn menus. See core/console.py.
+    CONSOLE.acquire()
     sys.stdout.write(HIDE_CURSOR)
     try:
         redraw()
@@ -5126,8 +5402,55 @@ def _arrow_menu(title: str, items: list[str], footer: str = "") -> int:
                 if n <= len(items):
                     return n - 1
     finally:
+        # Leaving the list on screen is right for /config, where the next
+        # thing printed is the result of the choice. It is wrong when the
+        # caller is about to prompt again — you end up typing underneath a
+        # menu that no longer accepts input.
+        if erase_on_exit and last_rows:
+            sys.stdout.write(CURSOR_UP_N.format(last_rows) + RETURN + ERASE_DOWN)
         sys.stdout.write(SHOW_CURSOR)
         sys.stdout.flush()
+        CONSOLE.release()
+
+
+def _drawn_rows(line: str) -> int:
+    """How many physical rows one written line will occupy.
+
+    Both pickers rewind with `\\033[{n}A` and counted `n` as one per item —
+    true only while nothing wraps. `ask_user_question` builds its labels as
+    `label + padding + description`, which routinely exceeds the terminal
+    width; the rewind then landed mid-menu and `\\033[J` erased whatever was
+    below it, so each keypress ate more of the screen. That is the "I switch
+    and it disappears" report.
+
+    The main prompt reader already solves this exactly — see `_rows()` in
+    `read_input_with_suggestions`, whose docstring explains that an exact row
+    count is "what makes the cursor arithmetic safe". This is the same
+    measurement for the menus.
+    """
+    from text_display import display_width, strip_ansi, term_columns
+    width = max(20, term_columns() - 1)
+    plain = strip_ansi(line)
+    if not plain:
+        return 1
+    return max(1, -(-display_width(plain) // width))   # ceil-divide
+
+
+def _fit_label(label: str, desc: str, pad: int = 0) -> str:
+    """A menu row that fits the terminal, description clipped rather than wrapped.
+
+    Wrapping is not merely ugly here: a wrapped row breaks the rewind
+    arithmetic above. `_drawn_rows` makes a wrapped row survivable; this makes
+    it rare.
+    """
+    from text_display import display_width, shorten, term_columns
+    padding = " " * max(0, pad - display_width(label))
+    if not desc:
+        return f'{label}{padding}'.rstrip()
+    room = term_columns() - display_width(label) - len(padding) - 10
+    if room < 12:
+        return f'{label}{padding}'.rstrip()
+    return f'{label}{padding}   {DIM}{shorten(desc, room)}{RESET}'
 
 
 def _numbered_checklist_fallback(title: str, items: list[str],
@@ -5166,6 +5489,7 @@ def _arrow_checklist(title: str, items: list[str], footer: str = "") -> Optional
     except ImportError:
         return _numbered_checklist_fallback(title, items, footer)
 
+    RETURN = '\r'          # see `_arrow_menu`: LF does not return the cursor
     CLEAR_LINE = '\033[2K'
     CURSOR_UP_N = '\033[{}A'
     ERASE_DOWN = '\033[J'
@@ -5179,26 +5503,34 @@ def _arrow_checklist(title: str, items: list[str], footer: str = "") -> Optional
     def draw() -> int:
         rows = 0
         if title:                      # see `_arrow_menu.draw` for why
-            sys.stdout.write(CLEAR_LINE + f'  {BOLD}{title}{RESET}\n')
-            rows += 1
+            line = f'  {BOLD}{title}{RESET}'
+            sys.stdout.write(RETURN + CLEAR_LINE + line + '\n')
+            rows += _drawn_rows(line)
         for i, label in enumerate(items):
             box = f'{GREEN}[x]{RESET}' if checked[i] else '[ ]'
             marker = f'{GREEN}▶{RESET} ' if i == cursor else '  '
             body = f'{BOLD}{label}{RESET}' if i == cursor else label
-            sys.stdout.write(CLEAR_LINE + f'  {marker}{box} {body}\n')
-            rows += 1
+            line = f'  {marker}{box} {body}'
+            sys.stdout.write(RETURN + CLEAR_LINE + line + '\n')
+            rows += _drawn_rows(line)      # physical rows — see `_drawn_rows`
         foot = footer or 'Space toggle · Enter confirm · Esc cancel'
-        sys.stdout.write(CLEAR_LINE + f'  {DIM}{foot}{RESET}\n')
-        rows += 1
+        line = f'  {DIM}{foot}{RESET}'
+        sys.stdout.write(RETURN + CLEAR_LINE + line + '\n')
+        rows += _drawn_rows(line)
         return rows
 
     def redraw():
         nonlocal last_rows
         if last_rows:
-            sys.stdout.write(CURSOR_UP_N.format(last_rows) + ERASE_DOWN)
+            sys.stdout.write(CURSOR_UP_N.format(last_rows) + RETURN + ERASE_DOWN)
         last_rows = draw()
         sys.stdout.flush()
 
+    # One reader on the console at a time. Without this the adapter's Esc
+    # poller keeps calling getwch() from its spinner thread and swallows a
+    # byte of every two-byte arrow sequence, so the selection stops moving
+    # and the screen fills with half-drawn menus. See core/console.py.
+    CONSOLE.acquire()
     sys.stdout.write(HIDE_CURSOR)
     try:
         redraw()
@@ -5229,6 +5561,7 @@ def _arrow_checklist(title: str, items: list[str], footer: str = "") -> Optional
     finally:
         sys.stdout.write(SHOW_CURSOR)
         sys.stdout.flush()
+        CONSOLE.release()
 
 
 def _config_menu(messages: list) -> str:
@@ -5719,6 +6052,24 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
     if cmd == "mcp-resources":
         return handle_read_mcp_resource({})
 
+    if cmd == "setup":
+        # The same body the trigger words would load, reached deliberately.
+        # Routed through /skill's mechanism rather than duplicating it, so the
+        # command and the trigger cannot describe two different procedures.
+        result = cmd_skill_run("onboard")
+        if result is None:
+            return (f'  {RED}The onboard skill is not installed.{RESET} '
+                    f'{DIM}It ships with TOMAS under skills/onboard.{RESET}')
+        try:
+            import onboarding
+            onboarding.note_offered()   # asked for it: this session is spent
+        except Exception:
+            pass
+        messages.append({"role": "user", "content": result})
+        print(f'  {YELLOW}⚡ Setup:{RESET} {BOLD}getting to know you{RESET} '
+              f'{DIM}[Esc skips any question]{RESET}')
+        return None  # fall through to the agent loop
+
     if cmd == "skills":
         return cmd_skill_list()
 
@@ -6099,6 +6450,23 @@ def _read_input_cross_platform(prompt: str) -> str:
 # that a sentence or a path pasted mid-thought still reads as what it is.
 PASTE_COLLAPSE_CHARS = 400
 
+#: How a paste burst is followed to its end. Two polls of 12ms — 24ms of
+#: silence — used to be enough to call it over, and that is thin: a terminal
+#: hands a long paste over in chunks, and the gap between them can be longer
+#: than that over SSH, in a remote session, or simply behind a redraw. A
+#: premature end splits the text at whatever character the queue happened to
+#: run dry on.
+#:
+#: Raised after a prompt arrived split mid-word ("щоб во" / "на була") across
+#: six fragments. That is what a premature end looks like, but it is not
+#: proof: the pasted source may have carried those breaks itself, and nothing
+#: in the session record can tell the two apart. Six polls costs 72ms, only
+#: ever runs *after* a burst has been detected, and is never in the way of
+#: typing — cheap enough to widen on a strong suspicion.
+_PASTE_POLL_S = 0.012
+_PASTE_IDLE_POLLS = 6
+
+
 IMAGE_SUFFIXES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                   ".gif": "image/gif", ".webp": "image/webp"}
 
@@ -6446,9 +6814,9 @@ def read_input_with_suggestions(prompt: str) -> str:
         chunk: list[str] = []
         prev_cr = False
         idle = 0
-        while idle < 2:
+        while idle < _PASTE_IDLE_POLLS:
             if not msvcrt.kbhit():
-                time.sleep(0.012)
+                time.sleep(_PASTE_POLL_S)
                 idle += 1
                 continue
             idle = 0
@@ -6524,6 +6892,15 @@ def read_input_with_suggestions(prompt: str) -> str:
                 # middle of a burst is a line break inside pasted text — that
                 # one used to submit, so pasting three paragraphs sent three
                 # half-written messages.
+                #
+                # A Return that lands at the *head* of a paste's next chunk,
+                # with the queue momentarily empty behind it, reads as "send"
+                # here and cannot be told apart from one. A time-based grace
+                # window was tried and removed: it takes "paste, then press
+                # Enter" — which is how the prompt is documented and tested to
+                # work — away from the user to buy a case that `_drain`'s idle
+                # window already covers, since that now follows a burst
+                # through gaps of up to _PASTE_POLL_S * _PASTE_IDLE_POLLS.
                 if _shift_down() or msvcrt.kbhit():
                     if msvcrt.kbhit():
                         _absorb_burst()
@@ -6999,6 +7376,20 @@ def main() -> int:
         pass
     print(f'  {GREEN}✦{RESET}  Self-improving system active — learning from interactions')
 
+    # One line, in the first five sessions only, and then never again — see
+    # onboarding.py. A fresh install genuinely knows nothing about the user
+    # (the fact store starts empty and reflection is a manual command), so the
+    # offer is worth making; an assistant that keeps making it is one whose
+    # notices stop being read at all.
+    try:
+        import onboarding
+        onboarding.note_session_start()
+        if onboarding.should_offer():
+            onboarding.note_offered()
+            print(f'  {MAGENTA}🧭{RESET}  {onboarding.offer_text()}')
+    except Exception:
+        pass
+
     print(f'  {DIM}─── Type {RESET}{BOLD}quit{RESET}{DIM} or {RESET}{BOLD}exit{RESET}{DIM} to leave · {RESET}{BOLD}/help{RESET}{DIM} for commands · {RESET}{BOLD}Esc Esc{RESET}{DIM} also exits ───{RESET}')
     print(f'  {DIM}    {RESET}{BOLD}Shift+Enter{RESET}{DIM} newline · paste keeps its line breaks · '
           f'{RESET}{BOLD}Ctrl+G{RESET}{DIM} attach clipboard image{RESET}')
@@ -7070,10 +7461,15 @@ def main() -> int:
             # went straight into the system prompt tail with nothing printed,
             # so there was no way to tell from the chat whether one had fired
             # at all. Same notice style as the explicit `/skill` path.
+            # "[auto-applied]" was a promise the retrieval could not keep: it
+            # is a substring match, and it fired on a question *about* a
+            # document. The body is offered to the model with an instruction
+            # to decide (see `skills_manager._GATE`), so the badge says what
+            # actually happened — retrieved, not applied.
             for _triggered_skill in match_skills(user_input):
-                print(f'  {YELLOW}⚡ Skill triggered:{RESET} '
+                print(f'  {YELLOW}⚡ Skill matched:{RESET} '
                       f'{BOLD}{_triggered_skill["name"]}{RESET} '
-                      f'{DIM}[auto-applied]{RESET}')
+                      f'{DIM}[offered — the model decides if it fits]{RESET}')
             # Re-check compaction with the actual system prompt size
             messages = maybe_compact(messages, system_prompt)
             result = agent_loop(system_prompt, messages)
