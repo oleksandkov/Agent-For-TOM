@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 from .events import (
     AgentEvent,
@@ -414,8 +414,9 @@ def _record_usage(state: AgentState, usage) -> None:
     state.usage["calls"] = state.usage.get("calls", 0) + 1
 
 
-def _stream_can_serve(final_msg) -> bool:
-    """Whether the streamed assembly can stand in for a non-streamed repeat.
+def _stream_serve_blocker(final_msg) -> Optional[str]:
+    """None when the streamed assembly can stand in for a non-streamed repeat;
+    otherwise, which check failed.
 
     The adapter builds complete `tool_use` blocks from the stream; the only
     thing it cannot do is recover arguments whose JSON never parsed, which it
@@ -423,34 +424,45 @@ def _stream_can_serve(final_msg) -> bool:
     has nothing left to contribute — measured across three live sessions,
     58 discarded streams, `would_have_served == duplicate_calls` and
     `stream_malformed_tool_args == 0` on every one of them: 2.9M input tokens
-    re-sent to be told the same thing.
+    re-sent to be told the same thing. Once every recoverable case is served
+    directly (this function returning `None`), the reason attached to the
+    cases that still fall through matters more than the old boolean did — see
+    `_record_discarded_stream`.
 
     The real Anthropic SDK sets no such attribute; `getattr(..., 0)` reads as
     "nothing was malformed", which is correct — its own stream assembly is
     authoritative, and that path never needed the second call either.
     """
     if final_msg is None:
-        return False
+        return "no_final_message"
     malformed = getattr(final_msg, "malformed_tool_args", 0)
     if not isinstance(malformed, int) or isinstance(malformed, bool):
         malformed = 0
     if malformed:
-        return False
+        return "malformed"
     # A reply cut off at the output limit may have stopped cleanly *between*
     # two tool calls, so nothing parsed badly and a call was still lost. Fall
     # through in that case: the non-streamed retry gets a fresh budget and is
     # the existing path for handling truncation.
     if getattr(final_msg, "output_truncated", False):
-        return False
+        return "truncated"
     # And it must actually carry the calls it claims. A provider that reports
     # `tool_calls` while assembling none leaves a response that is neither a
     # reply nor a tool step, and serving it would spend a turn going nowhere;
     # the non-streamed call is the existing answer to "ask again".
     content = getattr(final_msg, "content", None) or []
-    return any(getattr(b, "type", None) == "tool_use" for b in content)
+    if not any(getattr(b, "type", None) == "tool_use" for b in content):
+        return "no_tool_use_content"
+    return None
 
 
-def _record_discarded_stream(state: AgentState, usage, final_msg) -> None:
+def _stream_can_serve(final_msg) -> bool:
+    """Whether the streamed assembly can stand in for a non-streamed repeat."""
+    return _stream_serve_blocker(final_msg) is None
+
+
+def _record_discarded_stream(state: AgentState, usage, final_msg,
+                             reason: Optional[str] = None) -> None:
     """Account for a streamed answer that is about to be thrown away.
 
     A streamed call that wants tools falls through to a second, non-streamed
@@ -461,12 +473,14 @@ def _record_discarded_stream(state: AgentState, usage, final_msg) -> None:
     conversation, once per tool step. A 29-step turn reporting 1.8M input
     tokens really spent closer to 3.5M.
 
-    `would_have_served` is the number that decides whether the second call can
-    be dropped altogether. The adapter already assembles complete tool_use
-    blocks from the stream; the only thing it cannot do is recover arguments
-    whose JSON never parsed, which it counts as `malformed_tool_args`. So a
-    session where that stays at zero is a session where the second call bought
-    nothing at all — and this is what says so, instead of arithmetic.
+    `would_have_served` used to be inferred from `malformed_tool_args == 0`
+    alone, which conflated "would have served" with "was truncated" or "had no
+    tool_use content" — both legitimate discard reasons on a stream that is
+    not malformed. Now that `_stream_serve_blocker` already serves everything
+    recoverable, this stays at zero going forward; `reason` (from that same
+    function, or `"interrupted"` for a turn the user cut off) is recorded per
+    bucket instead, so a future regression is diagnosable rather than a single
+    flat count.
     """
     inp = getattr(usage, "input_tokens", 0) or 0
     out = getattr(usage, "output_tokens", 0) or 0
@@ -485,6 +499,8 @@ def _record_discarded_stream(state: AgentState, usage, final_msg) -> None:
     # answers this whole measurement exists to tell apart.
     state.usage["would_have_served"] = (
         state.usage.get("would_have_served", 0) + (1 if malformed == 0 else 0))
+    reason_key = f"duplicate_reason_{reason or 'unknown'}"
+    state.usage[reason_key] = state.usage.get(reason_key, 0) + 1
 
 
 def turn_expired(state: AgentState) -> bool:
@@ -670,8 +686,13 @@ def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
     # streamed call too would bill the same turn twice. When it *can* be
     # trusted there is no second call, so this is the only call there is and
     # it is counted like any other.
-    served = final_msg if (wants_tools and not state.interrupted()
-                           and _stream_can_serve(final_msg)) else None
+    if not wants_tools:
+        blocker = None
+    elif state.interrupted():
+        blocker = "interrupted"
+    else:
+        blocker = _stream_serve_blocker(final_msg)
+    served = final_msg if (wants_tools and blocker is None) else None
     # Reported, never acted on here. See `AgentState.last_tool_args_truncated`.
     state.last_tool_args_truncated = bool(
         wants_tools and served is None and final_msg is not None
@@ -680,7 +701,7 @@ def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
     if not wants_tools or served is not None:
         _record_usage(state, usage_info)
     else:
-        _record_discarded_stream(state, usage_info, final_msg)
+        _record_discarded_stream(state, usage_info, final_msg, blocker)
     return "".join(text_parts), wants_tools, served
 
 
@@ -753,6 +774,110 @@ def _model_unavailable_error(err: Exception) -> ErrorOccurred:
         "served, so every request to it fails the same way — it is not "
         "something retrying or compacting can fix. Pick another with /model. "
         f"Upstream said: {_upstream_excerpt(err)}",
+        detail=str(err), recoverable=False)
+
+
+#: A refused, unresolvable or dropped socket. None of these reach an HTTP
+#: status, so nothing above classifies them: they arrived as the catch-all
+#: "An unexpected error occurred: [WinError 10061] No connection could be
+#: made because the target machine actively refused it" — which names neither
+#: the endpoint that refused nor anything the user could do about it.
+_UNREACHABLE_MARKERS = (
+    "WinError 10061",           # Windows: connection actively refused
+    "WinError 10060",           # Windows: connect timed out
+    "WinError 11001",           # Windows: host not found
+    "ConnectionRefusedError", "Connection refused",
+    "ConnectionError", "APIConnectionError", "Connection aborted",
+    "NewConnectionError", "MaxRetryError",
+    "Name or service not known", "nodename nor servname",
+    "getaddrinfo failed", "Failed to establish a new connection",
+    "Errno 111", "Errno 61",    # Linux / macOS: connection refused
+)
+
+
+#: A request that timed out is not an endpoint that is absent — something
+#: answered slowly, or is still thinking. These keep the retry ladder they
+#: have; only a socket that never opened skips it.
+_TIMEOUT_MARKERS = ("APITimeoutError", "ReadTimeout", "WriteTimeout",
+                    "PoolTimeout", "timed out", "Timeout")
+
+
+def _error_chain_text(err: Exception) -> str:
+    """Type names and messages down the `raise ... from` chain.
+
+    Needed because the useful text is usually not on the exception that was
+    raised. Measured against a genuinely closed port, the Anthropic SDK
+    raises `APIConnectionError` whose `str()` is the entire five words
+    "Connection error." — the `[WinError 10061]` is on its `__cause__`. A
+    classifier reading only `str(err)` sees nothing to match and the failure
+    falls through to the catch-all, which is the bug this exists to fix.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    cur: Optional[BaseException] = err
+    while cur is not None and id(cur) not in seen and len(parts) < 20:
+        seen.add(id(cur))
+        parts.append(type(cur).__name__)
+        parts.append(str(cur))
+        # `__cause__` only: an explicit `raise X from Y`. `__context__` would
+        # also pick up whatever happened to be in flight inside an unrelated
+        # `except` block, and this check runs ahead of every other one.
+        cur = cur.__cause__
+    return " | ".join(parts)
+
+
+def is_endpoint_unreachable(err: Exception) -> bool:
+    """True when nothing answered at the endpoint at all.
+
+    Distinct from `is_retryable_error`: a 503 means the service is up and
+    busy, this means the socket never opened. Retrying a closed port for the
+    full 5/10/20s ladder cannot help — a local server is either running or it
+    is not.
+    """
+    text = _error_chain_text(err)
+    if any(marker in text for marker in _TIMEOUT_MARKERS):
+        return False
+    return any(marker in text for marker in _UNREACHABLE_MARKERS)
+
+
+def _deepest_reason(err: Exception) -> str:
+    """The most specific message in the chain, not the vaguest.
+
+    `str(APIConnectionError)` is "Connection error." for a refused socket, a
+    resolver failure and a dropped TLS handshake alike. The cause underneath
+    is the one that says which.
+    """
+    reason, cur = str(err), err.__cause__
+    while cur is not None:
+        if str(cur).strip():
+            reason = str(cur)
+        cur = cur.__cause__
+    return reason
+
+
+def _endpoint_unreachable_error(err: Exception,
+                                state: Optional[Any] = None) -> ErrorOccurred:
+    """Say which endpoint refused, and what the two ways out are.
+
+    Real session: the active provider was Ollama, Ollama was not running, and
+    the turn reported `[WinError 10061] ... actively refused it` and nothing
+    else. The endpoint is the single fact that makes it actionable, and the
+    core cannot know it — `state.describe_endpoint` is the host's answer.
+    """
+    where = ""
+    if state is not None and getattr(state, "describe_endpoint", None):
+        try:
+            label = state.describe_endpoint()
+            if label:
+                where = f" ({label})"
+        except Exception:
+            pass
+    return ErrorOccurred(
+        f"Nothing is listening at the active provider's endpoint{where}, so "
+        "the request never reached a server. If it is a local one, start it; "
+        "otherwise check the address and your connection, or switch provider "
+        "with /provider. Retrying will fail the same way. "
+        f"The socket said: {_deepest_reason(err)}",
         detail=str(err), recoverable=False)
 
 
@@ -884,6 +1009,9 @@ def _model_call(state: AgentState) -> Iterator[AgentEvent]:
                 continue
             return response
         except anthropic.InternalServerError as e:
+            if is_endpoint_unreachable(e):
+                yield fail(_endpoint_unreachable_error(e, state))
+                return None
             # Checked before the retryable test on purpose: a missing model is
             # reported as a 503 by some gateways, which `is_retryable_error`
             # reads as a blip and burns the whole 5/10/20s ladder on.
@@ -909,6 +1037,12 @@ def _model_call(state: AgentState) -> Iterator[AgentEvent]:
             yield RetryScheduled(attempt + 1, MAX_RETRIES, delay, str(e))
             time.sleep(delay)
         except Exception as e:
+            # Same diagnosis, same place in the order, as the SDK branch
+            # above: an unreachable endpoint is decided before anything that
+            # could send it round the retry ladder.
+            if is_endpoint_unreachable(e):
+                yield fail(_endpoint_unreachable_error(e, state))
+                return None
             if is_model_unavailable(e):
                 state.model_unavailable = True
                 yield fail(_model_unavailable_error(e))

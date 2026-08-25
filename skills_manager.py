@@ -190,6 +190,27 @@ def _read_frontmatter_only(path: Path) -> tuple[dict, bool]:
     return frontmatter, True
 
 
+#: Cache for `discover_skills(warn=False)` — the path all the automatic
+#: per-turn callers use (`build_triggered_skills`, `match_skills`). Keyed on
+#: a directory-level stat fingerprint at the same granularity
+#: `agent._stable_fingerprint()` already uses for these same directories, so
+#: an installed/removed skill is picked up exactly when the stable prompt
+#: would notice it too.
+_skills_cache: Optional[list] = None
+_skills_cache_sig: Optional[tuple] = None
+
+
+def _skill_dirs_fingerprint() -> tuple:
+    signature = []
+    for d in find_skill_dirs():
+        try:
+            st = d.stat()
+            signature.append((str(d), int(st.st_mtime_ns), st.st_size))
+        except OSError:
+            signature.append((str(d), 0, -1))
+    return tuple(signature)
+
+
 def discover_skills(warn: bool = False) -> list[Skill]:
     """
     Scan all skill directories and return skill records:
@@ -197,7 +218,26 @@ def discover_skills(warn: bool = False) -> list[Skill]:
 
     Bodies are not read here — `skill["content"]` loads on demand.
     A malformed frontmatter block is reported, never fatal.
+
+    Cached when `warn` is False (every automatic caller) on a directory-mtime
+    fingerprint — `build_triggered_skills` used to open every skill file's
+    frontmatter on every single turn just to decide whether one matched.
+    `warn=True` (the explicit `/skills`-style diagnostic paths) always
+    rescans, since it exists specifically to report the current state.
     """
+    if not warn:
+        global _skills_cache, _skills_cache_sig
+        sig = _skill_dirs_fingerprint()
+        if _skills_cache is not None and sig == _skills_cache_sig:
+            return _skills_cache
+    skills = _scan_skills(warn)
+    if not warn:
+        _skills_cache, _skills_cache_sig = skills, sig
+    return skills
+
+
+def _scan_skills(warn: bool = False) -> list[Skill]:
+    """The actual directory scan — see `discover_skills` for caching."""
     skills: list[Skill] = []
     seen: set[str] = set()
 
@@ -377,11 +417,27 @@ def find_skill(name: str) -> Optional[Skill]:
     return None
 
 
+def invalidate_skills_cache() -> None:
+    """Drop discover_skills()'s cache. For a write this module knows about.
+
+    The cache is keyed on each skill directory's own mtime/size, which is
+    NTFS's signal for an entry being added or removed — not for an existing
+    file being overwritten in place, which is exactly what `improve_skill`
+    does. Without this, a skill improved and then immediately looked up again
+    (install, generate, improve — all go through `write_skill`) read back its
+    own pre-write version.
+    """
+    global _skills_cache, _skills_cache_sig
+    _skills_cache = None
+    _skills_cache_sig = None
+
+
 def write_skill(path: Path, meta: dict, body: str) -> Path:
     """Write a skill in the one format. Used by install, generate and improve."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_frontmatter(meta) + "\n" + body.strip() + "\n",
                     encoding="utf-8")
+    invalidate_skills_cache()
     return path
 
 

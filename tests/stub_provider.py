@@ -185,6 +185,41 @@ class KeepAliveStub(BaseStub):
             return
         with KeepAliveStub._counter_lock:
             KeepAliveStub.requests += 1
+        if req.get("stream"):
+            # Real chunked transfer encoding — a streamed response has no
+            # Content-Length to declare, and HTTP/1.1 keep-alive means the
+            # client cannot fall back to "read until the connection closes"
+            # the way it can (and does) against FullStub's HTTP/1.0 response.
+            # This framing is exactly what exposes whether the client drains
+            # the terminating 0-length chunk before releasing the connection:
+            # skip it and the socket still has bytes on it when the *next*
+            # request tries to parse a status line from them.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+
+            def _chunk(data: bytes) -> bytes:
+                return f"{len(data):x}\r\n".encode() + data + b"\r\n"
+
+            for frame in (
+                {"choices": [{"delta": {"content": "ok"}, "index": 0}]},
+                {"choices": [{"delta": {}, "finish_reason": "stop", "index": 0}],
+                 "usage": {"prompt_tokens": 100, "completion_tokens": 2,
+                          "prompt_tokens_details": {"cached_tokens": 90}}},
+            ):
+                try:
+                    self.wfile.write(_chunk(
+                        b"data: " + json.dumps(frame).encode() + b"\n\n"))
+                    self.wfile.flush()
+                except OSError:
+                    return
+            try:
+                self.wfile.write(_chunk(b"data: [DONE]\n\n"))
+                self.wfile.write(b"0\r\n\r\n")   # terminating chunk
+            except OSError:
+                pass
+            return
         self._json({"choices": [{"message": {"content": "ok"},
                                  "finish_reason": "stop", "index": 0}],
                     "usage": {"prompt_tokens": 100, "completion_tokens": 2,

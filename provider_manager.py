@@ -41,6 +41,15 @@ PROVIDER_TYPES = (
     "anthropic", "openai", "openrouter", "zen", "google", "ollama", "custom",
 )
 
+#: The working set for now — Ollama (local + Ollama Cloud, distinguished per
+#: model via `remote_host`, not a separate type) and OpenCode Zen. Every other
+#: provider stays fully wired (PROVIDER_TYPES, PROVIDER_TYPE_TO_DETECT,
+#: PROVIDER_LABELS, detect_type() all stay complete — a hand-edited config
+#: must keep working) but is filtered out of the menus and listings a user
+#: picks from. Temporary and reversible: widen this tuple to bring a provider
+#: back, no other change needed.
+VISIBLE_PROVIDER_TYPES = ("ollama", "zen")
+
 # Endpoints that speak OpenAI wire format rather than Anthropic's.
 #: Google is on this list because it publishes an OpenAI-compatible endpoint
 #: (`/v1beta/openai/chat/completions`) that speaks the same wire format as the
@@ -103,6 +112,30 @@ def apply_env(key: str, value: str) -> None:
     """Persist a config key to ~/.tomas/.env and apply it to this process."""
     set_env_key(ENV_FILE, key, value)
     os.environ[key] = value
+
+
+def clear_env(key: str) -> None:
+    """Remove a config key from ~/.tomas/.env and from this process.
+
+    The counterpart to `apply_env`, and both halves matter: dropping the key
+    from `os.environ` alone lets the next launch read the stale value straight
+    back out of the file.
+    """
+    drop_env_key(ENV_FILE, key)
+    os.environ.pop(key, None)
+
+
+def env_file_keys(path: Path) -> set:
+    """The keys a .env file carries, ignoring comments and blank lines."""
+    if not path.exists():
+        return set()
+    keys = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        keys.add(line.split("=", 1)[0].strip())
+    return keys
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -280,6 +313,17 @@ def list_providers() -> list[Provider]:
     config = load_config()
     return [Provider.from_dict(name, data)
             for name, data in (config.get("providers") or {}).items()]
+
+
+def visible_providers() -> list[Provider]:
+    """Configured providers whose type is in the current working set.
+
+    A presentation-only filter — `list_providers()` stays complete, so a
+    provider configured outside `VISIBLE_PROVIDER_TYPES` (e.g. from before
+    this build, or a hand-edited config) keeps working via `get()`/
+    `get_active()`/`activate()`; it just does not resurface in a menu.
+    """
+    return [p for p in list_providers() if p.type in VISIBLE_PROVIDER_TYPES]
 
 
 def get(name: str) -> Optional[Provider]:
@@ -966,12 +1010,25 @@ def activate(name: str, start_proxy_if_needed: bool = True) -> bool:
 
     for key, value in (provider.env or {}).items():
         apply_env(key, value)
-    if provider.base_url and "ANTHROPIC_BASE_URL" not in (provider.env or {}):
-        apply_env("ANTHROPIC_BASE_URL", provider.base_url)
+    # Activation defines the whole connection, so it must also *unset* what
+    # this provider does not define. It only ever wrote before, and a provider
+    # with no base_url of its own — Zen stores `base_url: ""` — therefore
+    # inherited whatever the previously activated one left in ~/.tomas/.env,
+    # which is read into os.environ at import. A Zen session ran with
+    # `ANTHROPIC_BASE_URL=http://localhost:11434/v1` still live, and
+    # `agent._get_client`'s Anthropic-SDK fallback dialled an Ollama that was
+    # not running: "[WinError 10061] ... actively refused it", every turn.
+    if "ANTHROPIC_BASE_URL" not in (provider.env or {}):
+        if provider.base_url:
+            apply_env("ANTHROPIC_BASE_URL", provider.base_url)
+        else:
+            clear_env("ANTHROPIC_BASE_URL")
     if provider.model:
         apply_env("AGENT_MODEL", provider.model)
     if provider.extra_headers:
         apply_env("ANTHROPIC_EXTRA_HEADERS", json.dumps(provider.extra_headers))
+    elif "ANTHROPIC_EXTRA_HEADERS" not in (provider.env or {}):
+        clear_env("ANTHROPIC_EXTRA_HEADERS")
 
     config = load_config()
     config["active"] = name
@@ -983,6 +1040,49 @@ def activate(name: str, start_proxy_if_needed: bool = True) -> bool:
     except Exception:
         pass
     return True
+
+
+#: The keys that together say *where a request goes, and as what*. They are
+#: written by `activate()` and read by `agent._get_client` / `agent._get_model`.
+CONNECTION_ENV_KEYS = ("ANTHROPIC_BASE_URL", "AGENT_MODEL",
+                       "ANTHROPIC_EXTRA_HEADERS")
+
+
+def sync_env_to_active() -> Optional[str]:
+    """Reconcile this process's environment with the active provider, once.
+
+    Activation state lives in two files and startup loaded only one of them:
+    `~/.tomas/.env` is read into `os.environ` at import, `providers.json`
+    decides which provider is active, and nothing brought the two into line —
+    `activate()` runs when the *user switches*, never on the way in. A session
+    therefore opened with the endpoint, model name and headers of whichever
+    provider was activated last, while the menus and `openai_adapter` read the
+    active one. That is the split behind a `/config` panel reading
+
+        Provider   OpenCode Zen (opencode.ai)
+        Model      gemma4:31b-cloud
+
+    and a first turn that died on a dead localhost port.
+
+    A value present in the real environment but absent from `~/.tomas/.env` is
+    a deliberate pre-launch override (`AGENT_MODEL=x python agent.py`, which
+    `tests/labwork_sim.py` sweeps models with). It outranks the stored
+    provider, so it is restored in-process — and never written to the file,
+    because an override is for this run only.
+
+    Returns the active provider's name, or None when none is configured.
+    """
+    config = load_config()
+    name = config.get("active")
+    if not name or get(name) is None:
+        return None
+    stored = env_file_keys(ENV_FILE)
+    overrides = {k: os.environ[k] for k in CONNECTION_ENV_KEYS
+                 if k in os.environ and k not in stored}
+    activate(name, start_proxy_if_needed=False)
+    for key, value in overrides.items():
+        os.environ[key] = value
+    return name
 
 
 def _use_standalone_proxy() -> bool:

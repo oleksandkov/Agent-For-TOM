@@ -1300,6 +1300,14 @@ def provider_tool_ceiling() -> int:
 _budget_settings: Optional[Any] = None
 _budget_cache: Optional[tuple] = None
 
+# Bumped once, at the single point in init_mcp() where ALL_TOOLS is finalized
+# — never on the turn path. Used to cache _avg_tool_tokens()'s json.dumps pass
+# over the whole pool, which used to re-run unconditionally on every call,
+# including the ones made just to check whether active_budget()'s own cache
+# still applied.
+_tool_pool_version = 0
+_avg_tool_tokens_cache: Optional[tuple[int, int]] = None
+
 
 def budget_settings(refresh: bool = False):
     """The user's stored budget choices, read once per session."""
@@ -1332,11 +1340,20 @@ def _avg_tool_tokens() -> int:
     Passing a measured figure to `core.budget.resolve` is what lets a share
     mean what it says: 20% of the window is 20% whether the connected servers
     publish terse schemas or verbose ones.
+
+    Cached on `_tool_pool_version` rather than recomputed every call: this
+    used to `json.dumps` the entire tool pool unconditionally before
+    `active_budget()` even checked *its own* cache, at least twice per turn,
+    even though the pool only changes on MCP connect/reconnect.
     """
+    global _avg_tool_tokens_cache
+    if (_avg_tool_tokens_cache is not None
+            and _avg_tool_tokens_cache[0] == _tool_pool_version):
+        return _avg_tool_tokens_cache[1]
     pool = ALL_TOOLS or COMBINED_TOOLS or TOOLS
-    if not pool:
-        return 0
-    return max(1, estimate_tool_tokens(pool) // len(pool))
+    value = 0 if not pool else max(1, estimate_tool_tokens(pool) // len(pool))
+    _avg_tool_tokens_cache = (_tool_pool_version, value)
+    return value
 
 
 def active_budget():
@@ -4339,6 +4356,25 @@ def maybe_compact(messages: list, system_prompt: str = "",
         _record_compaction("truncate", before_tok, running, plan, error=str(e)[:200])
         return keep
 
+
+def _prepare_turn_context(messages: list, user_input: str) -> tuple[list, str]:
+    """Prune, build the system prompt, then compact exactly once against its
+    real size.
+
+    Order matters: compacting before the system prompt is known forces a
+    second check with an understated reserve, and on a heavy system prompt
+    (many facts/skills/MCP tools) close to the trigger boundary that second
+    check can independently fire its own real summarization call — two
+    network round-trips instead of at most one. `build_system_prompt` depends
+    only on `user_input` and on-disk state, never on `messages` (see its
+    docstring), so building it first costs nothing extra and removes the need
+    for a second compaction check entirely.
+    """
+    messages = maybe_prune(messages)
+    system_prompt = build_system_prompt(user_input)
+    messages = maybe_compact(messages, system_prompt)
+    return messages, system_prompt
+
 # ---------------------------------------------------------------------------
 # The agent loop
 # ---------------------------------------------------------------------------
@@ -4380,6 +4416,7 @@ def init_mcp(config: Optional[dict] = None) -> dict:
     credentials is not a trade anyone would choose.
     """
     global COMBINED_TOOLS, TOOL_TOKENS, MCP_TOOL_NAME_MAP, ALL_TOOLS, mcp_manager
+    global _tool_pool_version
 
     from mcp_manager import read_mcp_servers
 
@@ -4415,6 +4452,9 @@ def init_mcp(config: Optional[dict] = None) -> dict:
         COMBINED_TOOLS = TOOLS
         MCP_TOOL_NAME_MAP = {}
         TOOL_TOKENS = estimate_tool_tokens(TOOLS)
+    # All three branches above converge here with ALL_TOOLS finalized — the
+    # one place _avg_tool_tokens()'s cache needs invalidating.
+    _tool_pool_version += 1
     return summary
 
 
@@ -4844,6 +4884,7 @@ def build_state(system_prompt: str, messages: list, responder) -> AgentState:
         origin_of=_tool_origin,
         parallel_safe=parallel_safe,
         before_model_call=remark_cache,
+        describe_endpoint=_describe_endpoint,
         responder=responder,
         approvals=APPROVALS,
         auto_approve_low=AUTO_APPROVE_LOW,
@@ -5077,6 +5118,48 @@ def _intercept_slash_command(messages: list) -> Optional[str]:
     return result
 
 
+def _try_zen_fallback(reason: str) -> str:
+    """Switch to a different free, served Zen model after this one turned out
+    to be listed but not actually served, so a task can continue instead of
+    just stopping.
+
+    Zen only: Ollama has no equivalent "try a different served model"
+    catalogue to fall back to, and every other provider is outside the
+    current working set (see provider_manager.VISIBLE_PROVIDER_TYPES).
+    `mark_unavailable` then `default_free_model` compose correctly with no
+    extra plumbing — `default_free_model` filters through `_stamp_served`,
+    which re-reads the unavailable-models file fresh on every call, so the
+    just-failed model is already excluded from the candidate it returns.
+
+    Returns the new model name, or "" when no fallback applies (a different
+    provider is active, nothing else free is currently served, or switching
+    itself failed) — the caller's existing "model unavailable" message stands
+    unchanged in that case. A failure here must not cost the user *more* than
+    the original error already did, so nothing above this returning "" is
+    allowed to propagate — a config write that fails partway through must
+    leave the turn ending the way it always has, not crash it worse.
+    """
+    try:
+        import provider_manager
+        active = provider_manager.get_active()
+        if active is None or active.type != "zen":
+            return ""
+        import zen_catalog
+        failed_model = _get_model()
+        zen_catalog.mark_unavailable(failed_model, reason)
+        candidate = zen_catalog.default_free_model()
+        if not candidate or candidate == failed_model:
+            return ""
+        active.model = candidate
+        provider_manager.save(active, activate_it=True)
+        provider_manager.activate(active.name)
+        reinit_client()
+        _refresh_context_window()
+    except Exception:
+        return ""
+    return candidate
+
+
 def agent_loop(system_prompt: str, messages: list) -> str:
     """Shim — drives core.loop.run_turn through the terminal adapter.
 
@@ -5116,6 +5199,23 @@ def agent_loop(system_prompt: str, messages: list) -> str:
         reply = adapter.run(state)
         if not _active_capabilities().tool_use:
             reply = _run_text_protocol(state, adapter, reply, messages)
+        # A free Zen model that is listed but not actually served used to just
+        # end the task here — the red error above already printed, and the
+        # user had to notice, run /model, and hope the next pick was not also
+        # dead. `messages` is untouched by the failure (the core never appends
+        # anything before the request itself fails), so whatever the turn had
+        # already gathered — tool results included — is still there to retry
+        # with. One bounded attempt, never a chain: this is a fallback, not a
+        # search.
+        if not (reply or "").strip() and getattr(state, "model_unavailable", False):
+            fallback_model = _try_zen_fallback(state.last_error or "")
+            if fallback_model:
+                print(f'  {YELLOW}⟳{RESET} {DIM}unavailable — retrying with'
+                     f'{RESET} {CYAN}{fallback_model}{RESET}{DIM} …{RESET}')
+                state = build_state(system_prompt, messages, adapter)
+                reply = adapter.run(state)
+                if not _active_capabilities().tool_use:
+                    reply = _run_text_protocol(state, adapter, reply, messages)
     except BaseException as e:
         error = e
         raise
@@ -5159,6 +5259,12 @@ def agent_loop(system_prompt: str, messages: list) -> str:
                     "would_have_served", "stream_malformed_tool_args"):
             _session_tokens[key] = (_session_tokens.get(key, 0)
                                     + state.usage.get(key, 0))
+        # Bucketed by why the stream was discarded (see
+        # core.loop._record_discarded_stream) — dynamic keys, so copied by
+        # prefix rather than added to the fixed tuple above.
+        for key, value in state.usage.items():
+            if key.startswith("duplicate_reason_"):
+                _session_tokens[key] = _session_tokens.get(key, 0) + value
         # A turn that produced nothing is recorded as such. Silence here is
         # what let a session with eight prompts and zero replies be saved,
         # and then be reported as eight turns of completed work.
@@ -5196,6 +5302,7 @@ SLASH_COMMANDS = {
     "help":         {"desc": "Show this help message",            "icon": "ℹ"},
     "clear":        {"desc": "Clear conversation history",        "icon": "✧"},
     "status":       {"desc": "Show current model and connection", "icon": "◈"},
+    "version":      {"desc": "Show TOMAS's version and last-updated date", "icon": "ℹ"},
     "model":        {"desc": "Show/switch model: /model [list|<name>]", "icon": "◎"},
     "mode":         {"desc": "Show/change mode: /mode [auto|default]", "icon": "⚙"},
     "config":       {"desc": "Interactive menu: provider, model, mode", "icon": "🛠"},
@@ -5222,6 +5329,27 @@ SLASH_COMMANDS = {
     "notes":        {"desc": "List all self-notes",               "icon": "📒"},
     "exit":         {"desc": "Exit TOMAS",                        "icon": "✕"},
 }
+
+def _describe_endpoint() -> str:
+    """Where requests are going, in words — for error messages only.
+
+    `core.loop` reports an unreachable endpoint and cannot name it: it must
+    not know that `provider_manager` exists. This is the host's answer, and it
+    is what turns "[WinError 10061] ... actively refused it" into a sentence
+    naming the provider and address that refused.
+    """
+    try:
+        import provider_manager
+        active = provider_manager.get_active()
+        if active is None:
+            return os.environ.get("ANTHROPIC_BASE_URL", "")
+        where = active.base_url or os.environ.get("ANTHROPIC_BASE_URL", "")
+        if active.type == "zen" and not where:
+            where = "opencode.ai/zen"     # reached in-process, not via base_url
+        return f"{active.name} at {where}" if where else active.name
+    except Exception:
+        return ""
+
 
 def _get_model() -> str:
     """Read model from environment or active provider configuration."""
@@ -5576,7 +5704,7 @@ def _config_menu(messages: list) -> str:
 
     while True:
         active = provider_manager.get_active()
-        providers = provider_manager.list_providers()
+        providers = provider_manager.visible_providers()
         mode = current_mode_name()
 
         top_items = [
@@ -5748,6 +5876,23 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
                          f'{DIM}(~{saved:,} tokens released){RESET}')
         return '\n'.join(lines)
 
+    if cmd == "version":
+        from version import VERSION, LAST_UPDATED, git_info
+        lines = [
+            f'  {BOLD}TOMAS{RESET}',
+            f'  {DIM}{"─" * 46}{RESET}',
+            f'  {CYAN}◎{RESET}  Version:       {VERSION}',
+            f'  {CYAN}▣{RESET}  Last updated:  {LAST_UPDATED}',
+        ]
+        # Dev-checkout-only supplement — see version.git_info's docstring for
+        # why this is never the primary source.
+        info = git_info()
+        if info:
+            commit_hash, commit_date = info
+            lines.append(f'  {DIM}⎇  dev checkout — commit {commit_hash} '
+                         f'({commit_date}){RESET}')
+        return '\n'.join(lines)
+
     if cmd == "model":
         sub = parts[1].strip() if len(parts) > 1 else ""
         if not sub:
@@ -5768,12 +5913,26 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
                 models = provider_manager.available_models(active.name)
             except Exception as e:
                 return f'  {RED}Could not list models: {e}{RESET}'
+            # This is the raw upstream list — the same one that told the user
+            # a dead model was there in the first place ("This model is
+            # listed but not currently being served"). Cross-referencing the
+            # observed-refusal record here means someone told "pick another
+            # with /model" is not steered right back into another dead one.
+            unavailable = {}
+            if active.type == "zen":
+                try:
+                    import zen_catalog
+                    unavailable = zen_catalog.unavailable()
+                except Exception:
+                    pass
             if not models:
                 lines.append(f'  {DIM}The endpoint did not report a model list.{RESET}')
             else:
                 for m in models:
                     marker = f'{GREEN}●{RESET}' if m == current else f'{DIM}○{RESET}'
-                    lines.append(f'    {marker} {m}')
+                    flag = (f'  {YELLOW}(unavailable — refused within the '
+                           f'last 24h){RESET}') if m in unavailable else ''
+                    lines.append(f'    {marker} {m}{flag}')
             lines.append('')
             lines.append(f'  {DIM}Switch with{RESET} {CYAN}/model <name>{RESET}')
             return '\n'.join(lines)
@@ -5933,8 +6092,12 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
             if not cat.free():
                 lines.append(f'    {DIM}none right now{RESET}')
             lines.append('')
-            lines.append(f'  {DIM}{len(cat.paid())} further models bill per '
-                         f'token — switch with{RESET} {CYAN}/model{RESET}')
+            # Informational only, deliberately not "switch with /model" — the
+            # working set is free-tier-only for now (see
+            # provider_manager.VISIBLE_PROVIDER_TYPES), so this should not
+            # read as an invitation to pick one of them.
+            lines.append(f'  {DIM}{len(cat.paid())} further models on this '
+                         f'endpoint bill per token (not offered for now).{RESET}')
             return '\n'.join(lines)
         except Exception as e:
             return f'  {YELLOW}Zen: {e}{RESET}'
@@ -5945,7 +6108,7 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
         sub = sub_raw.lower()
 
         if sub in ("list", "ls"):
-            providers = provider_manager.list_providers()
+            providers = provider_manager.visible_providers()
             if not providers:
                 return f'  {DIM}No provider is configured. Use{RESET} {CYAN}agent_cli.py{RESET}{DIM} to add one.{RESET}'
             active_provider = provider_manager.get_active()
@@ -5960,7 +6123,7 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
 
         # ── Switch to a different configured provider ──
         if sub and sub != "probe":
-            names = [p.name for p in provider_manager.list_providers()]
+            names = [p.name for p in provider_manager.visible_providers()]
             exact = [n for n in names if n.lower() == sub]
             partial = [n for n in names if sub in n.lower()]
             target = exact[0] if exact else (partial[0] if len(partial) == 1 else None)
@@ -6634,6 +6797,7 @@ def read_input_with_suggestions(prompt: str) -> str:
 
     global _history_index   # mode switching goes through set_mode()
     base_prompt = prompt
+    from version import VERSION as _VERSION
 
     buffer: list[str] = []
     showing = False
@@ -6666,9 +6830,15 @@ def read_input_with_suggestions(prompt: str) -> str:
     def _build_prompt() -> str:
         badge = _mode_badge()
         idx = base_prompt.find('TOMAS')
-        if idx >= 0:
-            return base_prompt[:idx] + badge + ' ' + base_prompt[idx:]
-        return badge + ' ' + base_prompt
+        if idx < 0:
+            return badge + ' ' + base_prompt
+        # Terse on purpose: this line redraws on every keystroke, so it is
+        # the one place version visibility has to earn its width. The full
+        # picture (last-updated date, git info if this is a dev checkout)
+        # lives in /version instead.
+        after = idx + len('TOMAS')
+        return (base_prompt[:idx] + badge + ' ' + base_prompt[idx:after]
+                + f' {DIM}v{_VERSION}{RESET}' + base_prompt[after:])
 
     # Delegates to the module-level `set_mode` rather than repeating the flag
     # writes. This copy had drifted from the /mode handler's — it knew nothing
@@ -7275,6 +7445,18 @@ def main() -> int:
     # ── This session's accounting starts here, not at import time ──
     reset_session_state()
 
+    # ── Bring the environment into line with the active provider ──
+    # ~/.tomas/.env lands in os.environ at import and providers.json decides
+    # who is active; nothing reconciled the two on the way in, so a session
+    # could run with a *previous* provider's endpoint still live while every
+    # menu showed the current one. Do it before the banner and the context
+    # window, both of which read the result.
+    try:
+        import provider_manager
+        provider_manager.sync_env_to_active()
+    except Exception:
+        pass    # a config we cannot read must not stop the agent from starting
+
     # ── Auto-start Zen proxy if needed ──
     _ensure_zen_proxy()
 
@@ -7290,6 +7472,9 @@ def main() -> int:
     print(f'  {CYAN}{BOLD}   ██║   ╚██████╔╝██║ ╚═╝ ██║██║  ██║███████║{RESET}')
     print(f'  {CYAN}{BOLD}   ╚═╝    ╚═════╝ ╚═╝     ╚═╝╚═╝  ╚═╝╚══════╝{RESET}')
     print()
+    from version import VERSION, LAST_UPDATED
+    print(f'  {DIM}Version:{RESET}  {CYAN}{VERSION}{RESET} '
+          f'{DIM}(updated {LAST_UPDATED}){RESET}')
     print(f'  {DIM}Model:{RESET}    {CYAN}{_get_model()}{RESET}')
     cw_str = f'{_current_context_window:,}' if _current_context_window else '?'
     print(f'  {DIM}Context:{RESET}  {CYAN}{cw_str} tokens{RESET}')
@@ -7453,10 +7638,9 @@ def main() -> int:
             # compaction spends a model call and rewrites the whole transcript.
             # Doing it in this order means a session often no longer needs to
             # compact at all.
-            messages = maybe_prune(messages)
-            messages = maybe_compact(messages)
-            # Retrieve learned knowledge against what the user just asked.
-            system_prompt = build_system_prompt(user_input)  # re-inject every turn
+            # Prune, build the system prompt, then compact exactly once
+            # against its real size — see _prepare_turn_context.
+            messages, system_prompt = _prepare_turn_context(messages, user_input)
             # An auto-triggered skill was, until now, invisible: its body
             # went straight into the system prompt tail with nothing printed,
             # so there was no way to tell from the chat whether one had fired
@@ -7470,8 +7654,6 @@ def main() -> int:
                 print(f'  {YELLOW}⚡ Skill matched:{RESET} '
                       f'{BOLD}{_triggered_skill["name"]}{RESET} '
                       f'{DIM}[offered — the model decides if it fits]{RESET}')
-            # Re-check compaction with the actual system prompt size
-            messages = maybe_compact(messages, system_prompt)
             result = agent_loop(system_prompt, messages)
             # agent_loop owns both printing and transcript recording: the
             # streaming path prints tokens as they arrive, the non-streaming
@@ -7496,12 +7678,20 @@ def main() -> int:
                 # The bill nobody was shown: streamed calls re-issued
                 # non-streamed to get their tool blocks. Named "duplicate"
                 # rather than folded into the total because it is the number
-                # that argues for removing the second call.
+                # that argues for removing the second call. `_stream_can_serve`
+                # already serves everything recoverable, so `would_have_served`
+                # is expected to read 0 now — the reason breakdown (why the
+                # remaining ones fell through) is the useful part, not a
+                # "recoverable" count that would always say zero.
                 if s.get("duplicate_input"):
-                    served = s.get("would_have_served", 0)
+                    reasons = sorted(
+                        (k[len("duplicate_reason_"):], v)
+                        for k, v in s.items()
+                        if k.startswith("duplicate_reason_") and v)
+                    breakdown = ", ".join(f'{k}×{v}' for k, v in reasons)
                     cached += (f'  ·  {s["duplicate_input"]:,} duplicate'
-                               f' ({served}/{s.get("duplicate_calls", 0)}'
-                               f' recoverable)')
+                               f' ({s.get("duplicate_calls", 0)} calls'
+                               + (f': {breakdown}' if breakdown else '') + ')')
                 print(f'  {DIM}┄  {t["input"]:,} in  {t["output"]:,} out  ·  total: {s["input"]:,} in  {s["output"]:,} out{cached}  ·  {pct:.1f}% of {CONTEXT_WINDOW:,} ctx  ·  {elapsed}{RESET}')
             # ── Self-improvement analysis, after the reply so it never adds latency ──
             try:

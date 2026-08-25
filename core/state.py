@@ -106,6 +106,14 @@ class AgentState:
     # provider is told to cut it, and the core ignores anything it raises.
     before_model_call: Optional[Callable[[list], None]] = None
 
+    # Where requests are going, in words, for error messages only — e.g.
+    # "Ollama (ollama) at http://localhost:11434/v1". A callable for the same
+    # reason `get_model` is one: the endpoint changes under a running state
+    # when the user switches provider. Injected rather than imported because
+    # the core must not know that `provider_manager` exists; when no host
+    # supplies it, the messages simply omit the endpoint.
+    describe_endpoint: Optional[Callable[[], str]] = None
+
     # Permission policy
     approvals: ApprovalStore = field(default_factory=ApprovalStore)
     auto_approve_low: bool = True

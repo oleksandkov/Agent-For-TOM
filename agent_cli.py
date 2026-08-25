@@ -792,8 +792,16 @@ def _save_provider_config(name: str, env_vars: dict, model: str = "",
 def _choose_provider_to_switch() -> bool:
     """Show a sub-menu of configured providers to switch to.
     Returns True if a switch was made, False if cancelled."""
+    import provider_manager
     config = _load_providers_config()
-    providers = _get_configured_providers(config)
+    # Restricted to the current working set — see
+    # provider_manager.VISIBLE_PROVIDER_TYPES. A provider configured outside
+    # it (a legacy entry, or one added by hand) stays in providers.json and
+    # keeps working if switched to directly; it just does not resurface here.
+    all_providers = _get_configured_providers(config)
+    providers = [p for p in all_providers
+                if config.get("providers", {}).get(p, {}).get("type")
+                in provider_manager.VISIBLE_PROVIDER_TYPES]
     if not providers:
         show_info_page('No Providers',
                        ['  No providers are configured yet.',
@@ -1641,7 +1649,10 @@ def page_skills():
     """Show installed skills with enhanced formatting."""
     from skills_manager import discover_skills, find_skill_dirs
 
-    all_skills = discover_skills()
+    # warn=True: this page exists to report current state, including any
+    # frontmatter problems, so it always rescans rather than reading the
+    # per-turn cache other callers use.
+    all_skills = discover_skills(warn=True)
     dirs = find_skill_dirs()
     if not all_skills:
         show_info_page('Installed Skills', ['  No skills installed.'])
@@ -2040,11 +2051,25 @@ def page_configure_provider():
         'Ollama (local)',
         'Custom / Other',
     ]
+    # index -> provider type, matched to provider_names by position. Kept as
+    # a parallel list rather than folded into provider_names itself so the
+    # idx==N dispatch below — and every provider_names[N] reference inside
+    # it — stays on the original, stable indices even though the menu below
+    # shows only a filtered subset of them.
+    provider_name_types = ['openrouter', 'anthropic', 'openai', 'google',
+                           'zen', 'ollama', 'custom']
     # Probe for a local Ollama so the option can say whether it is there.
     # Cached: without it this page paid 12.3 s on every open, because a
     # missing Ollama meant three HTTP attempts that each ran to their timeout.
     import net_probe
     import provider_manager
+
+    # Restricted to the current working set (see
+    # provider_manager.VISIBLE_PROVIDER_TYPES) — temporary and reversible,
+    # not a removal: every other provider stays fully wired below, it just
+    # does not appear in this menu for now.
+    visible_indices = [i for i, t in enumerate(provider_name_types)
+                       if t in provider_manager.VISIBLE_PROVIDER_TYPES]
 
     def _probe_ollama() -> list[str]:
         try:
@@ -2058,7 +2083,8 @@ def page_configure_provider():
 
     # Show ✓ for already-configured providers
     display = []
-    for p in provider_names:
+    for i in visible_indices:
+        p = provider_names[i]
         suffix = ''
         if p == 'Ollama (local)':
             suffix = (f'  {DIM}— {len(ollama_models)} model(s) detected{RESET}'
@@ -2068,10 +2094,11 @@ def page_configure_provider():
         else:
             display.append(f'  {p}{suffix}')
 
-    idx = arrow_menu('Connect / Configure Provider', display,
+    sel = arrow_menu('Connect / Configure Provider', display,
                      footer=DEFAULT_FOOTER)
-    if idx < 0:
+    if sel < 0:
         return
+    idx = visible_indices[sel]   # back to the original, stable index
 
     if idx == 0:  # OpenRouter
         key = prompt_text('Enter OpenRouter API key (sk-or-...)')
@@ -2178,15 +2205,45 @@ def page_configure_provider():
         _save_providers_config(config)
     elif idx == 5:  # Ollama (local)
         if not ollama_models:
-            show_info_page('Ollama not found', [
-                f'  No Ollama server answered at {provider_manager.OLLAMA_DEFAULT_URL}.',
-                '',
-                '  Install from https://ollama.com, then:',
-                f'    {CYAN}ollama pull qwen2.5-coder{RESET}',
-                f'    {CYAN}ollama serve{RESET}',
-                '',
-                '  Then come back here — it will be detected automatically.'])
-            return
+            import shutil
+            has_binary = bool(shutil.which("ollama"))
+            started = False
+            if has_binary:
+                print(f'  {DIM}Ollama is installed but not running — starting it...{RESET}')
+                started = _try_start_ollama_server()
+                if started:
+                    net_probe.invalidate('ollama_models')
+                    ollama_models = net_probe.cached(
+                        'ollama_models', 30.0, _probe_ollama)
+            if not ollama_models:
+                lines = [
+                    f'  No Ollama server answered at {provider_manager.OLLAMA_DEFAULT_URL}.',
+                    '']
+                if started:
+                    # The server came up (reachable) but reported no models —
+                    # a different situation from "Ollama isn't installed",
+                    # and the fix is a pull, not serve.
+                    lines += [
+                        '  It started, but has no models pulled yet:',
+                        f'    {CYAN}ollama pull qwen2.5-coder{RESET}',
+                        '',
+                        '  Then come back here — it will be detected automatically.']
+                elif has_binary:
+                    lines += [
+                        '  Found the ollama binary, but the server did not come up '
+                        'in time.',
+                        f'    {CYAN}ollama serve{RESET}',
+                        '',
+                        '  Then come back here — it will be detected automatically.']
+                else:
+                    lines += [
+                        '  Install from https://ollama.com, then:',
+                        f'    {CYAN}ollama pull qwen2.5-coder{RESET}',
+                        f'    {CYAN}ollama serve{RESET}',
+                        '',
+                        '  Then come back here — it will be detected automatically.']
+                show_info_page('Ollama not found', lines)
+                return
         m_idx = arrow_menu('Ollama — choose a model',
                            [f'  {m}' for m in ollama_models],
                            footer=DEFAULT_FOOTER)
@@ -2255,6 +2312,67 @@ def page_configure_zen():
     action = actions[idx]
     if action:
         action()
+
+
+def _ollama_server_reachable(timeout: float = 1.0) -> bool:
+    """Direct reachability check against Ollama's own endpoint.
+
+    Deliberately not `provider_manager.list_models()`, which the rest of this
+    page uses to mean "the server is up" — that returns `[]` for a server
+    that is running but has no models pulled yet, which would make a freshly
+    started, empty Ollama look identical to one that never started at all.
+    """
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+                "http://localhost:11434/api/tags", timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _try_start_ollama_server() -> bool:
+    """Launch `ollama serve` in the background if it is installed but not
+    already running — the same "the user should not need a manual terminal
+    command first" reasoning `_zen_setup_proxy` already applies to Zen.
+
+    Returns True once the local API actually answers, False if the `ollama`
+    binary is not on PATH or the server never came up within the wait.
+    """
+    import shutil
+    import subprocess
+    import time as _time
+
+    if _ollama_server_reachable():
+        return True   # already running — nothing to launch
+    ollama_bin = shutil.which("ollama")
+    if not ollama_bin:
+        return False
+    kwargs = {}
+    if sys.platform == "win32":
+        # Same detached-process pattern agent.py's background run_command
+        # uses: the server must outlive this menu, not be tied to its console.
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS)
+    try:
+        subprocess.Popen(
+            [ollama_bin, "serve"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, **kwargs)
+    except Exception:
+        return False
+    # Polled rather than a fixed sleep: measured live on a real installation
+    # with a large local+cloud model library, the server took ~12s to start
+    # answering — enumerating everything registered is part of startup, not
+    # just binding the port — while an empty/small library binds in under a
+    # second. 25s covers the slow case without making the fast one wait for it.
+    deadline = _time.monotonic() + 25.0
+    while _time.monotonic() < deadline:
+        if _ollama_server_reachable():
+            return True
+        _time.sleep(0.4)
+    return False
 
 
 def _zen_setup_proxy():
@@ -2515,8 +2633,10 @@ def _provider_model_entries(provider: str) -> list[tuple[str, str | None]]:
     elif provider == "zen":
         # Live, never static — for the reason the Ollama branch below is, and
         # then some: this list *changed under the hardcoded copy* three times.
-        # Free first and under its own heading, because the old menu filed all
-        # sixty models under "free-tier models" while eight of them were free.
+        # Free-tier only, for now — see provider_manager.VISIBLE_PROVIDER_TYPES
+        # and Catalog.free()'s cost.input == 0 and cost.output == 0 rule.
+        # Paid models are deliberately left off this menu rather than merely
+        # de-emphasized, so nothing here can be picked by accident.
         import net_probe
         import zen_catalog
         cat = net_probe.cached('zen_catalog', 60.0, zen_catalog.catalog)
@@ -2525,11 +2645,6 @@ def _provider_model_entries(provider: str) -> list[tuple[str, str | None]]:
         if free:
             entries.append(('── Free (no charge) ──', None))
             entries += [(f'  {m.label}', m.id) for m in free]
-        paid = cat.paid() if free else cat.models
-        if paid:
-            entries.append(('── Paid (billed per token) ──' if free
-                            else '── Zen models ──', None))
-            entries += [(f'  {m.label}', m.id) for m in paid]
         # Only when the list is actually doubtful. A fresh cache is the normal
         # fast path, not a degraded one — warning on it would train the user to
         # ignore the warning that matters.
@@ -3440,7 +3555,8 @@ def cmd_skill_list():
     """List installed skills with enhanced formatting."""
     from skills_manager import discover_skills, find_skill_dirs
 
-    all_skills = discover_skills()
+    # warn=True — see page_skills().
+    all_skills = discover_skills(warn=True)
     dirs = find_skill_dirs()
     if not all_skills:
         print("No skills installed.")

@@ -272,12 +272,50 @@ def append_jsonl(path: Path, row: dict) -> None:
         pass
 
 
+#: `recall()` and `directives_for_prompt()` each read both scopes independently
+#: every turn — four full reads and JSON-parses of facts.jsonl per turn with
+#: nothing else changing it in between. Keyed on mtime/size rather than a
+#: timer, same reasoning as agent._stable_fingerprint(): a fact written this
+#: process is visible on the very next read. Values are cached rows; callers
+#: always get their own copy (see load_facts) because promotion.py mutates a
+#: returned fact dict in place before saving — a shared reference would let
+#: that mutation leak into other readers ahead of the save.
+#:
+#: Keyed on the resolved path, not on `scope` — "project" resolves through
+#: `project_key()`, which changes when `set_project()` switches the active
+#: project. Keying on the scope name alone would let a fact store from the
+#: *previous* project answer for the new one until something else happened
+#: to invalidate it.
+_facts_cache: dict[str, tuple] = {}
+
+
+def _facts_sig(path: Path) -> tuple:
+    try:
+        st = path.stat()
+        return (int(st.st_mtime_ns), st.st_size)
+    except OSError:
+        return (0, -1)
+
+
 def load_facts(scope: str) -> list[dict]:
-    return _read_jsonl(facts_path(scope))
+    path = facts_path(scope)
+    key = str(path)
+    sig = _facts_sig(path)
+    cached = _facts_cache.get(key)
+    if cached is not None and cached[0] == sig:
+        return [dict(f) for f in cached[1]]
+    rows = _read_jsonl(path)
+    _facts_cache[key] = (sig, rows)
+    return [dict(f) for f in rows]
 
 
 def save_facts(scope: str, facts: list[dict]) -> None:
-    _write_jsonl(facts_path(scope), facts)
+    path = facts_path(scope)
+    _write_jsonl(path, facts)
+    # Recorded from our own write rather than left to the next load to
+    # discover, so a save immediately followed by a load in the same process
+    # cannot lose to mtime resolution (some filesystems round to ~1s).
+    _facts_cache[str(path)] = (_facts_sig(path), [dict(f) for f in facts])
     if scope != "global":
         _write_project_meta()
 

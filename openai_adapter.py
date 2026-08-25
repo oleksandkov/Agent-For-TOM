@@ -38,6 +38,16 @@ from zen_proxy import (anthropic_to_openai, attach_reasoning,
 
 DEFAULT_TIMEOUT = 300
 
+#: Bounds only the TCP/TLS handshake, not the read that follows it. stdlib
+#: `http.client` applies one `timeout` to both connect() and every later
+#: recv(), so a route that black-holes packets (no refusal, just silence)
+#: used to cost the full DEFAULT_TIMEOUT on each of the retry ladder's 4
+#: attempts in core.loop — ~20 minutes for a failure a handshake should
+#: reveal in seconds. Widening the socket's timeout right after connect()
+#: (see _ConnectTimeoutMixin) keeps today's tolerance for a slow-but-arriving
+#: reply; only the handshake itself is bounded tightly.
+CONNECT_TIMEOUT = int(os.environ.get("TOMAS_CONNECT_TIMEOUT", "10"))
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  Anthropic-shaped response objects
@@ -291,8 +301,35 @@ class _Stream:
         return self._final
 
 
+def _drain(resp) -> None:
+    """Read whatever is left on the socket so `isclosed()` becomes true.
+
+    Only called from `_iter_sse`'s two natural-completion points, never from
+    an early exit. A stream the caller abandons mid-read (interrupted turn,
+    exception) delivers `GeneratorExit` to this generator at its current
+    `yield`, which skips straight past both call sites — so an aborted
+    connection is never drained, and `_PooledResponse.close()`'s existing
+    `isclosed()` check keeps discarding it exactly as it does today. A failed
+    drain (dropped connection, malformed trailer) is swallowed the same way:
+    `isclosed()` just stays False and the connection is discarded, which is
+    already correct.
+    """
+    try:
+        resp.read()
+    except Exception:
+        pass
+
+
 def _iter_sse(resp) -> Iterator[dict]:
-    """Yield decoded JSON payloads from an SSE response, as they arrive."""
+    """Yield decoded JSON payloads from an SSE response, as they arrive.
+
+    Draining on natural completion is what lets the connection go back to the
+    pool: `[DONE]` used to `return` immediately, leaving the terminating
+    chunked-encoding frame unread on the socket — `isclosed()` never became
+    true, so every streamed call paid for a fresh TCP/TLS handshake on the
+    *next* call even though `_ConnectionPool` exists specifically to avoid
+    that. See `_PooledResponse.close()`.
+    """
     if resp is None:
         return
     for raw in resp:
@@ -302,11 +339,13 @@ def _iter_sse(resp) -> Iterator[dict]:
         if line.startswith("data:"):
             line = line[5:].strip()
         if line == "[DONE]":
+            _drain(resp)
             return
         try:
             yield json.loads(line)
         except json.JSONDecodeError:
             continue
+    _drain(resp)  # provider closed the stream without a [DONE] sentinel
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -348,9 +387,10 @@ class _PooledResponse:
         # `isclosed()` is true only once the body has been read to the end.
         # A half-read body leaves bytes in the socket that would be parsed as
         # the *next* response's status line, so anything short of fully drained
-        # is thrown away rather than pooled. This is why streamed calls — which
-        # stop at `[DONE]` without draining — do not currently reuse their
-        # connection, and must not be made to without solving that first.
+        # is thrown away rather than pooled. Streamed calls reach `isclosed()`
+        # too, via `_iter_sse`'s drain-on-completion — an *abandoned* stream
+        # (interrupted mid-read) never reaches that drain, so it still falls
+        # through to being discarded here, correctly.
         reusable = False
         try:
             reusable = bool(self._resp.isclosed())
@@ -361,6 +401,34 @@ class _PooledResponse:
         except Exception:
             pass
         self._pool.release(self._conn, reusable=reusable)
+
+
+class _ConnectTimeoutMixin:
+    """Fail fast on a hung handshake; stay generous once connected.
+
+    `timeout=` on an `http.client` connection covers connect() *and* every
+    subsequent read with the same value. Passing the short CONNECT_TIMEOUT as
+    that value and then widening the socket right after connect() gives the
+    handshake its own tight bound without touching how long a slow-but-
+    arriving reply is allowed to take.
+    """
+
+    def __init__(self, *a, connect_timeout: float, read_timeout: float, **kw):
+        super().__init__(*a, timeout=connect_timeout, **kw)
+        self._read_timeout = read_timeout
+
+    def connect(self):
+        super().connect()
+        if self.sock is not None:
+            self.sock.settimeout(self._read_timeout)
+
+
+class _TimeoutHTTPConnection(_ConnectTimeoutMixin, http.client.HTTPConnection):
+    pass
+
+
+class _TimeoutHTTPSConnection(_ConnectTimeoutMixin, http.client.HTTPSConnection):
+    pass
 
 
 class _ConnectionPool:
@@ -389,11 +457,9 @@ class _ConnectionPool:
         self._lock = threading.Lock()
 
     def _new(self):
-        if self._secure:
-            return http.client.HTTPSConnection(
-                self._host, self._port, timeout=self._timeout)
-        return http.client.HTTPConnection(
-            self._host, self._port, timeout=self._timeout)
+        cls = _TimeoutHTTPSConnection if self._secure else _TimeoutHTTPConnection
+        return cls(self._host, self._port,
+                   connect_timeout=CONNECT_TIMEOUT, read_timeout=self._timeout)
 
     def acquire(self):
         with self._lock:
