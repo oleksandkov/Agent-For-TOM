@@ -2049,6 +2049,7 @@ def page_configure_provider():
         'Google AI',
         'OpenCode Zen (opencode.ai)',
         'Ollama (local)',
+        'Groq (console.groq.com)',
         'Custom / Other',
     ]
     # index -> provider type, matched to provider_names by position. Kept as
@@ -2057,7 +2058,7 @@ def page_configure_provider():
     # it — stays on the original, stable indices even though the menu below
     # shows only a filtered subset of them.
     provider_name_types = ['openrouter', 'anthropic', 'openai', 'google',
-                           'zen', 'ollama', 'custom']
+                           'zen', 'ollama', 'groq', 'custom']
     # Probe for a local Ollama so the option can say whether it is there.
     # Cached: without it this page paid 12.3 s on every open, because a
     # missing Ollama meant three HTTP attempts that each ran to their timeout.
@@ -2270,7 +2271,25 @@ def page_configure_provider():
         lines.append(f'  Streaming:      {"yes" if caps.streaming else "no — blocking fallback"}')
         lines.append(f'  Vision:         {"yes" if caps.vision else "no"}')
         show_info_page('Done', lines)
-    elif idx == 6:  # Custom
+    elif idx == 6:  # Groq
+        key = prompt_text('Enter Groq API key (gsk_...)')
+        if key:
+            update_dotenv("ANTHROPIC_API_KEY", key)
+            update_dotenv("ANTHROPIC_BASE_URL", "https://api.groq.com/openai/v1")
+            update_dotenv("ANTHROPIC_EXTRA_HEADERS", "")
+            _save_provider_config(
+                provider_names[6],
+                {"ANTHROPIC_API_KEY": key,
+                 "ANTHROPIC_BASE_URL": "https://api.groq.com/openai/v1",
+                 "ANTHROPIC_EXTRA_HEADERS": ""},
+                provider_type="groq"
+            )
+            reinit_client()
+            show_info_page('Done', ['  ✓ Groq configured and active.',
+                                    '',
+                                    f'  {DIM}Use "Choose Model" to see every model this '
+                                    f'key can reach.{RESET}'])
+    elif idx == 7:  # Custom
         name = prompt_text('Provider name')
         key = prompt_text('API key')
         base = prompt_text('Base URL')
@@ -2551,6 +2570,7 @@ PROVIDER_TYPE_TO_DETECT = {
     "openai": "openai",
     "google": "google",
     "ollama": "ollama",
+    "groq": "groq",
 }
 
 
@@ -2572,6 +2592,7 @@ PROVIDER_LABELS = {
     "openai": "OpenAI",
     "google": "Google AI",
     "ollama": "Ollama (local)",
+    "groq": "Groq",
     "other": "Generic",
 }
 
@@ -2581,55 +2602,47 @@ def _provider_model_entries(provider: str) -> list[tuple[str, str | None]]:
     entries: list[tuple[str, str | None]] = []
 
     if provider == "openrouter":
-        entries = [
-            ('── OpenAI models (via OpenRouter) ──', None),
-            ('openai/gpt-4o-mini',                'openai/gpt-4o-mini'),
-            ('openai/gpt-4o',                     'openai/gpt-4o'),
-            ('openai/gpt-4.1',                    'openai/gpt-4.1'),
-            ('openai/gpt-4.1-mini',               'openai/gpt-4.1-mini'),
-            ('openai/gpt-4.1-nano',               'openai/gpt-4.1-nano'),
-            ('openai/o3-mini',                    'openai/o3-mini'),
-            ('openai/o4-mini',                    'openai/o4-mini'),
-            ('openai/gpt-4.5-preview',            'openai/gpt-4.5-preview'),
-            ('── Anthropic models (via OpenRouter) ──', None),
-            ('anthropic/claude-sonnet-4.5',       'anthropic/claude-sonnet-4.5'),
-            ('anthropic/claude-opus-4.5',         'anthropic/claude-opus-4.5'),
-            ('anthropic/claude-sonnet-4',          'anthropic/claude-sonnet-4'),
-            ('anthropic/claude-haiku-4.5',         'anthropic/claude-haiku-4.5'),
-            ('anthropic/claude-3.5-sonnet',       'anthropic/claude-3.5-sonnet'),
-            ('anthropic/claude-3.5-haiku',        'anthropic/claude-3.5-haiku'),
-            ('── Google models (via OpenRouter) ──', None),
-            ('google/gemini-2.5-pro',             'google/gemini-2.5-pro'),
-            ('google/gemini-2.5-flash',           'google/gemini-2.5-flash'),
-            ('google/gemini-2.5-flash-8b',        'google/gemini-2.5-flash-8b'),
-            ('google/gemini-2.0-flash',           'google/gemini-2.0-flash'),
-            ('google/gemma-3-27b-it',             'google/gemma-3-27b-it'),
-            ('google/gemma-3-12b-it',             'google/gemma-3-12b-it'),
-            ('── Meta models (via OpenRouter) ──', None),
-            ('meta-llama/llama-4-maverick',       'meta-llama/llama-4-maverick'),
-            ('meta-llama/llama-4-scout',          'meta-llama/llama-4-scout'),
-            ('meta-llama/llama-3.3-70b-instruct', 'meta-llama/llama-3.3-70b-instruct'),
-            ('meta-llama/llama-3.1-8b-instruct', 'meta-llama/llama-3.1-8b-instruct'),
-            ('── DeepSeek models (via OpenRouter) ──', None),
-            ('deepseek/deepseek-chat',            'deepseek/deepseek-chat'),
-            ('deepseek/deepseek-r1',              'deepseek/deepseek-r1'),
-            ('deepseek/deepseek-r1-distill-llama-70b', 'deepseek/deepseek-r1-distill-llama-70b'),
-            ('── Qwen models (via OpenRouter) ──', None),
-            ('qwen/qwen-2.5-72b-instruct',        'qwen/qwen-2.5-72b-instruct'),
-            ('qwen/qwen-3-30b-instruct',          'qwen/qwen-3-30b-instruct'),
-            ('qwen/qwq-32b',                      'qwen/qwq-32b'),
-            ('── Mistral models (via OpenRouter) ──', None),
-            ('mistral/mistral-large',             'mistral/mistral-large'),
-            ('mistral/mistral-small',             'mistral/mistral-small'),
-            ('mistral/codestral-2501',            'mistral/codestral-2501'),
-            ('── Other popular (via OpenRouter) ──', None),
-            ('cohere/command-r-plus',             'cohere/command-r-plus'),
-            ('cohere/command-r7b-12-2024',        'cohere/command-r7b-12-2024'),
-            ('ai21/jamba-1.6-mini',               'ai21/jamba-1.6-mini'),
-            ('x-ai/grok-2-1212',                  'x-ai/grok-2-1212'),
-            ('perplexity/sonar-pro',              'perplexity/sonar-pro'),
-            ('nousresearch/hermes-3-llama-3.1-405b', 'nousresearch/hermes-3-llama-3.1-405b'),
+        # Live, never static — this used to be a fixed ~30-model list under
+        # vendor headings; OpenRouter's real catalogue numbers in the
+        # hundreds and free-tier availability moves under it, the same
+        # problem that hid all but a handful of Ollama's models. Formatted by
+        # the same helper `page_choose_model`'s primary fetch path uses, so
+        # this fallback and that path never disagree about what a row shows.
+        import net_probe
+        import provider_manager
+        cat = net_probe.cached(
+            'openrouter_catalog', 60.0, provider_manager.openrouter_catalog)
+        entries = _format_openrouter_entries(cat) or [
+            ('── OpenRouter is not answering ──', None),
+            (f'  {DIM}Check your connection, or try again shortly.{RESET}', None),
         ]
+    elif provider == "groq":
+        # Live: Groq's own /models listing requires the configured key
+        # (unlike OpenRouter's public one), and unlike OpenRouter or Zen it
+        # publishes no per-model pricing at all — every model on the account
+        # is accessible the same way, so there is no free/paid split to draw.
+        import net_probe
+        import provider_manager
+        active = provider_manager.get_active()
+
+        def _probe_groq():
+            if active is None or active.type != "groq":
+                return []
+            try:
+                return provider_manager.list_models(active)
+            except Exception:
+                return []
+
+        model_ids = net_probe.cached('groq_models', 60.0, _probe_groq)
+        if model_ids:
+            entries = [('── Available to this key ──', None)]
+            entries += [(f'  {m}', m) for m in sorted(model_ids)]
+        else:
+            entries = [
+                ('── Groq is not answering ──', None),
+                (f'  {DIM}Check the API key under Connect / configure '
+                 f'provider.{RESET}', None),
+            ]
     elif provider == "zen":
         # Live, never static — for the reason the Ollama branch below is, and
         # then some: this list *changed under the hardcoded copy* three times.
@@ -2907,62 +2920,44 @@ def page_choose_model():
         show_info_page('Done', [f'  ✓ Model set to: {model}'])
 
 
-def _try_fetch_openrouter_entries() -> list[tuple[str, str | None]] | None:
-    """Model entries from the OpenRouter API. None on failure.
+def _format_openrouter_entries(
+        cat: list[dict]) -> list[tuple[str, str | None]] | None:
+    """Render provider_manager.openrouter_catalog()'s output for a picker.
 
     Free models come first and under their own heading, and every row says
     whether the model can call tools. Both matter more than the alphabetical
-    ordering they replace: the catalogue is 409 entries long, 18 of them free,
-    and a model that cannot call tools cannot drive this agent at all — it
-    drops to the text protocol at best. Measured against the live catalogue,
-    3 of the 18 free models declare no tool support, and picking one of those
-    is a failure the menu can prevent rather than explain afterwards.
+    ordering they replace: the catalogue runs to hundreds of entries, and a
+    model that cannot call tools cannot drive this agent at all — it drops to
+    the text protocol at best. Measured against the live catalogue, some of
+    the free models declare no tool support, and picking one of those is a
+    failure the menu can prevent rather than explain afterwards.
+
+    Shared by the auto-fetch path, the manual retry button, and
+    `_provider_model_entries`'s own fallback, so there is exactly one place
+    that turns the catalogue into rows — not three that must agree.
     """
-    import urllib.request
-    import json
-    try:
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/models",
-            headers={"User-Agent": "TOMAS/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception:
+    if not cat:
         return None
 
-    models = data.get("data", [])
-    if not models:
-        return None
-
-    def price(model, key):
-        try:
-            raw = (model.get("pricing") or {}).get(key)
-            return float(raw) if raw is not None else None
-        except (ValueError, TypeError):
-            return None
-
-    def describe(model):
-        mid = model.get("id", "")
+    def describe(m: dict) -> tuple[str, str]:
         marks = []
-        ctx = model.get("context_length") or 0
-        if ctx:
-            marks.append(f'{ctx:,} ctx')
-        if "tools" not in (model.get("supported_parameters") or []):
+        if m['context_window']:
+            marks.append(f"{m['context_window']:,} ctx")
+        if not m['tool_call']:
             marks.append('no tools')
-        prompt_p, comp_p = price(model, "prompt"), price(model, "completion")
-        if prompt_p is not None and comp_p is not None and (prompt_p or comp_p):
+        if not m['free'] and (m['prompt_cost'] or m['completion_cost']):
             # Per million, not per token. OpenRouter quotes per-token prices
             # like 3e-07, and `$0.0000/$0.0000` was every paid model on the
             # page — a price column that could not distinguish the cheapest
             # model in the catalogue from the most expensive.
-            marks.append(f'${prompt_p * 1e6:,.2f}/${comp_p * 1e6:,.2f} per M')
-        return (f'  {mid}  {DIM}({" · ".join(marks)}){RESET}' if marks
-                else f'  {mid}'), mid
+            marks.append(f"${m['prompt_cost'] * 1e6:,.2f}/"
+                         f"${m['completion_cost'] * 1e6:,.2f} per M")
+        label = (f"  {m['id']}  {DIM}({' · '.join(marks)}){RESET}" if marks
+                else f"  {m['id']}")
+        return label, m['id']
 
-    free, paid = [], []
-    for model in sorted(models, key=lambda m: m.get("id", "")):
-        prompt_p, comp_p = price(model, "prompt"), price(model, "completion")
-        (free if prompt_p == 0 and comp_p == 0 else paid).append(model)
+    free = sorted((m for m in cat if m['free']), key=lambda m: m['id'])
+    paid = sorted((m for m in cat if not m['free']), key=lambda m: m['id'])
 
     entries: list[tuple[str, str | None]] = []
     if free:
@@ -2972,6 +2967,12 @@ def _try_fetch_openrouter_entries() -> list[tuple[str, str | None]] | None:
         entries.append((f'── Paid ({len(paid)}) ──', None))
         entries += [describe(m) for m in paid]
     return entries or None
+
+
+def _try_fetch_openrouter_entries() -> list[tuple[str, str | None]] | None:
+    """Model entries from the OpenRouter API. None on failure."""
+    import provider_manager
+    return _format_openrouter_entries(provider_manager.openrouter_catalog())
 
 
 def _fetch_openrouter_models():
