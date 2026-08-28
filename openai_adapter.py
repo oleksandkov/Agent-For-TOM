@@ -151,10 +151,15 @@ class _ContentBlockRef:
 
 class _Event:
     def __init__(self, type_: str, delta: Optional[_Delta] = None,
-                 content_block: Optional[_ContentBlockRef] = None):
+                 content_block: Optional[_ContentBlockRef] = None,
+                 chars: int = 0):
         self.type = type_
         self.delta = delta
         self.content_block = content_block
+        # Only meaningful on the synthetic "reasoning_progress" event: how much
+        # chain-of-thought has arrived so far. The text is never carried — see
+        # `_Stream.__iter__`.
+        self.chars = chars
 
 
 class _Stream:
@@ -211,6 +216,12 @@ class _Stream:
             thought = delta.get("reasoning_content") or delta.get("reasoning")
             if thought and isinstance(thought, str):
                 reasoning_parts.append(thought)
+                # Announced by size only, never by content. A reasoning model
+                # can spend a long time here before the first visible token
+                # (measured: 44s on big-pickle), and without this the caller
+                # has no way to tell that from a stalled connection.
+                yield _Event("reasoning_progress",
+                             chars=sum(len(p) for p in reasoning_parts))
 
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)

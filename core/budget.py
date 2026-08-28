@@ -505,8 +505,21 @@ def instructions_budget(window_tokens: int,
 #: What the compaction menu offers, in order. `None` is "use the default" and
 #: `0` is "never" — both are real choices and both need a row, because a menu
 #: that only lists percentages gives the user no way back to either.
+#:
+#: The low end exists so compaction can be *observed*. At the default of 75%
+#: of a 200k window, a conversation has to reach 150,000 tokens before
+#: anything happens, which in practice means most users never see the feature
+#: work and cannot tell a broken one from an idle one. 4% of the same window
+#: is ~8,000 tokens — a handful of turns — and `CompactionPlan.can_help` still
+#: refuses to fire when the fixed overhead makes summarising pointless.
 COMPACTION_CHOICES: tuple[tuple[Optional[int], str, str], ...] = (
     (None, "Default (75%)", "Compact once the request reaches 75% of the window."),
+    (4, "4%", "Very early — compacts within a few turns. For seeing it work."),
+    (10, "10%", "Early. Short conversations, frequent summaries."),
+    (20, "20%", "Compacts well before the window is under pressure."),
+    (25, "25%", "A quarter of the window."),
+    (50, "50%", "Half the window before summarising."),
+    (75, "75%", "The default, chosen explicitly rather than followed."),
     (80, "80%", "A little more history before summarising."),
     (90, "90%", "Keep almost the whole window; compaction is rarer and larger."),
     (95, "95%", "As late as it can go and still leave room for a reply."),

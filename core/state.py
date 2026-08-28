@@ -224,6 +224,19 @@ class AgentState:
     # anything. An adapter's Esc-watcher thread is what makes it True.
     interrupted: Callable[[], bool] = lambda: False
 
+    # This turn's `max_tokens` was lowered on purpose (core.features'
+    # every-third-reply cap), so a `max_tokens` stop is the expected outcome
+    # rather than a failure.
+    #
+    # It needs its own flag because `max_tokens` alone cannot say why it is
+    # small: `_can_escalate` fires on any truncation and retries at 4x the
+    # budget, which would undo the cap on the very turn it was applied and
+    # report a scary "the reply was cut off" for something the user asked for.
+    # Set by the host in `build_state`; read by `_can_escalate` and
+    # `_report_truncation`, which is the same report-vs-decide split the rest
+    # of the turn path uses.
+    reply_capped: bool = False
+
     def needs_permission(self, name: str, args: dict) -> bool:
         """True if this call must be put to the responder."""
         if self.yolo:

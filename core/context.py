@@ -58,11 +58,20 @@ class ContextWindow:
 DEFAULT_FIT_FRACTION = 0.75
 
 #: What a user may set the fit rule to, as a percentage of the window.
-#: Bounded at both ends on purpose. Below the floor the agent compacts so often
-#: it never accumulates the context that makes it useful; above the ceiling
-#: there is no room left for the reply that compaction is supposed to protect,
-#: so the first turn past the line fails outright instead of being summarised.
-MIN_FIT_PERCENT = 40
+#:
+#: The ceiling is the load-bearing one: above it there is no room left for the
+#: reply that compaction exists to protect, so the first turn past the line
+#: fails outright instead of being summarised.
+#:
+#: The floor used to be 40, on the reasoning that below it "the agent compacts
+#: so often it never accumulates the context that makes it useful". That was
+#: written before `CompactionPlan.can_help`, which answers the same worry
+#: directly and better: a threshold the fixed overhead already exceeds now
+#: reports `reason="overhead"` and does not fire, instead of firing every turn.
+#: With that guard in place a blanket floor only removed choices — including
+#: the one a user needs to *see* compaction happen at all, which on a
+#: 200k-token window is nowhere near 40%.
+MIN_FIT_PERCENT = 1
 MAX_FIT_PERCENT = 95
 
 #: `compact_at_percent = 0` means "never automatically" — the transcript grows

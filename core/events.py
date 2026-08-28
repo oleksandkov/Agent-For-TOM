@@ -38,6 +38,23 @@ class TextDelta(AgentEvent):
 
 
 @dataclass
+class ReasoningProgress(AgentEvent):
+    """A reasoning model is emitting chain-of-thought, not yet a reply.
+
+    The content itself is deliberately *not* carried: it is not the answer and
+    must not reach the screen (see `openai_adapter._Stream.__iter__`). Only its
+    size is, so an adapter can say the model is working rather than leaving the
+    terminal dead.
+
+    Measured on `big-pickle` via Zen: 44 seconds of reasoning before the first
+    visible token, then 14 seconds of streamed text. Without this the whole
+    44 seconds is silent, and a reply that streams perfectly well arrives
+    looking like one block dumped after a hang.
+    """
+    chars: int
+
+
+@dataclass
 class AssistantMessage(AgentEvent):
     """A complete assistant reply that did not arrive as deltas."""
     text: str

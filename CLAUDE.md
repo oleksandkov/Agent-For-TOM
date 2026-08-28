@@ -229,6 +229,68 @@ TOMAS (Terminal Operated Modular Agent System) — a self-hosted AI coding agent
   `compact_tool_schemas` clips prose and drops documentation-only keys on the
   way out of `build_state`; it is pure, and must stay pure, because `ALL_TOOLS`
   is re-selected every turn and clipping in place would compound.
+- **Esc had one cancellation point; MCP tool calls had none.**
+  `handle_run_command` polls `_CURRENT_INTERRUPT` inside its own wait loop and
+  kills its subprocess within a fraction of a second of Esc; every other tool
+  only checked `state.interrupted()` *between* tool calls, so a slow MCP call
+  (a browser action, a big fetch, OCR) held the turn hostage until it finished
+  on its own — no keypress reached it. `_call_mcp_tool_interruptibly` runs the
+  call on a background thread and polls the same `_CURRENT_INTERRUPT` the
+  shell handler already uses, so the *turn* stops waiting the moment Esc is
+  pressed. The call is not killed, only abandoned: an MCP server is one
+  long-lived process for the whole session, not a per-call subprocess like
+  `run_command`'s, so tearing it down would break every later call to it and,
+  for `playwright` specifically, drop whatever page state the user had. The
+  cost is narrow — `mcp_manager.py` holds a per-server lock for the call's
+  duration, so a server that truly never answers stays locked for the rest of
+  the session — which is still strictly better than today's alternative: the
+  whole agent hanging with no way to interrupt at all. Tests:
+  `tests/test_mcp_collision.py::TestMcpCallInterrupt`.
+- **Spending and behaviour are two settings files, not one.** `core/budget.py`
+  answers "how much of the window may this occupy" in shares that follow the
+  model; `core/features.py` answers "is this on at all" as switches that
+  survive a model change. Both are pure, and the TUI renders `FEATURES` rather
+  than keeping its own list, so a switch cannot be added to the file and
+  forgotten in the menu.
+- **A deliberate limit must not be fought by the recovery for an accidental
+  one.** `_can_escalate` retries any `max_tokens` stop at 4x, so the
+  every-3rd-reply cap would be undone on the turn it applied.
+  `AgentState.reply_capped` is its own flag because `max_tokens` cannot say
+  *why* it is small; `_can_escalate` refuses on it.
+- **An event nothing handles is a feature that silently does not exist.**
+  `run_turn` yields `ThinkingStarted` before every model call and
+  `TerminalAdapter.render` had no branch for it, so the watcher `drive()`
+  starts was stopped by the first event and never restarted: every model call
+  ran with a dead screen. On a reasoning model that is ~44 s of nothing
+  (measured, `big-pickle`) then the reply at once — reported as "streaming is
+  broken" when streaming was fine. `ReasoningProgress` carries the *size* of
+  hidden reasoning, never its text, and relabels the spinner in place because
+  it fires once per chunk. The Esc watcher lives in that loop, so
+  `Thinking(silent=True)` turns the display off without turning off the only
+  way to interrupt.
+- **A threshold nobody can reach is not a setting.** `MIN_FIT_PERCENT` was 40,
+  so every lower compaction choice was silently rewritten to 40% and a menu
+  offering 4% would be a lie. The floor predated `CompactionPlan.can_help`,
+  which answers the same worry better, so it drops to 1. The low end makes
+  compaction observable: at 75% of a 200k window nothing happens until
+  150,000 tokens.
+- **Recording every payload is the largest thing the program would hold.** A
+  session re-sends its whole conversation each turn, so `core/debug_log.py`
+  records nothing until `features.debug_view` switches it on, and is bounded
+  in entries and per-value size. It stores a `json.dumps` snapshot, not a
+  reference: `messages` is mutated in place after the call. `_snapshot`
+  catches `Exception` — `default=str` calls `str()` on unknown objects, which
+  can raise anything. A live mirror file is what the Ctrl+Alt+X window tails:
+  the REPL owns its console, so a live view cannot share it.
+- **A wait that starts after "done" reads as a hang, not as more work.**
+  `reflect_on_session_end` calls the model over the whole transcript, so it
+  gets slower exactly as a session gets longer — and it ran, silently, in the
+  `finally` block *after* `main()` already printed `Session saved: <id>`.
+  Nothing distinguished a long reflection call from the process being stuck,
+  because the one line the user had just seen already said the work was
+  finished. Wrapped in the same `Thinking` spinner (`adapters.terminal`)
+  `run_turn` uses mid-turn, so a long exit shows *why* it is still running
+  instead of leaving the terminal looking frozen right after "saved".
 
 ## Architecture essentials
 
@@ -252,6 +314,8 @@ TOMAS (Terminal Operated Modular Agent System) — a self-hosted AI coding agent
 | `skills_manager.py` | Discovers skills for `/skills` and `/skill <name>`. One format everywhere (`name`/`description`/`triggers`/`source`/`version`); malformed frontmatter is reported, never fatal; bodies load on demand; `improve_skill()` bumps the version and keeps provenance |
 | `skills/document-style-match/` | Reproduces a sample document's layout with new content. `run.py` is the entry point — `measure` then `build`, one verdict; the other scripts are its steps and are read when one fails |
 | `core/budget.py` | Context budget policy — presets as shares of the window, section toggles, per-tool/server enable. Pure: computes and persists, never draws. `/budget` and the TUI page both render `agent.render_budget`, so they cannot disagree |
+| `core/features.py` | Feature switches (`~/.tomas/features.json`). Pure like `budget.py`; `/settings` and the TUI both render `FEATURES` |
+| `core/debug_log.py` | Bounded recorder for raw payloads, off unless `features.debug_view` is on. Shown by `/debug`, Ctrl+Alt+X |
 | `mcp_manager.py` | MCP server management (shared config with Claude Code at `~/.claude.json`); tools, resources and prompts |
 | `provider_manager.py` | UI-free provider config, activation, and **probed** `Capabilities` (streaming, tool use, system prompt, context window, tool ceiling). Nothing infers behaviour from substrings in a URL or model name at runtime |
 | `openai_adapter.py` | In-process Anthropic↔OpenAI translation with real incremental SSE streaming. Used for openai/openrouter/zen/ollama/custom endpoints; no daemon |

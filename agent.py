@@ -42,6 +42,8 @@ from typing import Any, Callable, Optional
 
 from core import budget as core_budget
 from core import context as core_context
+from core import debug_log
+from core import features as core_features
 from core.console import CONSOLE
 from core.context import ContextWindow
 
@@ -118,7 +120,7 @@ from core import loop as core_loop
 from core.loop import run_turn
 from core.permissions import ApprovalStore
 from core.state import AgentState
-from adapters.terminal import TerminalAdapter
+from adapters.terminal import TerminalAdapter, Thinking
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -126,6 +128,14 @@ from adapters.terminal import TerminalAdapter
 
 MODEL = os.environ.get("AGENT_MODEL")
 PROJECT_DIR = Path(os.environ.get("AGENT_PROJECT_DIR", os.getcwd())).resolve()
+
+# Where /export writes. The project directory is the right default — an export
+# the user cannot find has not been exported — but it is a module global rather
+# than a literal so a test sweep that calls every command can redirect it, the
+# same seam `session_manager.SESSION_DIR` and `self_notes.NOTES_DIR` provide.
+# Without it, `test_command_surface` left a conversation dump in the repo root
+# on every run.
+EXPORT_DIR = PROJECT_DIR
 MEMORY_DIR = Path.home() / ".tomas" / "memory"
 
 # Where throwaway helper scripts belong. The sandbox allows writes only under
@@ -380,13 +390,20 @@ LOW_CONTENT_REPLY_CHARS = 24
 # build_state() at the start of every turn. handle_run_command polls it to
 # kill a running subprocess immediately rather than only at the next loop
 # checkpoint, which for a shell command can be the whole timeout away.
+# _call_mcp_tool_interruptibly polls the same signal for the same reason —
+# an MCP call has no cancellation point of its own.
 _CURRENT_INTERRUPT: Optional[threading.Event] = None
 
 
 def reset_session_state() -> None:
     """Start a fresh session's accounting. Called when a session begins or
     when /clear discards the conversation."""
-    global _session_started_at
+    global _session_started_at, _synthetic_replies
+    # /clear discards the transcript, prefill included, so the allowance for
+    # scaffolding turns has to go with it — otherwise the every-3rd-reply
+    # cadence would be off by one in the other direction for the rest of the
+    # session.
+    _synthetic_replies = 0
     # Every key, including ones added since this dict was created. Naming them
     # here meant a counter added later survived the session boundary — the
     # exact bug TestSessionTokenIsolation exists to catch.
@@ -1332,6 +1349,89 @@ def save_budget_settings(settings) -> None:
     _budget_cache = None
     invalidate_prompt_cache()
     _refresh_tool_tokens()
+
+
+_features: Optional[Any] = None
+
+
+def features(refresh: bool = False):
+    """The user's feature switches, read once per session.
+
+    Same shape as `budget_settings` deliberately: both are user choices
+    persisted under `~/.tomas/`, both are read on the turn path, and one
+    caching pattern for the two is one thing to get right rather than two.
+    """
+    global _features
+    if _features is None or refresh:
+        _features = core_features.load()
+        # The debug recorder holds whole request payloads, so it stays off
+        # until something asks for it — see core/debug_log.py. Applied on load
+        # rather than only on toggle, or a switch left on in the settings file
+        # would not start recording until the user toggled it again.
+        _apply_debug_setting(_features.enabled("debug_view"))
+    return _features
+
+
+def save_features(new_features) -> None:
+    """Persist the switches and make them take effect immediately."""
+    global _features
+    core_features.save(new_features)
+    _features = new_features
+    _apply_debug_setting(new_features.enabled("debug_view"))
+
+
+def _apply_debug_setting(on: bool) -> None:
+    """Turn recording on or off, and give it somewhere to stream to.
+
+    The live file is per-process, not per-session: two TOMAS windows tailing
+    one file would interleave their traffic into something neither user could
+    read. It is created when recording starts rather than at import, so a
+    session that never enables debug leaves nothing behind.
+    """
+    debug_log.set_enabled(on)
+    if not on:
+        debug_log.set_live_file(None)
+        return
+    if debug_log.live_file():
+        return
+    try:
+        directory = Path(tempfile.gettempdir()) / "tomas-debug"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"session-{os.getpid()}.log"
+        path.write_text(
+            f"TOMAS debug log — session started "
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Every model request and response is appended below as it "
+            f"happens.\n", encoding="utf-8")
+        debug_log.set_live_file(str(path))
+    except OSError:
+        # No live file is a degraded debug view, not a broken session:
+        # /debug still reads the in-memory ring buffer.
+        debug_log.set_live_file(None)
+
+
+#: Assistant turns at the head of the transcript that are scaffolding, not
+#: conversation. `prefill_messages` seeds a synthetic `user → assistant`
+#: exchange, and its acknowledgement is not a reply to anybody — counting it
+#: shifted the every-3rd-reply cadence by one, so the cap fired on the user's
+#: *second* question. Set when the prefill is applied, cleared by
+#: `reset_session_state` (after /clear the prefill is no longer in `messages`,
+#: so subtracting for it would move the error the other way).
+_synthetic_replies = 0
+
+
+def _replies_so_far(messages: list) -> int:
+    """How many replies the *user* has actually been given.
+
+    Counted from the transcript rather than kept in a counter, so it survives
+    /clear (which resets the conversation, and should reset the cadence with
+    it) and a continued session (which should carry it on) without either case
+    needing its own line of bookkeeping — minus the synthetic turns above,
+    which are in the transcript but were never an answer to a question.
+    """
+    total = sum(1 for m in messages
+                if isinstance(m, dict) and m.get("role") == "assistant")
+    return max(0, total - _synthetic_replies)
 
 
 def _avg_tool_tokens() -> int:
@@ -3377,8 +3477,46 @@ def execute_tool(name: str, params: dict) -> str:
     # Try MCP tool dispatch (with name mapping for renamed conflicting tools)
     if mcp_manager:
         mcp_name = MCP_TOOL_NAME_MAP.get(name, name)  # resolve renamed name -> original
-        return mcp_manager.call_tool(mcp_name, params)
+        return _call_mcp_tool_interruptibly(mcp_name, params)
     return f"Error: unknown tool '{name}'"
+
+
+def _call_mcp_tool_interruptibly(name: str, params: dict) -> str:
+    """Run one MCP tool call so an Esc press can cut the *wait* short.
+
+    mcp_manager.call_tool() blocks on a pipe read or an HTTP request with no
+    cancellation point of its own — unlike handle_run_command, which polls
+    _CURRENT_INTERRUPT directly inside its own wait loop. Before this, a slow
+    MCP call (a browser action, a big fetch, OCR) was the one kind of "the
+    agent is doing something" that Esc could not touch: the turn-level check
+    only runs *between* tool calls, so the user sat through the entire call
+    regardless of how many times they pressed it.
+
+    The call still runs to completion on a background thread rather than
+    being killed — an MCP server is a single long-lived process for the whole
+    session (unlike run_command's one-shot subprocess), so tearing it down
+    here would break every later call to it, and for playwright specifically
+    would drop whatever page state the user was relying on. The one cost of
+    abandoning the wait instead: mcp_manager.py takes a per-server lock for
+    the duration of a call, so a server that never answers stays locked for
+    the rest of the session. That is strictly better than today's failure
+    mode for the same case, which is the whole agent hanging forever with no
+    way to interrupt it at all.
+    """
+    outcome: list[str] = []
+
+    def _run() -> None:
+        outcome.append(mcp_manager.call_tool(name, params))
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    while thread.is_alive():
+        if _CURRENT_INTERRUPT is not None and _CURRENT_INTERRUPT.is_set():
+            return (f"[interrupted] '{name}' was still waiting on its MCP "
+                    f"server when Esc was pressed. The call keeps running in "
+                    f"the background; this result was not.")
+        thread.join(timeout=0.25)
+    return outcome[0] if outcome else f"Error: '{name}' produced no result."
 
 # ---------------------------------------------------------------------------
 # Permission system
@@ -4826,6 +4964,7 @@ def build_state(system_prompt: str, messages: list, responder) -> AgentState:
     # as the whole timeout.
     _CURRENT_INTERRUPT = getattr(responder, "esc_interrupt", None)
 
+    active_features = features()
     selected, withheld = tools_for_turn(messages)
     # Compacted here rather than at discovery so `ALL_TOOLS` keeps the full
     # schemas: selection scores against descriptions, and scoring clipped text
@@ -4870,13 +5009,24 @@ def build_state(system_prompt: str, messages: list, responder) -> AgentState:
     else:
         remark_cache = None
 
+    # ── The every-3rd-reply cap ──
+    # Applied here rather than inside `run_turn` for the same reason the mode
+    # flags are: the core is handed numbers and a flag, and decides with them.
+    # `reply_capped` is what stops the truncation escalation undoing this on
+    # the very turn it applies to — see `core.loop._can_escalate`.
+    capped = core_features.caps_this_reply(active_features,
+                                           _replies_so_far(messages))
+    max_output = (core_features.SHORT_REPLY_MAX_TOKENS if capped
+                  else effective_max_tokens(caps))
+
     return AgentState(
         system_prompt=system_prompt,
         messages=messages,
         get_client=_get_client,
         get_model=_get_model,
         tools=selected if caps.tool_use else [],
-        max_tokens=effective_max_tokens(caps),
+        max_tokens=max_output,
+        reply_capped=capped,
         temperature=effective_temperature(),
         max_turn_seconds=MAX_TURN_SECONDS,
         execute_tool=execute_tool,
@@ -4893,7 +5043,13 @@ def build_state(system_prompt: str, messages: list, responder) -> AgentState:
         max_auto_continuations=MAX_AUTO_CONTINUATIONS,
         tool_budget=MAX_TOOL_CALLS_PER_TURN,
         max_result_chars=MAX_RESULT_CHARS,
-        streaming_enabled=(not _streaming_disabled) and caps.streaming,
+        # Three separate answers to "may this turn stream?", and all three have
+        # to say yes: the user's switch, the provider's probed capability, and
+        # the runtime fallback that turns it off after a provider rejects a
+        # stream mid-session. The switch is listed first because it is the only
+        # one the user can see.
+        streaming_enabled=(active_features.enabled("streaming")
+                           and (not _streaming_disabled) and caps.streaming),
         on_tool_call=_record_tool_call,
         interrupted=getattr(responder, "is_interrupted", lambda: False),
     )
@@ -5183,7 +5339,8 @@ def agent_loop(system_prompt: str, messages: list) -> str:
     _reinforce_standing_rules(messages)
 
     interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
-    adapter = TerminalAdapter(interactive=interactive)
+    adapter = TerminalAdapter(interactive=interactive,
+                              show_status=features().enabled("status_indicator"))
     state = build_state(system_prompt, messages, adapter)
 
     turn_index = len(_turn_timings) + 1
@@ -5308,6 +5465,9 @@ SLASH_COMMANDS = {
     "config":       {"desc": "Interactive menu: provider, model, mode", "icon": "🛠"},
     "compact":      {"desc": "Force compact conversation now",    "icon": "⚙"},
     "budget":       {"desc": "Context budget: /budget [economy|balanced|full|auto|tools N|output N|on|off <section>]", "icon": "▣"},
+    "settings":     {"desc": "Feature switches: /settings [<name>] to toggle", "icon": "⚙"},
+    "debug":        {"desc": "Raw request/response JSON: /debug [on|off|N|schemas]", "icon": "🐞"},
+    "export":       {"desc": "Save the conversation: /export [txt|json]", "icon": "📤"},
     "setup":        {"desc": "Tell TOMAS about you; tunes instructions and defaults", "icon": "🧭"},
     "skills":       {"desc": "List installed skills",            "icon": "⚡"},
     "skill":        {"desc": "Run a skill: /skill <name>",        "icon": "⚡"},
@@ -5373,7 +5533,7 @@ KEY_HELP = [
     ("Enter",        "send · accepts the highlighted /command"),
     ("Tab",          "complete a /command · otherwise cycle mode"),
     ("↑ ↓",          "history · moves the /command selection"),
-    ("Esc",          "clear the line"),
+    ("Esc",          "clear the line · during a reply or tool call, stops it"),
     ("Ctrl+W",       "delete the last word"),
     ("Ctrl+U",       "clear the line"),
     ("Ctrl+Z",       "undo the last clear, paste or history recall"),
@@ -5381,6 +5541,7 @@ KEY_HELP = [
     ("Ctrl+L",       "clear the screen, keep what is typed"),
     ("Ctrl+C",       "cancel"),
     ("⇧+Space",      "toggle auto-approve"),
+    ("Ctrl+Alt+X",   "debug view — the last raw request and response"),
     ("F5 F6 F7 F8 F9", "auto · default · strict · yolo · bypass"),
 ]
 
@@ -5692,6 +5853,377 @@ def _arrow_checklist(title: str, items: list[str], footer: str = "") -> Optional
         CONSOLE.release()
 
 
+def _handle_settings(arg: str) -> str:
+    """Show the feature switches, or toggle one by name.
+
+    Names are matched on a prefix so `/settings stream` works; an ambiguous
+    prefix lists the candidates rather than picking one, because silently
+    toggling the wrong switch is a worse outcome than a second keystroke.
+    """
+    current = features(refresh=True)
+    name = (arg or "").strip().lower().replace("-", "_")
+
+    if name:
+        matches = [f for f in core_features.FEATURES
+                   if f["key"] == name or f["key"].startswith(name)]
+        if not matches:
+            return (f'  {RED}✗{RESET} No such setting: {name}\n'
+                    f'  {DIM}One of: '
+                    f'{", ".join(core_features.FEATURE_KEYS)}{RESET}')
+        if len(matches) > 1:
+            names = ", ".join(m["key"] for m in matches)
+            return (f'  {YELLOW}⚠{RESET} "{name}" matches several settings: '
+                    f'{names}')
+        key = matches[0]["key"]
+        updated = core_features.toggle(current, key)
+        save_features(updated)
+        now_on = updated.enabled(key)
+        state = f'{GREEN}on{RESET}' if now_on else f'{DIM}off{RESET}'
+        note = ""
+        if key == "debug_view":
+            note = (f'\n  {DIM}Press Ctrl+Alt+X (or /debug) to view the last '
+                    f'request and response.{RESET}' if now_on else
+                    f'\n  {DIM}Recorded payloads discarded.{RESET}')
+        elif key == "prefill_context":
+            note = f'\n  {DIM}Applies to the next new session.{RESET}'
+        return f'  {GREEN}✓{RESET} {matches[0]["label"]}: {state}{note}'
+
+    lines = [
+        f'  {BOLD}Settings{RESET}',
+        f'  {DIM}{"─" * 58}{RESET}',
+    ]
+    for spec in core_features.FEATURES:
+        on = current.enabled(spec["key"])
+        mark = f'{GREEN}✓{RESET}' if on else f'{RED}✕{RESET}'
+        lines.append(f'  {mark} {spec["label"]:<22}{DIM}{spec["detail"]}{RESET}')
+    lines.append('')
+    lines.append(f'  {DIM}Toggle with{RESET} {CYAN}/settings <name>{RESET}'
+                 f'{DIM} — e.g. /settings streaming{RESET}')
+    return '\n'.join(lines)
+
+
+def _open_debug_window() -> str:
+    """Open a second console that tails the debug log live.
+
+    The chat REPL owns the console it runs in — it reads raw keystrokes and
+    repaints its own prompt — so a live view cannot share that screen without
+    fighting it for the cursor. A separate window is not a workaround for
+    that, it is the only arrangement in which "watch the traffic while you use
+    the session" is a thing you can actually do.
+
+    PowerShell's `Get-Content -Wait` is the tail: it is present on every
+    supported Windows install, so this adds no dependency. The window stays up
+    after the session ends (`-NoExit`) because the last exchange is usually
+    the interesting one.
+    """
+    if sys.platform != "win32":
+        return (f'  {YELLOW}⚠{RESET} A separate debug window is Windows-only.\n'
+                f'  {DIM}The log is at {debug_log.live_file()} — tail it with'
+                f'{RESET} {CYAN}tail -f{RESET}')
+
+    path = debug_log.live_file()
+    if not path:
+        return f'  {RED}✗{RESET} No debug log file is active.'
+
+    # Single-quoted for PowerShell and doubled to escape, so a path containing
+    # an apostrophe cannot end the string and run the rest as a command.
+    ps_path = str(path).replace("'", "''")
+    command = (f"$Host.UI.RawUI.WindowTitle = 'TOMAS — live debug'; "
+               f"Write-Host 'Tailing {ps_path}' -ForegroundColor Cyan; "
+               f"Get-Content -LiteralPath '{ps_path}' -Wait -Tail 200")
+    try:
+        subprocess.Popen(
+            ["cmd", "/c", "start", "TOMAS Debug", "powershell",
+             "-NoProfile", "-NoExit", "-Command", command],
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+    except Exception as exc:
+        return (f'  {RED}✗{RESET} Could not open the debug window: {exc}\n'
+                f'  {DIM}The log is still being written to {path}{RESET}')
+    return (f'  {GREEN}✓{RESET} Debug window opened — it updates live as this '
+            f'session talks to the model.\n'
+            f'  {DIM}{path}{RESET}')
+
+
+def _handle_debug(arg: str) -> str:
+    """Show what actually went over the wire on recent model calls.
+
+    Off by default and explicitly switched on, because recording holds a full
+    copy of every request — see `core/debug_log.py`. Turning it on here rather
+    than only in Settings is deliberate: the moment someone wants this, they
+    want it for the call that just happened, and making them leave the chat to
+    arm it guarantees they miss it.
+    """
+    arg = (arg or "").strip().lower()
+
+    if arg in ("on", "off"):
+        updated = core_features.Features(
+            **{**features(refresh=True).to_dict(), "debug_view": arg == "on"})
+        save_features(updated)
+        if arg == "on":
+            return (f'  {GREEN}✓{RESET} Debug recording on.\n'
+                    f'  {DIM}Ctrl+Alt+X opens a live window; /debug shows the '
+                    f'last payload here.{RESET}')
+        return f'  {GREEN}✓{RESET} Debug recording off; captured payloads discarded.'
+
+    if arg == "window":
+        if not debug_log.is_enabled():
+            _handle_debug("on")
+        return _open_debug_window()
+
+    if not debug_log.is_enabled():
+        return (f'  {DIM}Debug recording is off.{RESET}\n'
+                f'  {CYAN}/debug on{RESET}{DIM} to start capturing requests and '
+                f'responses, then{RESET} {CYAN}Ctrl+Alt+X{RESET}{DIM} for a live '
+                f'window.{RESET}')
+
+    captured = debug_log.entries()
+    if not captured:
+        return (f'  {DIM}Nothing captured yet — recording is on, but no model '
+                f'call has been made since.{RESET}')
+
+    if arg == "schemas":
+        tools = (captured[-1].request or {}).get("tools") or []
+        if not tools:
+            return f'  {DIM}No tool schemas were sent on the last call.{RESET}'
+        return (f'  {BOLD}Tool schemas sent on call #{captured[-1].seq}{RESET} '
+                f'{DIM}({len(tools)} tools){RESET}\n'
+                + json.dumps(tools, indent=2, ensure_ascii=False, default=str))
+
+    if arg.isdigit():
+        wanted = int(arg)
+        entry = next((e for e in captured if e.seq == wanted), None)
+        if entry is None:
+            available = ", ".join(f"#{e.seq}" for e in captured)
+            return (f'  {RED}✗{RESET} No captured call #{wanted}.\n'
+                    f'  {DIM}Available: {available}{RESET}')
+        return debug_log.as_json(entry)
+
+    if arg in ("", "last"):
+        return debug_log.as_json(captured[-1])
+
+    if arg == "list":
+        lines = [f'  {BOLD}Captured calls{RESET}',
+                 f'  {DIM}{"─" * 58}{RESET}']
+        for entry in captured:
+            outcome = (f'{RED}{entry.error[:28]}{RESET}' if entry.error
+                       else (entry.response.get("stop_reason") or "—"))
+            lines.append(
+                f'  {CYAN}#{entry.seq}{RESET} {entry.path:<13}'
+                f'{DIM}{entry.message_count} msg · {entry.tool_count} tools · '
+                f'{entry.elapsed_ms:,}ms · {RESET}{outcome}')
+        lines.append('')
+        lines.append(f'  {DIM}/debug <n> for one call · /debug schemas for the '
+                     f'tool block{RESET}')
+        return '\n'.join(lines)
+
+    return (f'  {DIM}Usage:{RESET} /debug [on|off|last|list|<n>|schemas]')
+
+
+def _context_controls_disabled(what: str) -> str:
+    """The one message both context commands give when switched off.
+
+    Shared so the two cannot drift into describing the same switch
+    differently, and so it always names the way back — a command that refuses
+    without saying which setting refused it is a dead end.
+    """
+    return (f'  {YELLOW}⚠{RESET} /{what} is off — "Context controls" is '
+            f'disabled in Settings.\n'
+            f'  {DIM}Turn it back on with{RESET} {CYAN}/settings context{RESET}'
+            f'{DIM}, or in the Settings menu.{RESET}')
+
+
+#: Subfolder offered as the tidy default for exports. Relative to EXPORT_DIR,
+#: created on demand — an export that has to be filed by hand afterwards is
+#: one the user stops doing.
+EXPORT_SUBFOLDER = "exports"
+
+#: Whether `/export` may stop and ask where to save.
+#:
+#: A separate switch from `sys.stdin.isatty()`, because that test does not
+#: actually answer the question here: the picker reads the console through
+#: `msvcrt.getwch()`, which bypasses stdin entirely, so a redirected or closed
+#: stdin does not stop it blocking. Measured — `tests/test_command_surface`
+#: calls every advertised command, reached `/export`, and hung on a keypress
+#: that no test can send. Anything driving TOMAS without a person at the
+#: keyboard sets this False.
+EXPORT_PROMPT = True
+
+
+def _ask_export_destination(filename: str) -> Optional[Path]:
+    """Where should this export go? Returns the directory, or None to cancel.
+
+    Asked rather than assumed. Writing straight into the project root is fine
+    once and litter by the fifth time, and the answer genuinely varies — the
+    repo for something to be committed, a subfolder to keep it out of the way,
+    somewhere else entirely to hand to another program.
+
+    Falls back to the project root without prompting whenever asking is not
+    possible, because an export that blocks on input nobody can give is worse
+    than one filed in the obvious place.
+    """
+    root = Path(EXPORT_DIR)
+    if not EXPORT_PROMPT:
+        return root
+    if not bool(getattr(sys.stdin, "isatty", lambda: False)()):
+        return root
+
+    options = [
+        f'  Project root        {DIM}{root}{RESET}',
+        f'  Subfolder           {DIM}{root / EXPORT_SUBFOLDER}{RESET}',
+        f'  Another path…       {DIM}type it in{RESET}',
+    ]
+    print(f'\n  {BOLD}Save {filename} where?{RESET}')
+    choice = _arrow_menu('', options, footer='↑↓ choose · Enter save · Esc cancel',
+                         erase_on_exit=True)
+    if choice < 0:
+        return None
+    if choice == 0:
+        return root
+    if choice == 1:
+        target = root / EXPORT_SUBFOLDER
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f'  {YELLOW}⚠{RESET} Could not create {target}: {exc} — '
+                  f'using the project root instead.')
+            return root
+        return target
+
+    try:
+        typed = input(f'  {CYAN}Path:{RESET} ').strip().strip('"').strip("'")
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not typed:
+        return None
+    target = Path(typed).expanduser()
+    # A path that names a file is a common way to answer "where?", so the
+    # parent is taken rather than refusing — but only when the name matches
+    # what is about to be written, or an unrelated trailing segment would be
+    # silently discarded.
+    if target.suffix and target.name == filename:
+        target = target.parent
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f'  {RED}✗{RESET} Cannot use {target}: {exc}')
+        return None
+    return target
+
+
+def _handle_export(messages: list, arg: str) -> str:
+    """Write the conversation to a file the user can open.
+
+    Sessions are already persisted as JSON under `~/.tomas/sessions/`, but
+    that is the agent's own record: named by timestamp, in a schema built for
+    reloading, somewhere the user does not look. This writes a copy where they
+    are working, in a format they choose — which is the difference between
+    "the data exists" and "the user has it".
+    """
+    if not features().enabled("context_controls"):
+        return _context_controls_disabled("export")
+    if not messages:
+        return f'  {DIM}Nothing to export — the conversation is empty.{RESET}'
+
+    # `/export [txt|json] [path]` — a path given here skips the picker, which
+    # is what makes the command usable from a script as well as by hand.
+    parts = (arg or "").strip().split(maxsplit=1)
+    fmt = (parts[0] or "txt").lower() if parts else "txt"
+    where = parts[1].strip().strip('"').strip("'") if len(parts) > 1 else ""
+    if fmt not in ("txt", "json"):
+        return f'  {DIM}Usage:{RESET} /export [txt|json] [path]'
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    name = f"tomas_conversation_{stamp}.{fmt}"
+    if where:
+        directory = Path(where).expanduser()
+        if directory.suffix and directory.name == name:
+            directory = directory.parent
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return f'  {RED}✗{RESET} Cannot use {directory}: {exc}'
+    else:
+        directory = _ask_export_destination(name)
+    if directory is None:
+        return f'  {DIM}Export cancelled — nothing was written.{RESET}'
+    path = directory / name
+
+    try:
+        if fmt == "json":
+            payload = {
+                "exported": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "model": _get_model(),
+                "message_count": len(messages),
+                "system_prompt": build_system_prompt(),
+                "messages": messages,
+            }
+            path.write_text(json.dumps(payload, indent=2, ensure_ascii=False,
+                                       default=str), encoding="utf-8")
+        else:
+            lines = [
+                f"TOMAS conversation — {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                f"Model: {_get_model()}",
+                f"Messages: {len(messages)}",
+                "=" * 70,
+                "",
+                "--- SYSTEM PROMPT " + "-" * 52,
+                build_system_prompt(),
+                "",
+            ]
+            for message in messages:
+                role = str(message.get("role", "?")).upper()
+                lines.append("-" * 70)
+                lines.append(f"[{role}]")
+                lines.append(_render_message_for_export(message))
+                lines.append("")
+            path.write_text("\n".join(lines), encoding="utf-8")
+    except OSError as exc:
+        return f'  {RED}✗{RESET} Could not write {path.name}: {exc}'
+
+    size = path.stat().st_size
+    return (f'  {GREEN}✓{RESET} Exported {len(messages)} messages to '
+            f'{CYAN}{path.name}{RESET}\n'
+            f'  {DIM}{path}  ·  {size:,} bytes{RESET}')
+
+
+def _render_message_for_export(message: dict) -> str:
+    """One message as readable text, tool calls and results included.
+
+    The whole point of a .txt export is that it can be read without a JSON
+    viewer, so a content list is unpacked into labelled sections rather than
+    dumped — a transcript whose interesting half is `[{'type': 'tool_use',
+    ...}]` has not been exported into text, only into a file with a .txt name.
+    """
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            parts.append(str(block))
+            continue
+        kind = block.get("type")
+        if kind == "text":
+            parts.append(block.get("text", ""))
+        elif kind == "tool_use":
+            args = json.dumps(block.get("input", {}), ensure_ascii=False,
+                              default=str)
+            parts.append(f"  → tool call: {block.get('name', '?')}({args})")
+        elif kind == "tool_result":
+            body = block.get("content", "")
+            if isinstance(body, list):
+                body = "\n".join(
+                    b.get("text", "") if isinstance(b, dict) else str(b)
+                    for b in body)
+            parts.append(f"  ← tool result: {body}")
+        else:
+            parts.append(json.dumps(block, ensure_ascii=False, default=str))
+    return "\n".join(p for p in parts if p)
+
+
 def _config_menu(messages: list) -> str:
     """Arrow-key /config menu: pick provider, model or mode without leaving chat.
 
@@ -5825,10 +6357,14 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
         return _show_commands()
 
     if cmd == "clear":
+        if not features().enabled("context_controls"):
+            return _context_controls_disabled("clear")
+        cleared = len(messages)
         messages.clear()
         # A cleared conversation is a new session; its accounting starts over.
         reset_session_state()
-        return f'  {GREEN}✓{RESET} Conversation cleared ({_get_model()}).'
+        return (f'  {GREEN}✓{RESET} Conversation cleared — {cleared} messages '
+                f'dropped ({_get_model()}).')
 
     if cmd == "status":
         model_status = _get_model()
@@ -6042,6 +6578,18 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
             f'    /mode bypass   — {RED}yolo + never ask whether to continue{RESET}',
         ]
         return '\n'.join(lines)
+
+    # `parts[1]` rather than a shared `arg`: this function derives the
+    # argument per command, and the three below are the only ones that need
+    # the raw (uncased) tail.
+    if cmd == "settings":
+        return _handle_settings(parts[1] if len(parts) > 1 else "")
+
+    if cmd == "debug":
+        return _handle_debug(parts[1] if len(parts) > 1 else "")
+
+    if cmd == "export":
+        return _handle_export(messages, parts[1] if len(parts) > 1 else "")
 
     if cmd == "config":
         return _config_menu(messages)
@@ -7121,6 +7669,28 @@ def read_input_with_suggestions(prompt: str) -> str:
                 # the second call gives the key itself.
                 ext = msvcrt.getwch()
 
+                # Ctrl+Alt+X / Alt+X — the debug view.
+                #
+                # An Alt'd letter arrives through the same extended-key door as
+                # the function keys: a '\x00' prefix, then the key's *scan*
+                # code rather than its character. 0x2D is X. Windows delivers
+                # Ctrl+Alt+X here identically to Alt+X (the console API's
+                # modifier bits do not survive `getwch`), so binding the scan
+                # code catches both, and Alt+X alone is a harmless second way
+                # in rather than a conflict — nothing else in this REPL uses it.
+                if ext == '\x2d':
+                    _hide()
+                    print()
+                    # Opens the live window, arming recording first if needed.
+                    # Deliberately not a dump into this console: the point of
+                    # the key is to watch traffic *while* using the session,
+                    # and printing 200 lines of JSON over the prompt is the
+                    # opposite of that.
+                    print(_handle_debug("window"))
+                    print()
+                    _refresh()
+                    continue
+
                 # F5–F9 — quick mode switch
                 if ext in ('\x3f', '\x40', '\x41', '\x42', '\x43'):
                     if ext == '\x3f':      # F5 — toggle auto/default
@@ -7441,6 +8011,7 @@ def _print_conversation_history(messages: list) -> None:
 
 def main() -> int:
     global mcp_manager, _current_context_window, CONTEXT_WINDOW, CONTINUE_SESSION_ID
+    global _synthetic_replies
 
     # ── This session's accounting starts here, not at import time ──
     reset_session_state()
@@ -7600,6 +8171,31 @@ def main() -> int:
         except Exception as e:
             print(f'  {YELLOW}⚠{RESET}  Could not load session: {e}')
 
+    # ── Prefill, when asked for ──
+    # Only into a genuinely fresh conversation: a continued session already
+    # has the history this exists to simulate, and prepending filler to it
+    # would push the user's real first turn further from the model *and*
+    # re-add the filler on every subsequent continue.
+    if not messages and features().enabled("prefill_context"):
+        wanted = features().choice("prefill_tokens")
+        primer = core_features.prefill_messages(wanted)
+        if primer:
+            messages.extend(primer)
+            # The primer's acknowledgement is scaffolding, not a reply — see
+            # `_synthetic_replies`. Without this the every-3rd-reply cap fires
+            # a turn early for the whole session.
+            _synthetic_replies = sum(1 for m in primer
+                                     if m.get("role") == "assistant")
+            share = ""
+            window = CONTEXT_WINDOW or DEFAULT_CONTEXT_WINDOW
+            if window:
+                share = f' ({wanted / window:.0%} of the {window:,} window)'
+            print(f'  {CYAN}◈{RESET}  Context prefilled: '
+                  f'{CYAN}~{wanted:,} tokens{RESET}{DIM}{share} of history '
+                  f'before your first message.{RESET}')
+            print(f'  {DIM}Size and on/off: Settings → Prefill context.{RESET}')
+            print()
+
     try:
         while True:
             try:
@@ -7716,7 +8312,16 @@ def main() -> int:
             except Exception as e:
                 print(f'  {DIM}⚠  Session save skipped: {e}{RESET}')
             CONTINUE_SESSION_ID = None
-            reflect_on_session_end(messages)
+            # Reflection calls the model over the whole transcript, which can
+            # take several seconds on a long session. Shown as a spinner so
+            # the wait isn't mistaken for a hang right after "Session saved"
+            # already printed above.
+            thinking = Thinking(label="reflecting on this session")
+            thinking.start()
+            try:
+                reflect_on_session_end(messages)
+            finally:
+                thinking.stop()
         # ── Clean up MCP connections ──
         if mcp_manager:
             mcp_manager.disconnect_all()

@@ -15,6 +15,8 @@ Run: python -m unittest tests.test_mcp_collision -v
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -280,6 +282,68 @@ class TestExecuteToolRouting(unittest.TestCase):
         self.assertEqual(agent._tool_origin("git_status"), "MCP: srv")
         # Renamed tool resolves back to original before server lookup
         self.assertEqual(agent._tool_origin("mcp_read_file"), "built-in")
+
+
+class TestMcpCallInterrupt(unittest.TestCase):
+    """execute_tool's MCP path must stop *waiting* on Esc, even though
+    mcp_manager.call_tool() itself has no cancellation point (P?: Esc
+    interrupt did not reach MCP tool calls, only run_command)."""
+
+    def setUp(self):
+        self._orig_manager = agent.mcp_manager
+        self._orig_map = agent.MCP_TOOL_NAME_MAP
+        self._orig_interrupt = agent._CURRENT_INTERRUPT
+
+    def tearDown(self):
+        agent.mcp_manager = self._orig_manager
+        agent.MCP_TOOL_NAME_MAP = self._orig_map
+        agent._CURRENT_INTERRUPT = self._orig_interrupt
+
+    def test_no_interrupt_returns_the_real_result(self):
+        server = FakeMCPServer("srv", [mcp_tool("git_status")])
+        agent.mcp_manager = FakeMCPManager(server)
+        agent.MCP_TOOL_NAME_MAP = {}
+        agent._CURRENT_INTERRUPT = threading.Event()
+        result = agent.execute_tool("git_status", {})
+        self.assertEqual(result, "ok:git_status")
+
+    def test_esc_stops_the_wait_without_killing_the_call(self):
+        """A call that never returns must not hang execute_tool forever —
+        the turn gives up on it the moment Esc is pressed, while the fake
+        server call itself keeps running in the background."""
+        release = threading.Event()
+        started = threading.Event()
+
+        class SlowServer(FakeMCPServer):
+            def call_tool(self, name, arguments):
+                started.set()
+                release.wait(timeout=5)  # simulates a hung MCP call
+                return super().call_tool(name, arguments)
+
+        server = SlowServer("srv", [mcp_tool("slow_tool")])
+        agent.mcp_manager = FakeMCPManager(server)
+        agent.MCP_TOOL_NAME_MAP = {}
+        agent._CURRENT_INTERRUPT = threading.Event()
+
+        def press_esc_once_the_call_has_started():
+            started.wait(timeout=5)
+            agent._CURRENT_INTERRUPT.set()
+
+        presser = threading.Thread(target=press_esc_once_the_call_has_started)
+        presser.start()
+        begin = time.monotonic()
+        result = agent.execute_tool("slow_tool", {})
+        elapsed = time.monotonic() - begin
+        presser.join()
+
+        self.assertIn("interrupted", result)
+        self.assertIn("slow_tool", result)
+        # The fake server's call_tool blocks for up to 5s on `release`; a
+        # working interrupt returns in well under that.
+        self.assertLess(elapsed, 2.0,
+                         "execute_tool waited for the hung call instead of "
+                         "returning once Esc was pressed")
+        release.set()  # let the background thread finish so it doesn't leak
 
 
 class TestManagerRouting(unittest.TestCase):

@@ -1157,6 +1157,91 @@ def page_context_budget():
         agent_mod.save_budget_settings(settings)
 
 
+def page_settings():
+    """Feature switches — what the agent does, not what it spends.
+
+    Deliberately separate from Context Budget, which answers a different
+    question (how much of the window may something occupy) in a different
+    unit. Merging them would put "streaming on/off" next to "tool ceiling:
+    32" and leave the user to work out which numbers move together.
+    """
+    import agent as agent_mod
+    import core.features as cf
+
+    while True:
+        current = agent_mod.features(refresh=True)
+        rows, keys = [], []
+        for spec in cf.FEATURES:
+            on = current.enabled(spec['key'])
+            mark = f'{GREEN}✓{RESET}' if on else f'{RED}✕{RESET}'
+            rows.append(f'{mark} {spec["label"]:<22}{DIM}{spec["detail"]}{RESET}')
+            keys.append(spec['key'])
+        # Numeric settings sit below the switches, each showing its current
+        # value. One that depends on a switch says so when that switch is off,
+        # rather than silently having no effect.
+        for spec in cf.CHOICES:
+            value = current.choice(spec['key'])
+            gate = spec.get('depends_on')
+            inert = gate and not current.enabled(gate)
+            label = f'{spec["label"]}: {value:,} {spec["unit"]}'
+            note = (f'{DIM} — needs "{next(f["label"] for f in cf.FEATURES if f["key"] == gate)}" on{RESET}'
+                    if inert else f'{DIM}{spec["detail"]}{RESET}')
+            mark = f'{DIM}◦{RESET}' if inert else f'{CYAN}#{RESET}'
+            rows.append(f'{mark} {label:<22}{note}')
+            keys.append(('choice', spec['key']))
+        rows.append('')
+        keys.append(None)
+        rows.append(f'  {DIM}Reset to defaults{RESET}')
+        keys.append('__reset__')
+
+        idx = arrow_menu(
+            'Settings', rows,
+            header_lines=[
+                f'  {DIM}Enter toggles the highlighted switch. These persist '
+                f'across sessions{RESET}',
+                f'  {DIM}and models — unlike the context budget, which follows '
+                f'the model.{RESET}',
+                '─' * 58,
+            ],
+            footer=DEFAULT_FOOTER, max_visible=len(rows))
+        if idx < 0 or idx >= len(keys) or keys[idx] is None:
+            return
+        chosen = keys[idx]
+        if chosen == '__reset__':
+            agent_mod.save_features(cf.Features())
+            continue
+        if isinstance(chosen, tuple):
+            agent_mod.save_features(
+                _settings_pick_value(agent_mod, current, chosen[1]))
+            continue
+        agent_mod.save_features(cf.toggle(current, chosen))
+
+
+def _settings_pick_value(agent_mod, current, key):
+    """Pick one value for a numeric setting. Returns the new Features."""
+    import core.features as cf
+
+    spec = next(c for c in cf.CHOICES if c['key'] == key)
+    now = current.choice(key)
+    window = agent_mod.CONTEXT_WINDOW or agent_mod.DEFAULT_CONTEXT_WINDOW
+    rows = []
+    for value in spec['values']:
+        mark = f'{GREEN}●{RESET}' if value == now else f'{DIM}○{RESET}'
+        # The share is what makes the number a decision: 100,000 tokens means
+        # nothing until you know it is half your window, or most of it.
+        share = f'{DIM}  {value / window:.0%} of the {window:,} window{RESET}' \
+            if window else ''
+        rows.append(f'{mark} {value:>7,} {spec["unit"]}{share}')
+
+    idx = arrow_menu(spec['label'], rows,
+                     header_lines=[f'  {DIM}{spec["detail"]}{RESET}',
+                                   '─' * 50],
+                     footer=DEFAULT_FOOTER)
+    if idx < 0 or idx >= len(spec['values']):
+        return current
+    return cf.set_choice(current, key, spec['values'][idx])
+
+
 def _budget_pick_compaction(agent_mod, settings):
     """Choose when the conversation is summarised, or switch it off.
 
@@ -3091,6 +3176,7 @@ MENU_ITEMS = [
     f'  {YELLOW}⬡{RESET}  Tools',
     f'  {YELLOW}⬡{RESET}  Skills',
     f'  {YELLOW}▣{RESET}  Context Budget',
+    f'  {YELLOW}⚙{RESET}  Settings',
     '',
     f'  {CYAN}◈{RESET}  Sessions & Notes',
     f'  {BLUE}✎{RESET}  Agent Instructions',
@@ -3111,6 +3197,7 @@ MENU_ACTIONS = [
     page_tools,
     page_skills,
     page_context_budget,
+    page_settings,
     None,  # spacer
     page_sessions,
     page_edit_instructions,

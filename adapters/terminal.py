@@ -30,9 +30,11 @@ from core.events import (
     ContinuationNeeded,
     ErrorOccurred,
     LoopDetected,
+    ReasoningProgress,
     RetryScheduled,
     StreamingDisabled,
     TextDelta,
+    ThinkingStarted,
     AnnouncedWithoutActing,
     ToolCallsRecovered,
     ToolFinished,
@@ -153,11 +155,16 @@ class Thinking:
     FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
     def __init__(self, label: str = "thinking",
-                 interrupt: "threading.Event | None" = None):
+                 interrupt: "threading.Event | None" = None,
+                 silent: bool = False):
         self.label = label
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._interrupt = interrupt
+        # Draw nothing, but keep polling. The Esc watcher lives in this loop,
+        # so a "silent" spinner is how the status display is switched off
+        # without also switching off the only way to interrupt a turn.
+        self.silent = silent
 
     def start(self) -> None:
         if self._thread is not None:
@@ -186,7 +193,7 @@ class Thinking:
             # frame is written with `\r\033[2K`, which erases the line the
             # reader is echoing into — as destructive as a stolen keystroke
             # and harder to notice, because the text was there a moment ago.
-            if console_is_busy():
+            if self.silent or console_is_busy():
                 i += 1
                 continue
             frame = self.FRAMES[i % len(self.FRAMES)]
@@ -199,6 +206,15 @@ class Thinking:
             except Exception:
                 return
             i += 1
+
+    def set_label(self, label: str) -> None:
+        """Change what the spinner says without restarting it.
+
+        The reasoning indicator updates on every chunk — hundreds of times in
+        one call — so relabelling has to be an assignment, not a new thread.
+        The spinner picks it up on its next frame, at its own cadence.
+        """
+        self.label = label
 
     def stop(self) -> None:
         if self._thread is None:
@@ -216,8 +232,13 @@ class Thinking:
 class TerminalAdapter:
     """Drives a run_turn generator, printing as it goes."""
 
-    def __init__(self, interactive: bool = True):
+    def __init__(self, interactive: bool = True, show_status: bool = True):
         self.interactive = interactive
+        # Whether the spinner names what the agent is doing between steps.
+        # Off, the turn still runs identically and Esc still works — the
+        # spinner is the *watcher* for Esc, so switching this off replaces it
+        # with a bare watcher rather than removing one (see _watch).
+        self.show_status = show_status
         self._streaming_header_shown = False
         self._non_interactive_notice_shown = False
         self._stream: StreamWrap | None = None
@@ -242,14 +263,25 @@ class TerminalAdapter:
         state.responder = self
         return self.drive(run_turn(state, user_message))
 
+    def _watch(self, label: str = "thinking") -> None:
+        """Start the phase watcher: the spinner, and the Esc poller inside it.
+
+        One helper rather than three `Thinking(...)` constructions, because
+        every one of them has to carry the interrupt event — an omission there
+        is not a cosmetic bug, it is a phase of the turn during which Esc
+        silently does nothing.
+        """
+        self._thinking = Thinking(label=label, interrupt=self.esc_interrupt,
+                                  silent=not self.show_status)
+        self._thinking.start()
+
     def drive(self, gen) -> str:
         """Render an already-built generator. Prefer run() — with drive() the
         caller is responsible for having set state.responder."""
         reply = ""
         # Started before the first `next()`, which is where the request is
         # actually sent and where all the waiting happens.
-        self._thinking = Thinking(interrupt=self.esc_interrupt)
-        self._thinking.start()
+        self._watch("analysing the request")
         try:
             for event in gen:
                 self.render(event)
@@ -267,11 +299,32 @@ class TerminalAdapter:
     # ── Rendering ──────────────────────────────────────────────────
 
     def render(self, event) -> None:
+        # Reasoning prints nothing, so it must not count as "the wait is over".
+        # Handled before the stop below and returning here: it arrives once per
+        # chunk — hundreds of times in a single call — and anything that tore
+        # the spinner down and rebuilt it would spawn a thread per chunk.
+        if isinstance(event, ReasoningProgress):
+            if self._thinking is not None:
+                self._thinking.set_label(f"reasoning ({event.chars:,} chars)")
+            else:
+                self._watch(f"reasoning ({event.chars:,} chars)")
+            return
+
         # Any output at all means the wait is over.
         if not isinstance(event, TextDelta) or not self._streaming_header_shown:
             self._stop_thinking()
 
-        if isinstance(event, TextDelta):
+        if isinstance(event, ThinkingStarted):
+            # The event that means "a model call is in flight", and the one
+            # place the main wait can be shown. It went unhandled, so the
+            # watcher `drive()` starts was stopped by the line above and never
+            # restarted — the whole model call ran with a dead screen, and on a
+            # reasoning model that is the better part of a minute of nothing
+            # followed by the reply arriving at once. That is what "it answers
+            # in one block" looked like even though streaming worked fine.
+            self._watch("analysing the request")
+
+        elif isinstance(event, TextDelta):
             if not self._streaming_header_shown:
                 print(f'  {MAGENTA}{BOLD}▌ TOMAS{RESET}')
                 sys.stdout.write('  ')
@@ -317,9 +370,7 @@ class TerminalAdapter:
             # Same rule as `ask()` below — "never prompt underneath a spinner"
             # — applied to a tool that prompts from the inside.
             if not event.interactive:
-                self._thinking = Thinking(label=event.name,
-                                          interrupt=self.esc_interrupt)
-                self._thinking.start()
+                self._watch(f"running {event.name}")
 
         elif isinstance(event, ToolFinished):
             result = event.result
@@ -334,8 +385,7 @@ class TerminalAdapter:
                 print(f'    {mark} {DIM}{shown}{RESET}')
             # The model is about to be called again with this result; that
             # wait is the same dead air the indicator exists for.
-            self._thinking = Thinking(interrupt=self.esc_interrupt)
-            self._thinking.start()
+            self._watch("working through the result")
 
         elif isinstance(event, ToolResultTruncated):
             print(f'    {RED}⚠{RESET}  tool result truncated: '

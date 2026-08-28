@@ -23,6 +23,7 @@ from .events import (
     ErrorOccurred,
     LoopDetected,
     PermissionNeeded,
+    ReasoningProgress,
     RetryScheduled,
     StreamingDisabled,
     TextDelta,
@@ -38,6 +39,7 @@ from .events import (
 from .console import is_interactive_tool
 from .state import CYCLE_WINDOW, REPEATED_CALL_LIMIT, AgentState
 from .toolcall_text import recover as recover_text_tool_calls
+from . import debug_log
 
 MAX_RETRIES = 3
 
@@ -642,6 +644,12 @@ def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
     final_msg = None
 
     _prepare_request(state)
+    captured = debug_log.record_request(
+        model=state.get_model(), system=state.system_prompt,
+        tools=state.tools, messages=state.messages,
+        max_tokens=state.max_tokens,
+        temperature=_sampling(state).get("temperature"),
+        path="streamed")
     with state.get_client().messages.stream(
         model=state.get_model(),
         max_tokens=state.max_tokens,
@@ -660,6 +668,11 @@ def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
                 if event.delta.type == "text_delta":
                     text_parts.append(event.delta.text)
                     yield TextDelta(event.delta.text)
+            elif event.type == "reasoning_progress":
+                # Only the in-process adapter emits this; the native Anthropic
+                # SDK never will, so it is read defensively rather than
+                # assumed to carry a count.
+                yield ReasoningProgress(getattr(event, "chars", 0) or 0)
             elif event.type == "content_block_start":
                 if event.content_block.type == "tool_use":
                     has_tool_use = True
@@ -668,6 +681,7 @@ def _stream_call(state: AgentState) -> Iterator[AgentEvent]:
                 stop_reason = final_msg.stop_reason
                 usage_info = getattr(final_msg, "usage", None)
                 final_reasoning = _reasoning_of(getattr(final_msg, "content", None))
+                debug_log.record_response(captured, final_msg)
 
     wants_tools = has_tool_use or stop_reason == "tool_use"
     # Recorded rather than reported here: truncation is handled identically for
@@ -985,14 +999,29 @@ def _model_call(state: AgentState) -> Iterator[AgentEvent]:
             return None
         try:
             _prepare_request(state)
-            response = state.get_client().messages.create(
-                model=state.get_model(),
+            captured = debug_log.record_request(
+                model=state.get_model(), system=state.system_prompt,
+                tools=state.tools, messages=state.messages,
                 max_tokens=state.max_tokens,
-                system=state.system_prompt,
-                tools=state.tools,
-                messages=state.messages,
-                **_sampling(state),
-            )
+                temperature=_sampling(state).get("temperature"),
+                path="non-streamed")
+            try:
+                response = state.get_client().messages.create(
+                    model=state.get_model(),
+                    max_tokens=state.max_tokens,
+                    system=state.system_prompt,
+                    tools=state.tools,
+                    messages=state.messages,
+                    **_sampling(state),
+                )
+            except Exception as exc:
+                # Recorded before re-raising: the handlers below turn this into
+                # an ErrorOccurred and return, so without capturing it here the
+                # debug view would show a request that never got an answer and
+                # no reason why — which is the case it is most wanted for.
+                debug_log.record_response(captured, error=str(exc))
+                raise
+            debug_log.record_response(captured, response)
             _record_usage(state, getattr(response, "usage", None))
             # An empty response is a provider hiccup, not a refusal: the
             # request was accepted and well-formed, so the identical payload
@@ -1116,6 +1145,18 @@ def _report_truncation(state: AgentState, text: str) -> Iterator[AgentEvent]:
     is still useful, so it is shown with a warning rather than discarded.
     """
     limit = state.max_tokens
+    if state.reply_capped:
+        # Not a failure: this turn's limit was lowered on purpose, and saying
+        # so is the whole point of the setting. Reported through the same
+        # channel as a real truncation so it is visibly the *same* mechanism
+        # firing, but named as deliberate so nobody debugs it as a fault.
+        state.last_error = f"reply capped at max_tokens={limit} (every-3rd-reply limit)"
+        yield ErrorOccurred(
+            f"Output limit reached: this reply was capped at {limit} tokens by "
+            f"the every-3rd-reply setting, so it stops early by design. "
+            f"Turn it off in Settings to let replies run to full length.",
+            detail=state.last_error, recoverable=True)
+        return
     if text.strip():
         message = (f"The reply was cut off at the {limit}-token output limit — "
                    f"what you see above is incomplete.")
@@ -1344,7 +1385,13 @@ def _can_escalate(state: AgentState, text: str, escalated: bool) -> bool:
 
     The re-billing concern is real but bounded: `escalated` allows this once
     per turn, and MAX_OUTPUT_CEILING bounds where it can go.
+
+    A deliberately capped reply is the one truncation that must *not* escalate:
+    the user asked for a short answer, and quadrupling the budget to undo it
+    would make the setting do nothing at all on the turn it applies to.
     """
+    if state.reply_capped:
+        return False
     return not escalated and state.max_tokens < MAX_OUTPUT_CEILING
 
 
