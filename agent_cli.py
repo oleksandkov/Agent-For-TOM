@@ -258,8 +258,17 @@ def menu_row_count(item: str, columns: int) -> int:
 
 
 def _is_selectable(item: str) -> bool:
-    """Blank spacer rows are drawn but must not be landed on."""
-    return bool(strip_ansi(item or '').strip())
+    """Blank spacer rows are drawn but must not be landed on.
+
+    Nor are group headings. `── Free (21) ──` is the convention every menu in
+    this file already uses for a divider, and every caller already pairs it
+    with a `None` value — so landing on one could only ever produce a
+    selection the caller has to discard, and in the provider menu the cursor
+    *opens* on one. Skipping them here fixes that for the model pickers and
+    the provider list alike, rather than in each of them separately.
+    """
+    text = strip_ansi(item or '').strip()
+    return bool(text) and not text.startswith('──')
 
 
 def _matches(item: str, needle: str) -> bool:
@@ -2123,39 +2132,329 @@ def page_edit_project_agent():
     )
 
 
-def page_configure_provider():
-    """Arrow-key menu to select and configure a provider."""
-    configured = set(_get_configured_providers())
+def _spec_status(spec, configured: set, ollama_models: list) -> str:
+    """The one thing a row must say beyond its name: can I use this now?
 
-    provider_names = [
-        'OpenRouter (openrouter.ai)',
-        'Anthropic Direct (api.anthropic.com)',
-        'OpenAI (api.openai.com)',
-        'Google AI',
-        'OpenCode Zen (opencode.ai)',
-        'Ollama (local)',
-        'Groq (console.groq.com)',
-        'Custom / Other',
-    ]
-    # index -> provider type, matched to provider_names by position. Kept as
-    # a parallel list rather than folded into provider_names itself so the
-    # idx==N dispatch below — and every provider_names[N] reference inside
-    # it — stays on the original, stable indices even though the menu below
-    # shows only a filtered subset of them.
-    provider_name_types = ['openrouter', 'anthropic', 'openai', 'google',
-                           'zen', 'ollama', 'groq', 'custom']
-    # Probe for a local Ollama so the option can say whether it is there.
-    # Cached: without it this page paid 12.3 s on every open, because a
-    # missing Ollama meant three HTTP attempts that each ran to their timeout.
+    Three states worth distinguishing, because they need three different
+    actions from the user: already set up, a key is already on this machine
+    (press Enter, type nothing), or a key must be fetched from a website.
+    A local runtime answers a different question again — is it running — and
+    that is worth more than any of them, because it costs nothing to try.
+    """
+    # An unproven row must say so before it says anything else. It is still
+    # offered — a provider you cannot see is one you cannot get a key for —
+    # but the claim on the label stops at what has actually been witnessed.
+    unproven = ('' if spec.verified == 'live'
+                else f'  {YELLOW}— unverified{RESET}')
+
+    if spec.label in configured:
+        return f'  {DIM}— configured{RESET}{unproven}'
+    if spec.local:
+        if spec.id == 'ollama':
+            return (f'  {DIM}— {len(ollama_models)} model(s) detected{RESET}'
+                    if ollama_models else f'  {DIM}— not running{RESET}')
+        return f'  {DIM}— {spec.base_url}{RESET}{unproven}'
+    if not spec.needs_key:
+        return f'  {DIM}— no key needed{RESET}{unproven}'
+    env_name = _key_env_holding_a_key(spec)
+    if env_name:
+        return f'  {GREEN}— key found in {env_name}{RESET}{unproven}'
+    return f'  {DIM}— needs a key{RESET}{unproven}'
+
+
+def _key_env_holding_a_key(spec) -> str:
+    """The env name that already holds this provider's key, or ''.
+
+    Both sources, because they go out of step in both directions:
+    `~/.tomas/.env` is loaded into `os.environ` at import, so a key added
+    afterwards — by another session, or by the flow below — is on disk and not
+    in this process; and a key exported in the shell is in this process and
+    not on disk. Reading only one of them is how a menu says "needs a key"
+    while the key is sitting right there.
+    """
+    import provider_manager
+    on_disk = {}
+    try:
+        path = provider_manager.ENV_FILE
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    name, _, value = line.partition('=')
+                    on_disk[name.strip()] = value.strip()
+    except OSError:
+        pass
+    for env_name in spec.key_env_names:
+        if os.environ.get(env_name) or on_disk.get(env_name):
+            return env_name
+    return ''
+
+
+#: Group headings, in registry.GROUPS order. A heading is worth its row here:
+#: the difference between "costs nothing" and "bills per token" is the first
+#: thing a new user needs and the last thing a flat list conveys.
+_GROUP_HEADINGS = {
+    'free': '── Free tier — no card required ──',
+    'local': '── Local — runs on this machine ──',
+    'major': '── Major cloud ──',
+    'aggregator': '── Aggregators — many models, one key ──',
+    'enterprise': '── Enterprise ──',
+    'other': '── Other ──',
+}
+
+
+def page_configure_provider():
+    """Arrow-key menu to select and configure a provider.
+
+    Built from `core.provider_registry`, grouped by `spec.group`. It used to
+    be two parallel lists — `provider_names` and `provider_name_types` — that
+    an `elif idx == N` chain indexed into by position, plus a third mapping in
+    `PROVIDER_TYPE_TO_DETECT` and a fourth in `PROVIDER_LABELS`. Getting five
+    of the six right is what left `groq` unable to make a single call while
+    appearing, fully formed, in this menu.
+    """
     import net_probe
     import provider_manager
+    from core import provider_registry as registry
 
-    # Restricted to the current working set (see
-    # provider_manager.VISIBLE_PROVIDER_TYPES) — temporary and reversible,
-    # not a removal: every other provider stays fully wired below, it just
-    # does not appear in this menu for now.
-    visible_indices = [i for i, t in enumerate(provider_name_types)
-                       if t in provider_manager.VISIBLE_PROVIDER_TYPES]
+    configured = set(_get_configured_providers())
+
+    def _probe_ollama() -> list[str]:
+        try:
+            return provider_manager.list_models(provider_manager.Provider(
+                name='Ollama (local)', type='ollama',
+                base_url=provider_manager.OLLAMA_DEFAULT_URL))
+        except Exception:
+            return []
+
+    # Cached: without it this page paid 12.3 s on every open, because a
+    # missing Ollama meant three HTTP attempts that each ran to their timeout.
+    ollama_models = net_probe.cached('ollama_models', 30.0, _probe_ollama)
+
+    # Admitted providers only — see provider_manager.VISIBLE_PROVIDER_TYPES.
+    # Everything else stays fully wired and reachable by a hand-edited config;
+    # it simply is not offered until its conformance run passes.
+    display: list[str] = []
+    targets: list = []          # parallel only to `display`, built together
+    for group, specs in registry.by_group().items():
+        visible = [s for s in specs
+                   if s.id in provider_manager.VISIBLE_PROVIDER_TYPES]
+        if not visible:
+            continue
+        display.append(f'{DIM}{_GROUP_HEADINGS.get(group, group)}{RESET}')
+        targets.append(None)
+        for spec in visible:
+            mark = f'{GREEN}✓{RESET}' if spec.label in configured else ' '
+            display.append(
+                f'{mark} {spec.label}'
+                f'{_spec_status(spec, configured, ollama_models)}')
+            targets.append(spec)
+
+    if not any(targets):
+        show_info_page('No Providers Available', [
+            f'  {YELLOW}No provider is currently admitted to the menu.{RESET}',
+            '',
+            f'  {DIM}This is a configuration problem, not a missing '
+            f'feature.{RESET}'])
+        return
+
+    sel = arrow_menu('Connect / Configure Provider', display,
+                     footer=DEFAULT_FOOTER)
+    if sel < 0:
+        return
+    spec = targets[sel]
+    if spec is None:
+        return                  # a heading row
+    configure_spec(spec)
+
+
+def configure_spec(spec) -> bool:
+    """Set one provider up, whatever it is. Returns True if it was saved.
+
+    One flow for every provider, because the differences between them are
+    data: whether a key is needed and under which name, whether the base URL
+    is the user's to choose, and where the model list comes from. The two
+    that genuinely need their own path get it — Zen authenticates without a
+    key, and Ollama may need starting first — and both are named here rather
+    than being implied by a list position.
+    """
+    if spec.id == 'zen':
+        return _configure_zen(spec)
+    if spec.id == 'ollama':
+        return _configure_ollama(spec)
+    return _configure_generic(spec)
+
+
+def _configure_generic(spec) -> bool:
+    """Key, endpoint, probe, model, capability panel — in that order.
+
+    The panel at the end is the point. Only the Ollama branch used to show
+    one, and it is the single most useful thing in the whole flow: it says,
+    before the first turn rather than during it, how big the window is and
+    whether the model can call tools at all.
+    """
+    import provider_manager
+    import net_probe
+
+    key = ''
+    if spec.needs_key:
+        found_in = _key_env_holding_a_key(spec)
+        if found_in and not os.environ.get(found_in):
+            # On disk but not in this process — load it so the prompt below
+            # can offer it as the default.
+            from dotenv import load_dotenv
+            load_dotenv(provider_manager.ENV_FILE)
+        if found_in and os.environ.get(found_in):
+            # Already on the machine. Offering it as the default turns the
+            # commonest case into one keystroke, and still lets it be
+            # replaced by typing over it.
+            key = prompt_text(
+                f'{spec.label} API key  (found in {found_in}, Enter to keep)',
+                os.environ[found_in])
+        else:
+            hint = f'  ({spec.key_hint})' if spec.key_hint else ''
+            print(f'  {DIM}Get one at {spec.signup_url}{RESET}')
+            key = prompt_text(f'Enter {spec.label} API key{hint}')
+        if not key:
+            return False
+
+    base_url = spec.base_url
+    if spec.base_url_editable:
+        base_url = prompt_text('Base URL', spec.base_url or '')
+        if not base_url:
+            return False
+
+    env = {}
+    if spec.api_key_env and key:
+        env[spec.api_key_env] = key
+    if base_url:
+        env['ANTHROPIC_BASE_URL'] = base_url
+    # The runtime reads the provider's own `api_key_env`, so this is what
+    # makes the entry callable rather than merely recorded. The OpenAI branch
+    # wrote OPENAI_BASE_URL and nothing else, which is why the saved provider
+    # had no endpoint and the menu printed a disclaimer instead of a fix.
+    if key:
+        env['ANTHROPIC_API_KEY'] = key
+
+    provider = provider_manager.Provider(
+        name=spec.label, type=spec.id, base_url=base_url,
+        api_key_env=spec.api_key_env or 'ANTHROPIC_API_KEY', env=env)
+
+    for env_name, value in env.items():
+        update_dotenv(env_name, value)
+
+    net_probe.invalidate()
+    catalog = provider_manager.catalog_for(spec.id, key)
+    if catalog:
+        model = _pick_model_from_catalog(spec, catalog)
+        if not model:
+            return False
+        provider.model = model
+    else:
+        typed = prompt_text(
+            f'{spec.label} returned no model list — enter a model name',
+            provider.model or '')
+        if not typed:
+            show_info_page(f'⚠ {spec.label}', [
+                f'  {YELLOW}The key was saved, but {spec.label} returned no '
+                f'models for it.{RESET}',
+                '',
+                f'  {DIM}Check it at {spec.signup_url}{RESET}'])
+            return False
+        provider.model = typed
+
+    provider.capabilities = provider_manager.probe(provider)
+    provider_manager.save(provider)
+    provider_manager.activate(provider.name)
+    update_dotenv('AGENT_MODEL', provider.model)
+    reinit_client()
+    _show_capability_panel(spec, provider)
+    return True
+
+
+def _pick_model_from_catalog(spec, catalog: list) -> str:
+    """Choose a model, saying what each one is before it is chosen.
+
+    Tool support leads the description because it is the one fact that
+    decides whether a model can drive this agent at all — without it the
+    agent drops to the text protocol. Where a catalogue does not publish it,
+    the row says so rather than guessing: Groq's listing has no tool field,
+    and assuming support there picked `groq/compound`, which answers every
+    tool request with a 400.
+    """
+    rows, values = [], []
+    free = [m for m in catalog if m['free']]
+    rest = [m for m in catalog if not m['free']]
+    for heading, group in (('── Free (no charge) ──', free),
+                           ('── Everything else ──' if free else None, rest)):
+        if not group:
+            continue
+        if heading:
+            rows.append(f'{DIM}{heading}{RESET}')
+            values.append(None)
+        for m in group[:120]:
+            marks = []
+            if m['context_window']:
+                marks.append(f"{m['context_window']:,} ctx")
+            if not m['tool_call_known']:
+                marks.append('tools unknown')
+            elif not m['tool_call']:
+                marks.append('no tools')
+            if m['vision']:
+                marks.append('vision')
+            note = f"  {DIM}({' · '.join(marks)}){RESET}" if marks else ''
+            rows.append(f'  {m["id"]}{note}')
+            values.append(m['id'])
+
+    idx = arrow_menu(f'{spec.label} — choose a model', rows,
+                     footer=DEFAULT_FOOTER)
+    if idx < 0 or values[idx] is None:
+        return ''
+    return values[idx]
+
+
+def _show_capability_panel(spec, provider) -> None:
+    caps = provider.capabilities
+    lines = [
+        f'  {GREEN}✓{RESET} {spec.label} configured and active.',
+        '',
+        f'  Model           {provider.model}',
+        f'  Endpoint        {provider_manager_base(provider)}',
+        f'  Context window  {caps.context_window:,} tokens',
+        f'  Tool use        '
+        f'{"yes" if caps.tool_use else "no — text protocol fallback"}',
+        f'  Streaming       '
+        f'{"yes" if caps.streaming else "no — blocking fallback"}',
+        f'  Vision          {"yes" if caps.vision else "no"}',
+        f'  Tool ceiling    {caps.max_tools}',
+    ]
+    show_info_page('Done', lines)
+
+
+def provider_manager_base(provider) -> str:
+    import provider_manager
+    return provider_manager.probe_base_url(provider) or '(resolved at runtime)'
+
+
+def _configure_zen(spec) -> bool:
+    """Zen authenticates without a key, so it has its own short path."""
+    import zen_catalog
+    _zen_setup_proxy()
+    config = _load_providers_config()
+    config.setdefault('providers', {})[spec.label] = {
+        'type': 'zen',
+        'model': (os.environ.get('AGENT_MODEL', '')
+                  or zen_catalog.default_free_model()),
+    }
+    config['active'] = spec.label
+    _save_providers_config(config)
+    return True
+
+
+def _configure_ollama(spec) -> bool:
+    """Ollama may need starting before it can be configured."""
+    import net_probe
+    import provider_manager
 
     def _probe_ollama() -> list[str]:
         try:
@@ -2166,232 +2465,65 @@ def page_configure_provider():
             return []
 
     ollama_models = net_probe.cached('ollama_models', 30.0, _probe_ollama)
-
-    # Show ✓ for already-configured providers
-    display = []
-    for i in visible_indices:
-        p = provider_names[i]
-        suffix = ''
-        if p == 'Ollama (local)':
-            suffix = (f'  {DIM}— {len(ollama_models)} model(s) detected{RESET}'
-                      if ollama_models else f'  {DIM}— not running{RESET}')
-        if p in configured:
-            display.append(f'{GREEN}✓{RESET} {p}{suffix}')
-        else:
-            display.append(f'  {p}{suffix}')
-
-    sel = arrow_menu('Connect / Configure Provider', display,
-                     footer=DEFAULT_FOOTER)
-    if sel < 0:
-        return
-    idx = visible_indices[sel]   # back to the original, stable index
-
-    if idx == 0:  # OpenRouter
-        key = prompt_text('Enter OpenRouter API key (sk-or-...)')
-        if key:
-            update_dotenv("ANTHROPIC_API_KEY", key)
-            update_dotenv("ANTHROPIC_BASE_URL", "https://openrouter.ai/api")
-            update_dotenv("ANTHROPIC_EXTRA_HEADERS", "")
-            _save_provider_config(
-                provider_names[0],
-                {"ANTHROPIC_API_KEY": key,
-                 "ANTHROPIC_BASE_URL": "https://openrouter.ai/api",
-                 "ANTHROPIC_EXTRA_HEADERS": ""},
-                provider_type="openrouter"
-            )
-            reinit_client()
-            show_info_page('Done', ['  ✓ OpenRouter configured and active.'])
-    elif idx == 1:  # Anthropic Direct
-        key = prompt_text('Enter Anthropic API key (sk-ant-...)')
-        if key:
-            update_dotenv("ANTHROPIC_API_KEY", key)
-            update_dotenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
-            update_dotenv("ANTHROPIC_EXTRA_HEADERS", "")
-            _save_provider_config(
-                provider_names[1],
-                {"ANTHROPIC_API_KEY": key,
-                 "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
-                 "ANTHROPIC_EXTRA_HEADERS": ""},
-                provider_type="anthropic"
-            )
-            reinit_client()
-            show_info_page('Done', ['  ✓ Anthropic Direct configured and active.'])
-    elif idx == 2:  # OpenAI
-        key = prompt_text('Enter OpenAI API key')
-        base = prompt_text('Enter base URL', 'https://api.openai.com/v1')
-        if key:
-            update_dotenv("OPENAI_API_KEY", key)
-            update_dotenv("OPENAI_BASE_URL", base)
-            update_dotenv("ANTHROPIC_EXTRA_HEADERS", "")
-            _save_provider_config(
-                provider_names[2],
-                {"OPENAI_API_KEY": key,
-                 "OPENAI_BASE_URL": base,
-                 "ANTHROPIC_EXTRA_HEADERS": ""},
-                provider_type="openai"
-            )
-            show_info_page('Done', ['  ✓ OpenAI configured.',
-                                    '',
-                                    f'  {YELLOW}Note: OpenAI is saved but the agent uses',
-                                    '  the ANTHROPIC_* env vars for API calls.',
-                                    '  Use "Switch provider" to activate it.'])
-    elif idx == 3:  # Google AI
-        key = prompt_text('Enter Google AI API key')
-        if key:
-            import provider_manager as _pm
-            update_dotenv("GOOGLE_API_KEY", key)
-            _save_provider_config(
-                provider_names[3],
-                {"GOOGLE_API_KEY": key,
-                 # Saved explicitly so the provider is usable, not merely
-                 # recorded. It used to store the key alone and then say so:
-                 # "Google AI is saved but the agent uses the ANTHROPIC_* env
-                 # vars for API calls" — a configured provider that could not
-                 # be called, with the disclaimer standing in for the feature.
-                 "ANTHROPIC_BASE_URL": _pm.GOOGLE_OPENAI_BASE,
-                 "ANTHROPIC_API_KEY": key,
-                 "ANTHROPIC_EXTRA_HEADERS": ""},
-                provider_type="google"
-            )
-            import net_probe
-            net_probe.invalidate('google_catalog')
-            catalog = _pm.google_model_catalog(key)
-            if catalog:
-                top = catalog[0]
-                update_dotenv("AGENT_MODEL", top['name'])
-                show_info_page('Connected to Google AI', [
-                    f'  {GREEN}✓{RESET} API key set',
-                    f'  {GREEN}✓{RESET} Endpoint: {_pm.GOOGLE_OPENAI_BASE}',
-                    f'  {GREEN}✓{RESET} Model: {top["name"]} '
-                    f'({top["context_window"]:,} ctx)',
-                    '',
-                    f'  {DIM}{len(catalog)} models are reachable with this key '
-                    f'— pick another from "Change Model".{RESET}',
-                ])
-            else:
-                show_info_page('⚠ Google AI', [
-                    f'  {YELLOW}The key was saved, but Google returned no '
-                    f'models for it.{RESET}',
-                    '',
-                    f'  {DIM}Check it at https://aistudio.google.com/apikey{RESET}',
-                ])
-    elif idx == 4:  # OpenCode Zen — auto-start proxy, no config needed
-        _zen_setup_proxy()
-        # Also save to multi-provider config
-        import zen_catalog
-        config = _load_providers_config()
-        if "providers" not in config:
-            config["providers"] = {}
-        config["providers"][provider_names[4]] = {
-            "type": "zen",
-            "model": (os.environ.get("AGENT_MODEL", "")
-                      or zen_catalog.default_free_model())
-        }
-        config["active"] = provider_names[4]
-        _save_providers_config(config)
-    elif idx == 5:  # Ollama (local)
+    if not ollama_models:
+        import shutil
+        has_binary = bool(shutil.which('ollama'))
+        started = False
+        if has_binary:
+            print(f'  {DIM}Ollama is installed but not running — '
+                  f'starting it...{RESET}')
+            started = _try_start_ollama_server()
+            if started:
+                net_probe.invalidate('ollama_models')
+                ollama_models = net_probe.cached('ollama_models', 30.0,
+                                                 _probe_ollama)
         if not ollama_models:
-            import shutil
-            has_binary = bool(shutil.which("ollama"))
-            started = False
-            if has_binary:
-                print(f'  {DIM}Ollama is installed but not running — starting it...{RESET}')
-                started = _try_start_ollama_server()
-                if started:
-                    net_probe.invalidate('ollama_models')
-                    ollama_models = net_probe.cached(
-                        'ollama_models', 30.0, _probe_ollama)
-            if not ollama_models:
-                lines = [
-                    f'  No Ollama server answered at {provider_manager.OLLAMA_DEFAULT_URL}.',
-                    '']
-                if started:
-                    # The server came up (reachable) but reported no models —
-                    # a different situation from "Ollama isn't installed",
-                    # and the fix is a pull, not serve.
-                    lines += [
-                        '  It started, but has no models pulled yet:',
-                        f'    {CYAN}ollama pull qwen2.5-coder{RESET}',
-                        '',
-                        '  Then come back here — it will be detected automatically.']
-                elif has_binary:
-                    lines += [
-                        '  Found the ollama binary, but the server did not come up '
-                        'in time.',
-                        f'    {CYAN}ollama serve{RESET}',
-                        '',
-                        '  Then come back here — it will be detected automatically.']
-                else:
-                    lines += [
-                        '  Install from https://ollama.com, then:',
-                        f'    {CYAN}ollama pull qwen2.5-coder{RESET}',
-                        f'    {CYAN}ollama serve{RESET}',
-                        '',
-                        '  Then come back here — it will be detected automatically.']
-                show_info_page('Ollama not found', lines)
-                return
+            lines = [f'  No Ollama server answered at '
+                     f'{provider_manager.OLLAMA_DEFAULT_URL}.', '']
+            if started:
+                lines += ['  It started, but has no models pulled yet:',
+                          f'    {CYAN}ollama pull qwen2.5-coder{RESET}', '',
+                          '  Then come back here — it will be detected '
+                          'automatically.']
+            elif has_binary:
+                lines += ['  Found the ollama binary, but the server did not '
+                          'come up in time.',
+                          f'    {CYAN}ollama serve{RESET}', '',
+                          '  Then come back here — it will be detected '
+                          'automatically.']
+            else:
+                lines += ['  Install from https://ollama.com, then:',
+                          f'    {CYAN}ollama pull qwen2.5-coder{RESET}',
+                          f'    {CYAN}ollama serve{RESET}', '',
+                          '  Then come back here — it will be detected '
+                          'automatically.']
+            show_info_page('Ollama not found', lines)
+            return False
+
+    catalog = provider_manager.catalog_for('ollama')
+    model = _pick_model_from_catalog(spec, catalog) if catalog else ''
+    if not model:
         m_idx = arrow_menu('Ollama — choose a model',
                            [f'  {m}' for m in ollama_models],
                            footer=DEFAULT_FOOTER)
         if m_idx < 0:
-            return
+            return False
         model = ollama_models[m_idx]
-        provider = provider_manager.Provider(
-            name=provider_names[5], type='ollama',
-            base_url=provider_manager.OLLAMA_DEFAULT_URL,
-            model=model,
-            env={'ANTHROPIC_BASE_URL': provider_manager.OLLAMA_DEFAULT_URL,
-                 'ANTHROPIC_API_KEY': 'ollama'})
-        # Probe now: many local models have no tool support, and the context
-        # window is usually far smaller than the cloud default. Both must be
-        # known before the first turn, not discovered during it.
-        caps = provider_manager.probe(provider)
-        provider.capabilities = caps
-        provider_manager.save(provider)
-        provider_manager.activate(provider.name)
-        reinit_client()
-        lines = [f'  ✓ Ollama configured and active — {model}.', '']
-        lines.append(f'  Context window: {caps.context_window:,} tokens')
-        lines.append(f'  Tool use:       {"yes" if caps.tool_use else "no — text protocol fallback"}')
-        lines.append(f'  Streaming:      {"yes" if caps.streaming else "no — blocking fallback"}')
-        lines.append(f'  Vision:         {"yes" if caps.vision else "no"}')
-        show_info_page('Done', lines)
-    elif idx == 6:  # Groq
-        key = prompt_text('Enter Groq API key (gsk_...)')
-        if key:
-            update_dotenv("ANTHROPIC_API_KEY", key)
-            update_dotenv("ANTHROPIC_BASE_URL", "https://api.groq.com/openai/v1")
-            update_dotenv("ANTHROPIC_EXTRA_HEADERS", "")
-            _save_provider_config(
-                provider_names[6],
-                {"ANTHROPIC_API_KEY": key,
-                 "ANTHROPIC_BASE_URL": "https://api.groq.com/openai/v1",
-                 "ANTHROPIC_EXTRA_HEADERS": ""},
-                provider_type="groq"
-            )
-            reinit_client()
-            show_info_page('Done', ['  ✓ Groq configured and active.',
-                                    '',
-                                    f'  {DIM}Use "Choose Model" to see every model this '
-                                    f'key can reach.{RESET}'])
-    elif idx == 7:  # Custom
-        name = prompt_text('Provider name')
-        key = prompt_text('API key')
-        base = prompt_text('Base URL')
-        if key and base and name:
-            env_key = f"{name.upper().replace(' ', '_')}_API_KEY"
-            env_url = f"{name.upper().replace(' ', '_')}_BASE_URL"
-            update_dotenv(env_key, key)
-            update_dotenv(env_url, base)
-            # Type is sniffed once, here, and written down. Nothing sniffs at
-            # runtime; an unrecognised endpoint is "custom", which works.
-            _save_provider_config(
-                name,
-                {env_key: key, env_url: base,
-                 "ANTHROPIC_API_KEY": key, "ANTHROPIC_BASE_URL": base},
-                provider_type=provider_manager.detect_type(base)
-            )
-            show_info_page('Done', [f'  ✓ {name} configured and active.'])
+
+    provider = provider_manager.Provider(
+        name=spec.label, type='ollama',
+        base_url=provider_manager.OLLAMA_DEFAULT_URL, model=model,
+        env={'ANTHROPIC_BASE_URL': provider_manager.OLLAMA_DEFAULT_URL,
+             'ANTHROPIC_API_KEY': 'ollama'})
+    # Probe now: many local models have no tool support, and the context
+    # window is usually far smaller than the cloud default. Both must be
+    # known before the first turn, not discovered during it.
+    provider.capabilities = provider_manager.probe(provider)
+    provider_manager.save(provider)
+    provider_manager.activate(provider.name)
+    reinit_client()
+    _show_capability_panel(spec, provider)
+    return True
 
 
 def page_configure_zen():

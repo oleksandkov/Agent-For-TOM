@@ -215,10 +215,22 @@ class TestProbe(ConfigTestCase):
             srv.shutdown()
 
     def test_ollama_gets_a_small_default_context(self):
-        """Compaction must respect the real window, not the cloud default."""
+        """Compaction must respect the real window, not the cloud default.
+
+        The number is `OLLAMA_DEFAULT_NUM_CTX`, not a literal. This asserted
+        8192 and had been failing since that constant was introduced: 8192
+        was the old hardcoded guess, and it was *four times too small* for
+        every model on the machine it was measured on — while being stamped
+        `probed=True`, so it outranked every other source in
+        `resolve_context_window`. What matters here is unchanged, and is what
+        the assertion now says: an unreachable Ollama falls back to what the
+        server would actually serve, and that is far below the cloud default.
+        """
         p = pm.Provider(name="O", type="ollama",
                         base_url="http://127.0.0.1:1/v1", model="m")
-        self.assertEqual(pm.probe(p, quick=True).context_window, 8192)
+        window = pm.probe(p, quick=True).context_window
+        self.assertEqual(window, pm.OLLAMA_DEFAULT_NUM_CTX)
+        self.assertLess(window, pm.Capabilities().context_window)
 
 
 # ══════════════════════════════════════════════════════════════════════

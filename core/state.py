@@ -177,6 +177,13 @@ class AgentState:
     # `opencode.ai/zen/v1/models` and answers `401 ModelError: Model
     # ling-3.0-tiny-free is not supported` to every request.
     model_unavailable: bool = False
+    #: Set when the endpoint refused the tool definitions rather than the
+    #: request — a model that exists but will not take tools. The host reads
+    #: it to degrade `tool_use` and retry the turn on the text protocol, the
+    #: same shape as `model_unavailable` above. Reported by the core, acted on
+    #: by the host: the core cannot persist a capability without importing a
+    #: provider config it is deliberately free of.
+    tool_use_rejected: bool = False
 
     # Why the last model call ended ("end_turn", "tool_use", "max_tokens").
     # Set by the streaming path so the caller can treat truncation the same

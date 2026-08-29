@@ -31,24 +31,42 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from core import provider_registry as registry
+
 TOMAS_DIR = Path.home() / ".tomas"
 PROVIDERS_CONFIG_PATH = TOMAS_DIR / "providers.json"
 ENV_FILE = TOMAS_DIR / ".env"
 
 # Types we know how to talk to. "custom" is a first-class answer, not a
 # failure: an unrecognised OpenAI-compatible endpoint should work.
-PROVIDER_TYPES = (
-    "anthropic", "openai", "openrouter", "zen", "google", "ollama", "custom",
-)
+#
+# Derived, not typed. These three tuples and `detect_type` used to be four
+# independent hand-maintained lists, and `groq` was in the menu, the labels,
+# the detect map and the model picker while being absent from every one of
+# them — so `speaks_openai_wire` was False and every Groq call went to the
+# Anthropic SDK. One list now, in core/provider_registry.py, and the six
+# places that used to need teaching read it instead.
+PROVIDER_TYPES = registry.provider_types()
 
-#: The working set for now — Ollama (local + Ollama Cloud, distinguished per
-#: model via `remote_host`, not a separate type) and OpenCode Zen. Every other
-#: provider stays fully wired (PROVIDER_TYPES, PROVIDER_TYPE_TO_DETECT,
-#: PROVIDER_LABELS, detect_type() all stay complete — a hand-edited config
-#: must keep working) but is filtered out of the menus and listings a user
-#: picks from. Temporary and reversible: widen this tuple to bring a provider
-#: back, no other change needed.
-VISIBLE_PROVIDER_TYPES = ("ollama", "zen")
+#: What the menus offer: every spec in the registry.
+#:
+#: This was a hand-maintained tuple, and the honesty it was protecting is now
+#: carried per row by `ProviderSpec.verified` instead. That is a better place
+#: for it. Hiding a provider until someone has a key to prove it with means a
+#: user cannot discover the provider they would need the key *for* — and the
+#: five that were hidden this way were not broken, merely unwitnessed.
+#:
+#: The gate itself still exists and still matters. Every spec passes L0 and
+#: L1 offline before it can appear at all, and a row that has not completed a
+#: live tool round trip says `unverified` on its face. What must never happen
+#: again is a confident label over a provider that cannot make a call — which
+#: is what the OpenAI row was for months, with a yellow disclaimer standing in
+#: for the fix.
+#:
+#: Kept as a name because `agent_cli` and the session menus read it, and a
+#: future working set — a `--only` flag, an enterprise build — has somewhere
+#: to go.
+VISIBLE_PROVIDER_TYPES = registry.provider_types()
 
 # Endpoints that speak OpenAI wire format rather than Anthropic's.
 #: Google is on this list because it publishes an OpenAI-compatible endpoint
@@ -58,7 +76,7 @@ VISIBLE_PROVIDER_TYPES = ("ollama", "zen")
 #: setup page said so in as many words ("Google AI is saved but the agent uses
 #: the ANTHROPIC_* env vars for API calls"), which is a menu entry that leads
 #: nowhere wearing a disclaimer.
-OPENAI_WIRE_TYPES = ("openai", "openrouter", "zen", "google", "ollama", "custom")
+OPENAI_WIRE_TYPES = registry.openai_wire_types()
 
 #: Google's OpenAI-compatible surface. Not the same host path as its native
 #: API (`/v1beta/models`), which is still what `google_model_catalog` reads for
@@ -385,23 +403,13 @@ def detect_type(base_url: str, model: str = "") -> str:
     written to providers.json immediately; nothing reads it back by sniffing
     at runtime. An unknown endpoint is "custom" — a working configuration,
     not a degraded one.
+
+    Matched on **host**, by the registry. The chain that used to live here
+    tested `"openai" in base` and so classified
+    `https://api.groq.com/openai/v1` as OpenAI — a coincidence in Groq's own
+    path deciding a provider's identity.
     """
-    base = (base_url or "").lower()
-    if not base:
-        return "anthropic"
-    if "openrouter" in base:
-        return "openrouter"
-    if "opencode" in base or ":6446" in base:
-        return "zen"
-    if "11434" in base or "ollama" in base:
-        return "ollama"
-    if "api.anthropic.com" in base or "anthropic" in base:
-        return "anthropic"
-    if "generativelanguage" in base or "googleapis" in base:
-        return "google"
-    if "api.openai.com" in base or "openai" in base:
-        return "openai"
-    return "custom"
+    return registry.detect_id(base_url, model)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -410,15 +418,7 @@ def detect_type(base_url: str, model: str = "") -> str:
 
 # Ceilings that are a documented property of the endpoint rather than
 # something worth spending a probe on.
-KNOWN_TOOL_CEILINGS = {
-    "anthropic": 128,
-    "openai": 128,
-    "openrouter": 128,
-    "zen": 32,        # free-tier payload limit, measured
-    "ollama": 64,
-    "google": 128,
-    "custom": 128,
-}
+KNOWN_TOOL_CEILINGS = registry.tool_ceilings()
 
 _PROBE_TIMEOUT = 8
 
@@ -471,8 +471,19 @@ def _headers_for(provider: Provider) -> dict:
         headers.update(provider.extra_headers or {})
         return headers
 
+    # Headers the *endpoint* requires, from its spec. Groq is the reason this
+    # is not optional: behind Cloudflare, a bare `Authorization: Bearer …` to
+    # api.groq.com answers 403 "error code: 1010" — measured — and with a
+    # User-Agent it answers normally. Applied before the key so a probe and a
+    # real call cannot disagree about them, which is the same rule the zen
+    # branch above already follows for its x-opencode-* headers.
+    spec = registry.spec(provider.type)
+    if spec:
+        headers.update(spec.extra_headers)
+
     key = provider.api_key
     if not key:
+        headers.update(provider.extra_headers or {})
         return headers
     if provider.speaks_openai_wire:
         headers["Authorization"] = f"Bearer {key}"
@@ -941,6 +952,24 @@ def probe_and_persist(provider: Provider) -> Capabilities:
     return provider.capabilities
 
 
+def _tool_support_is_unknown(provider: Provider) -> bool:
+    """True when this provider's catalogue cannot say whether the model
+    accepts tools — so the answer has to be measured rather than carried.
+
+    False when the catalogue does say (OpenRouter publishes
+    `supported_parameters`, Zen and Ollama publish a capability list), and
+    false when there is no catalogue at all, because then there is nothing
+    new to learn and a probe would only cost latency.
+    """
+    try:
+        for entry in catalog_for(provider.type):
+            if entry["id"] == provider.model:
+                return not entry["tool_call_known"]
+    except Exception:
+        pass
+    return False
+
+
 def refresh_for_model(provider: Provider) -> Capabilities:
     """Re-measure what changes when the *model* changes, and persist it.
 
@@ -968,6 +997,19 @@ def refresh_for_model(provider: Provider) -> Capabilities:
         # instead of trusting a number measured for a different model.
         fresh.context_window = window or old.context_window
         fresh.probed_at = time.time() if window else 0.0
+
+        # Tool support belongs to the *model* wherever the catalogue cannot
+        # establish it, so carrying the previous model's answer is the same
+        # mistake as carrying its context window. Groq is the case: its
+        # /v1/models has no tool field, and five of its ten chat models
+        # answer `400 "tool calling" is not supported with this model` while
+        # the other five call tools normally. Switching from gpt-oss-120b to
+        # groq/compound would otherwise keep tool_use=True and fail the first
+        # turn. One probe, and only when the catalogue has already said it
+        # does not know.
+        if _tool_support_is_unknown(provider):
+            fresh.tool_use = _probe_feature(provider, with_tools=True)
+            fresh.parallel_tool_calls = fresh.tool_use
     fresh.max_tools = old.max_tools
     provider.capabilities = fresh
     persist_capabilities(provider)
@@ -1235,3 +1277,283 @@ def ollama_catalog(base_url: str = "") -> list[dict]:
             "params": details.get("parameter_size") or "",
         })
     return out
+
+
+def openrouter_catalog(api_key: str = "") -> list[dict]:
+    """Every model OpenRouter serves, with price, window and tool support.
+
+    This function was *called* by `agent_cli._provider_model_entries` and
+    `_format_openrouter_entries` and did not exist — opening the OpenRouter
+    model picker raised AttributeError inside `net_probe.cached`. It lives
+    here rather than in the TUI because the free-model pool needs the same
+    answer and neither should have its own copy.
+
+    The listing is public: no key is needed to read it, so the picker works
+    before a key is entered. Measured 2026-08-29: 396 models, 21 free by
+    price, 18 of those able to call tools.
+
+    **Free is `pricing.prompt == 0 and pricing.completion == 0`, never the
+    `:free` suffix.** The suffix is usually right on OpenRouter, and that is
+    exactly what makes trusting it dangerous — `zen_catalog` already carries
+    this scar, where a first-run path announced the free tier and then
+    selected a model that bills. Prices arrive as decimal *strings*
+    ("0.000000834"), so they are compared as floats, never as text.
+    """
+    headers = {"Content-Type": "application/json"}
+    spec = registry.spec("openrouter")
+    if spec:
+        headers.update(spec.extra_headers)
+    key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    try:
+        data = _get_json("https://openrouter.ai/api/v1/models", headers,
+                         timeout=_PROBE_TIMEOUT)
+    except Exception:
+        return []
+
+    def _price(entry: dict, field_name: str) -> float:
+        raw = (entry.get("pricing") or {}).get(field_name)
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            # No price is not a price of zero. An entry whose cost cannot be
+            # established must never reach a free pool, so it is reported as
+            # expensive rather than as unknown.
+            return float("inf")
+
+    out: list[dict] = []
+    for entry in (data or {}).get("data") or []:
+        model_id = entry.get("id")
+        if not model_id:
+            continue
+        arch = entry.get("architecture") or {}
+        params = entry.get("supported_parameters") or []
+        prompt_cost = _price(entry, "prompt")
+        completion_cost = _price(entry, "completion")
+        priced = prompt_cost != float("inf") and completion_cost != float("inf")
+        out.append({
+            # `id`, `tool_call` and the two cost fields are the shape
+            # `agent_cli._format_openrouter_entries` already documents and
+            # renders. It was written against this function before this
+            # function existed, so its expectations are the specification.
+            "id": model_id,
+            "name": model_id,
+            "label": entry.get("name") or model_id,
+            "context_window": int(entry.get("context_length") or 0),
+            "priced": priced,
+            "free": priced and prompt_cost == 0.0 and completion_cost == 0.0,
+            "prompt_cost": prompt_cost if priced else 0.0,
+            "completion_cost": completion_cost if priced else 0.0,
+            "tool_call": "tools" in params,
+            "vision": "image" in (arch.get("input_modalities") or []),
+        })
+    out.sort(key=lambda m: (not m["free"], -m["context_window"], m["id"]))
+    return out
+
+
+#: Groq output modalities that mean "this is a chat model". Its `/v1/models`
+#: lists transcription and speech models alongside the chat ones, and a picker
+#: offering `whisper-large-v3` as an agent model is an entry that fails on use
+#: — the same defect as offering an embedding model for Google, which
+#: `google_model_catalog` already filters out via `generateContent`.
+_GROQ_CHAT_OUTPUTS = ("text",)
+
+
+def groq_catalog(api_key: str = "") -> list[dict]:
+    """Every Groq model this key can call, with its real window.
+
+    Two facts the generic `/v1/models` path could not have known, both
+    measured against the live endpoint on 2026-08-29:
+
+    Groq is behind Cloudflare and answers a bare `Authorization: Bearer …`
+    with `403 error code: 1010` — the same block Zen sits behind. With a
+    User-Agent it answers. That header is carried in the spec's
+    `extra_headers`, so the probe and the real call cannot disagree about it.
+
+    Its listing is *richer* than OpenAI's: `context_window`,
+    `max_completion_tokens` and `input_modalities` all come back, so the
+    window and vision support are read rather than assumed.
+
+    Unlike OpenRouter and Zen it publishes no pricing at all — every model on
+    the account is reachable the same way — so there is no `free` field here.
+    Whether these cost anything is a property of the account, which is what
+    `ProviderSpec.free_tier` records.
+    """
+    key = api_key or os.environ.get("GROQ_API_KEY", "")
+    if not key:
+        return []
+    spec = registry.spec("groq")
+    headers = {"Content-Type": "application/json",
+               "Authorization": f"Bearer {key}"}
+    if spec:
+        headers.update(spec.extra_headers)
+    base = spec.base_url if spec else "https://api.groq.com/openai/v1"
+    try:
+        data = _get_json(f"{base}/models", headers, timeout=_PROBE_TIMEOUT)
+    except Exception:
+        return []
+
+    out: list[dict] = []
+    for entry in (data or {}).get("data") or []:
+        model_id = entry.get("id")
+        if not model_id or entry.get("active") is False:
+            continue
+        outputs = entry.get("output_modalities") or ["text"]
+        if not any(o in _GROQ_CHAT_OUTPUTS for o in outputs):
+            continue
+        inputs = entry.get("input_modalities") or ["text"]
+        out.append({
+            "id": model_id,
+            "name": model_id,
+            "label": model_id,
+            "context_window": int(entry.get("context_window")
+                                  or entry.get("context_length") or 0),
+            "max_output": int(entry.get("max_completion_tokens") or 0),
+            "vision": "image" in inputs,
+            # Groq's listing carries no tool field, and it is not a detail
+            # that can be assumed either way. Measured across all ten chat
+            # models on 2026-08-29: five call tools, and five answer
+            # `400 "tool calling" is not supported with this model` —
+            # groq/compound and compound-mini (they run their own tools),
+            # allam-2-7b, and both llama-prompt-guard classifiers. Claiming
+            # support here would put a model that cannot drive the agent at
+            # the top of a free pool. `probe()` settles it per model and
+            # persists the answer; until then it is unknown, not true.
+            "tool_call_known": False,
+        })
+    out.sort(key=lambda m: (-m["context_window"], m["id"]))
+    return out
+
+
+def zen_model_catalog(api_key: str = "") -> list[dict]:
+    """`zen_catalog` in the shape every other fetcher returns."""
+    try:
+        import zen_catalog
+    except Exception:
+        return []
+    return [{"name": m.id, "label": m.label, "context_window": m.context,
+             "priced": True, "free": m.free, "tools": m.tool_call,
+             "vision": m.vision, "served": m.served}
+            for m in zen_catalog.catalog().models]
+
+
+def _openai_list_catalog(api_key: str = "") -> list[dict]:
+    """Generic `/v1/models` for endpoints with nothing richer to offer.
+
+    Deliberately thin: ids and nothing else. An endpoint that reports only ids
+    genuinely knows only ids, and inventing a context window here is how
+    `MODEL_CONTEXT_MAP` got its wrong numbers.
+    """
+    provider = get_active()
+    if provider is None:
+        return []
+    return [{"name": m, "label": m, "context_window": 0}
+            for m in list_models(provider)]
+
+
+def _static_catalog(api_key: str = "") -> list[dict]:
+    """The spec's own list, for endpoints that publish no listing."""
+    provider = get_active()
+    spec = registry.spec(provider.type) if provider else None
+    if spec is None:
+        return []
+    return [{"name": m, "label": m, "context_window": 0}
+            for m in spec.static_models]
+
+
+def _ollama_list_catalog(api_key: str = "") -> list[dict]:
+    return ollama_catalog()
+
+
+#: `ProviderSpec.models` names one of these. Resolved here rather than in the
+#: registry because the registry is pure and these make network calls — and
+#: resolved by name *at import* rather than by getattr at menu time, so a spec
+#: naming a fetcher that does not exist is a startup failure instead of an
+#: AttributeError the user meets on opening a menu. Which is precisely how the
+#: missing `openrouter_catalog` stayed missing.
+CATALOG_FETCHERS = {
+    "openai_list": _openai_list_catalog,
+    "static": _static_catalog,
+    "zen_catalog": zen_model_catalog,
+    "google_catalog": google_model_catalog,
+    "groq_catalog": groq_catalog,
+    "openrouter_catalog": openrouter_catalog,
+    "ollama_catalog": _ollama_list_catalog,
+}
+
+
+#: What `catalog_for` guarantees, whatever the fetcher underneath returned.
+#:
+#: The fetchers keep their own shapes on purpose — `google_model_catalog` and
+#: `ollama_catalog` have callers in the TUI that read `name`, and
+#: `openrouter_catalog` has one that reads `id`, `tool_call` and the cost
+#: fields. Normalising *here* rather than rewriting them means the existing
+#: pickers keep working while everything new — the free pool above all — has
+#: one shape to read.
+#:
+#: `priced` and `tool_call_known` are not decoration. Each separates "the
+#: catalogue says no" from "the catalogue does not say", and the free pool
+#: must never collapse the two: an unknown price is not zero, and an unknown
+#: tool capability is not support.
+#:
+#: Both distinctions were paid for. Groq's listing has no tool field, so
+#: defaulting `tool_call` to True picked `groq/compound` as its best model and
+#: the round trip died on `400 "tool calling" is not supported with this
+#: model`. Five of its ten chat models answer that way.
+CANONICAL_CATALOG_KEYS = ("id", "label", "context_window", "priced", "free",
+                          "tool_call", "tool_call_known", "vision")
+
+
+def _normalise_catalog_entry(entry: dict, spec) -> dict:
+    model_id = entry.get("id") or entry.get("name") or ""
+    priced = entry.get("priced")
+    if priced is None:
+        # A catalogue that publishes no prices at all — Groq, Ollama — has not
+        # said the model is free, it has said nothing. The account-level fact
+        # is `spec.free_tier`, and that is what the pool weighs; it is not the
+        # same evidence as a published zero and is not recorded as if it were.
+        priced = False
+    free = entry.get("free")
+    if free is None:
+        free = bool(spec.free_tier) and not priced
+
+    # "The catalogue did not say" is its own answer. `tool_call` still gets an
+    # optimistic value so a picker has something to show, but `tool_call_known`
+    # is what anything making a decision must read — the free pool admits on
+    # established support, never on this default.
+    raw_tools = entry.get("tool_call", entry.get("tools"))
+    known = entry.get("tool_call_known")
+    if known is None:
+        known = raw_tools is not None
+    return {
+        "id": model_id,
+        "label": entry.get("label") or model_id,
+        "context_window": int(entry.get("context_window") or 0),
+        "priced": bool(priced),
+        "free": bool(free),
+        "tool_call": bool(raw_tools) if raw_tools is not None else True,
+        "tool_call_known": bool(known),
+        "vision": bool(entry.get("vision", False)),
+    }
+
+
+def catalog_for(provider_id: str, api_key: str = "") -> list[dict]:
+    """The model catalogue for one provider id, in CANONICAL_CATALOG_KEYS.
+
+    Never raises: a menu being drawn must not die because an endpoint is
+    down. An empty list is the caller's cue to say so — which is a gap the
+    user can see, rather than a traceback.
+    """
+    spec = registry.spec(provider_id)
+    if spec is None:
+        return []
+    fetcher = CATALOG_FETCHERS.get(spec.models)
+    if fetcher is None:
+        return []
+    try:
+        raw = fetcher(api_key) or []
+    except Exception:
+        return []
+    return [_normalise_catalog_entry(e, spec) for e in raw
+            if isinstance(e, dict) and (e.get("id") or e.get("name"))]

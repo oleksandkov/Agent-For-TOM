@@ -693,7 +693,15 @@ def build_from_active():
     if provider is None or not provider.speaks_openai_wire:
         return None
     base = provider.base_url or os.environ.get("ANTHROPIC_BASE_URL", "")
-    headers = dict(provider.extra_headers or {})
+    # Spec headers first, the provider's own overrides on top. Without this a
+    # Groq provider probes fine (`_headers_for` reads the spec) and then 403s
+    # on every real call, because Cloudflare wants a User-Agent and only the
+    # probe was sending one — exactly the probe/runtime split `probe_base_url`
+    # exists to prevent for zen.
+    from core import provider_registry as _registry
+    spec = _registry.spec(provider.type)
+    headers = dict(spec.extra_headers) if spec else {}
+    headers.update(provider.extra_headers or {})
     # Ask the provider for its key rather than reaching for ANTHROPIC_API_KEY.
     # `api_key_env` is a configurable field, and hardcoding the Anthropic name
     # here meant any provider that set it — OPENROUTER_API_KEY, say — probed

@@ -773,6 +773,38 @@ def is_model_unavailable(err: Exception) -> bool:
     return any(marker in low for marker in _MODEL_GONE_MARKERS)
 
 
+#: An upstream saying "this model exists, but not with tools". Measured
+#: against Groq on 2026-08-29, across all ten of its chat models: five answer
+#: `400 {"error":{"message":"`tool calling` is not supported with this
+#: model","param":"tool calling"}}` — groq/compound and compound-mini (which
+#: run their own tools internally), allam-2-7b, and both llama-prompt-guard
+#: classifiers. Its `/v1/models` carries no tool field, so this 400 is the
+#: only place the fact is stated.
+_NO_TOOLS_MARKERS = (
+    "tool calling` is not supported",
+    "tool calling is not supported",
+    "does not support tools",
+    "does not support tool use",
+    "tools are not supported",
+    "tool_choice is not supported",
+    "function calling is not supported",
+)
+
+
+def is_tool_use_rejected(err: Exception) -> bool:
+    """True when the endpoint refused the *tools*, not the request.
+
+    Worth its own branch for the reason `is_model_unavailable` is: the
+    generic 4xx advice ("the provider rejected the request itself … usually
+    that is a payload too large, try /compact") is actively wrong here, and
+    the condition is recoverable — the agent has a text tool protocol for
+    exactly this model. So it degrades and retries rather than ending the
+    turn, and `degrade_capability` remembers, so the discovery is paid once.
+    """
+    low = str(err).lower()
+    return any(marker in low for marker in _NO_TOOLS_MARKERS)
+
+
 def _model_unavailable_error(err: Exception) -> ErrorOccurred:
     """Name the one failure a user can fix in one keystroke.
 
@@ -787,6 +819,23 @@ def _model_unavailable_error(err: Exception) -> ErrorOccurred:
         "This model is listed by the provider but is not currently being "
         "served, so every request to it fails the same way — it is not "
         "something retrying or compacting can fix. Pick another with /model. "
+        f"Upstream said: {_upstream_excerpt(err)}",
+        detail=str(err), recoverable=False)
+
+
+def _tool_use_rejected_error(err: Exception) -> ErrorOccurred:
+    """Name the refusal as being about tools, and say what happens next.
+
+    The generic 4xx message would send the user to /compact over a payload
+    that was never the problem — the same wrong advice `is_model_unavailable`
+    exists to prevent. The host degrades `tool_use` and retries this turn on
+    the text protocol, so this is a notice about a reduced mode, not a dead
+    end.
+    """
+    return ErrorOccurred(
+        "This model does not accept tool definitions, so the turn is being "
+        "retried using the text tool protocol instead. It is slower and less "
+        "reliable — /model will offer one that calls tools natively. "
         f"Upstream said: {_upstream_excerpt(err)}",
         detail=str(err), recoverable=False)
 
@@ -1044,6 +1093,17 @@ def _model_call(state: AgentState) -> Iterator[AgentEvent]:
             # Checked before the retryable test on purpose: a missing model is
             # reported as a 503 by some gateways, which `is_retryable_error`
             # reads as a blip and burns the whole 5/10/20s ladder on.
+            # Most specific first, and this one really is more specific:
+            # `_MODEL_GONE_MARKERS` contains "is not supported", which the
+            # Groq refusal ("`tool calling` is not supported with this model")
+            # matches — so ordered the other way round, a model that merely
+            # will not take tools is reported as one the provider does not
+            # serve, and the user is told to pick another instead of being
+            # dropped to the text protocol that would have worked.
+            if is_tool_use_rejected(e):
+                state.tool_use_rejected = True
+                yield fail(_tool_use_rejected_error(e))
+                return None
             if is_model_unavailable(e):
                 state.model_unavailable = True
                 yield fail(_model_unavailable_error(e))
@@ -1071,6 +1131,17 @@ def _model_call(state: AgentState) -> Iterator[AgentEvent]:
             # could send it round the retry ladder.
             if is_endpoint_unreachable(e):
                 yield fail(_endpoint_unreachable_error(e, state))
+                return None
+            # Most specific first, and this one really is more specific:
+            # `_MODEL_GONE_MARKERS` contains "is not supported", which the
+            # Groq refusal ("`tool calling` is not supported with this model")
+            # matches — so ordered the other way round, a model that merely
+            # will not take tools is reported as one the provider does not
+            # serve, and the user is told to pick another instead of being
+            # dropped to the text protocol that would have worked.
+            if is_tool_use_rejected(e):
+                state.tool_use_rejected = True
+                yield fail(_tool_use_rejected_error(e))
                 return None
             if is_model_unavailable(e):
                 state.model_unavailable = True
@@ -1602,11 +1673,20 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                 # thing. A model the provider does not serve is the second:
                 # without this it also gets recorded as "this provider cannot
                 # stream", which is a lie that outlives the model switch.
-                if is_quota_error(e) or is_model_unavailable(e):
-                    if is_model_unavailable(e):
+                if (is_quota_error(e) or is_model_unavailable(e)
+                        or is_tool_use_rejected(e)):
+                    # Same precedence as the two branches above: the tool
+                    # refusal is tested first because "is not supported" is
+                    # also a `_MODEL_GONE_MARKERS` entry, and it is the more
+                    # specific of the two readings.
+                    if is_tool_use_rejected(e):
+                        state.tool_use_rejected = True
+                        event = _tool_use_rejected_error(e)
+                    elif is_model_unavailable(e):
                         state.model_unavailable = True
-                    event = (_model_unavailable_error(e)
-                             if is_model_unavailable(e) else _quota_error(e))
+                        event = _model_unavailable_error(e)
+                    else:
+                        event = _quota_error(e)
                     state.last_error = event.detail or event.message
                     yield event
                     # Same rule as the failed-retry path below: a discarded

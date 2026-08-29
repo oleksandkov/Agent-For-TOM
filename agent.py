@@ -5718,6 +5718,21 @@ def agent_loop(system_prompt: str, messages: list) -> str:
         # already gathered — tool results included — is still there to retry
         # with. One bounded attempt, never a chain: this is a fallback, not a
         # search.
+        # A model that exists but refuses tool definitions. The agent already
+        # has a protocol for that — it just had never been reached this way,
+        # because the refusal arrived as an unclassified 4xx and ended the
+        # turn. Degrading first means the retry is on the text protocol, and
+        # `degrade_capability` persists it, so the next session starts already
+        # knowing. Measured on Groq: five of its ten chat models answer
+        # `400 "tool calling" is not supported with this model`.
+        if not (reply or "").strip() and getattr(state, "tool_use_rejected", False):
+            degrade_capability("tool_use", "rejected the tool definitions")
+            print(f'  {YELLOW}⟳{RESET} {DIM}retrying with the text tool '
+                  f'protocol …{RESET}')
+            state = build_state(system_prompt, messages, adapter)
+            reply = adapter.run(state)
+            reply = _run_text_protocol(state, adapter, reply, messages)
+
         if not (reply or "").strip() and getattr(state, "model_unavailable", False):
             fallback_model = _try_zen_fallback(state.last_error or "")
             if fallback_model:
