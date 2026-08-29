@@ -3,22 +3,25 @@ name: document-style-match
 description: Reproduce an example document's exact layout and text formatting when the user provides a PDF or DOCX file as a sample and asks for a similar document with new content.
 triggers: ["зроби схожий", "схожий файл", "схожий", "подібний файл", "подібний", "такий же", "збережи форматування", "зберегти форматування", "зберіг форматування", "форматування тексту", "форматування", "таке саме форматування", "як приклад", "візьми як приклад", "проаналізуй файл", "проаналізуй", "по типу", "як цей", "як у прикладі", "за зразком", "на основі", "шаблон", "зразок", "приклад", "методичні вказівки", "методичка", "лабораторну", "лабораторна робота", "like this", "same style", "match formatting", "preserve formatting", "document template", "as an example"]
 skip_when: the user is asking about, reviewing, summarising or advising on a document rather than asking for one to be produced. Words like "проаналізуй"/"приклад"/"форматування" retrieve this skill, and most of the time they appear in a question, not an order.
+tools: [run_command, read_file, write_file, edit_file, list_files, ask_user_question]
 source: bundled
-version: 19
+version: 20
 ---
 # Matching an Example Document
 
-Content changes, formatting does not. **Two commands do the whole job:**
+Content changes, formatting does not. **Two commands do the whole job**, and
+they are the same two whether the sample is a PDF or a DOCX:
 
 ```
 python skills/document-style-match/run.py measure "<sample>" <name>
-python skills/document-style-match/run.py build   "<sample>" <name> <name>_content_plan.json "<output.docx>"
+python skills/document-style-match/run.py build   "<sample>" <name> <texts.json> "<output.docx>"
 ```
 
-`build` runs the shape check, the render, the PDF conversion and all three
-verifications, and prints one line: `VERDICT: PASS` or `VERDICT: FAIL` with
-what to fix. On a pass it deletes its own scaffolding. **Do not assemble the
-steps by hand, and never report a document `build` has not passed.**
+`measure` writes a `texts.json` you fill in. `build` renders it, converts it,
+runs every check, and prints one line: `VERDICT: PASS`, or `VERDICT: FAIL`
+**naming the blocks to change**. Fix what it names and re-run the same
+command. **Do not assemble the steps by hand, and never report a document
+`build` has not passed.**
 
 Assembling the steps by hand is how the one measured session that ignored this
 skill shipped a US-Letter document at 1.15 line spacing with its headings
@@ -31,51 +34,15 @@ flush left, and called it "looks great".
 1. **Never read the sample with `read_file`, `search_code` or a markdown
    converter.** They return text. Every defect this skill prevents lives in
    what they drop: page size, margins, spacing, alignment, weight.
-2. **Never take a previous output as the reference.** Not `tests/*/v6/`, not
-   your own last attempt. One run copied the shape of its own earlier output
-   and inherited every defect in it. The reference is the file the user
-   pointed at, and nothing else.
+2. **Never take a previous output as the reference, and never edit the sample
+   to make it easier to copy.** The reference is the file the user pointed at.
+   If the sample carries something you need gone — equations from the old
+   topic — say so in the edit file (`drop_math`), do not doctor the sample.
 3. **Reach a `VERDICT: PASS` first, then improve the prose.** A short plan
-   that passes beats a long one that never renders. Two of three sessions
-   built the whole generator up front and ended with no deliverable. A turn
-   is 1200s / 40 calls.
-4. **Research is bounded, and comes after the first PASS.** One session
-   re-researched the same names 25 times and generated nothing; another spent
-   five of nineteen calls on the web and died before the first render.
-   **Look inside the sample first** — a methodichka names its own authors in
-   its literature list, and one run went to the web for that, picked the
-   wrong department, and contradicted the document it was copying.
-
----
-
-## The block schema
-
-Read this instead of the scripts — sessions spend ~11k tokens on their
-source otherwise.
-
-```jsonc
-{"text": "…", "align": "justify"|"center"|"left"|"right",
- "bold": true, "size_pt": 14.0, "indent_cm": 1.25,
- "source_index": 12,          // position in the structure — carry it through
- "page_break_before": true,   // optional
- "style_name": "Heading 1",   // optional, a real Word style
- "list_id": 3, "list_level": 0}   // optional, numbering restarts per list_id
-{"kind": "spacer"}                    // empty paragraph = the vertical rhythm
-{"kind": "table", "rows": [["a","b"], …]}
-```
-
-- **Indices are 0-based into `blocks`**, not `read_file`'s line numbers.
-  Hand-subtracting the JSON header cost two sessions their turn. Enumerate
-  in code, or use `source_index`.
-- **`indent_cm: 0.0` means flush left** and is honoured. Never write `0.001`
-  to defeat a fallback — that turned indentation off for a whole document.
-  Only an *absent* `indent_cm` falls back.
-- **A spacer has no `text`.** Check `kind` before reading `b["text"]`.
-- **A block is a paragraph, not a line.** `target_chars` is how much text it
-  held; write about that much. A block given one sentence where the sample
-  had five ends on a half-empty line, and a page of those reads broken.
-- **`align` and `bold` are the answer, not decoration** — what a reader
-  checks first. Carry them through from the structure unchanged.
+   that passes beats a long one that never renders. A turn is 1200s / 40 calls.
+4. **Do not read this skill's scripts.** Every failure names the block to
+   change and the direction to change it. A session that read all six spent
+   27k tokens to learn what the message already said.
 
 ---
 
@@ -85,108 +52,98 @@ source otherwise.
 python skills/document-style-match/run.py measure "<sample>" <name>
 ```
 
-Writes `<name>_style_contract.json` (~2 KB — page size, margins, fonts,
-`line_spacing`, `body_indent_cm`, `style_signatures`) and
-`<name>_structure.json` (the blocks). The contract is printed; **read it and
-state it in one line**: `A4 21.0×29.7cm, Times New Roman, body 14pt, title
-20pt, margins 2.35/2.1/2.0/2.0cm.`
+Prints the contract in one line — **quote it back**, e.g. `A4 21.0×29.7cm ·
+Times New Roman · body 14pt · title 20pt · margins 2.35/2.1/2/2cm`. Writes
+everything into `.dsm/<name>/`, which is kept between runs; measuring the same
+sample twice costs nothing.
 
-If it prints a `page_window` NOTE, only part of the sample was opened. List
-the rest of its sections before building the plan:
+If it prints `NOTE: only part of the sample was opened`, name in your final
+answer every section of the sample your document does not contain. Not a
+choice: three of three runs read this field, said nothing, and shipped a
+document missing those sections.
 
-```
-python -c "import pymupdf;d=pymupdf.open(r'<sample.pdf>');print(chr(10).join(l for p in d for l in p.get_text().splitlines() if l.strip() and l.strip()==l.strip().upper())[:3000])"
-```
+## Step 2 — fill in `texts.json`
 
-Then name, in your final answer, every section of the sample your document
-does not contain. Not a choice: three of three runs read this field, said
-nothing, and shipped a document missing those sections.
-
-Spacers and breaks are *inferred* from geometry — say so, then stop
-researching the sample.
-
-## Step 2 — write the plan
-
-**Route B (PDF sample) — `<name>_content_plan.json`:** load
-`<name>_structure.json`'s `blocks`, replace each `"text"`, keep everything
-else — **including `source_index`, `align` and `bold`** — and honour
-`target_chars`. Do not author from scratch: one such run gave 57 blocks
-against 400 with no tables or headings. For a long sample write a generator;
-a 1599-block literal cost one session 29k tokens.
-
-**Route A (DOCX sample) — `<name>_edits.json` instead**, and `run.py build`
-picks it automatically from the `.docx` suffix. Rebuilding a DOCX reproduces
-only what a contract describes: on a real coursework it kept 57 of 400 blocks
-and lost **all 4 tables, all 22 heading styles and 2 of 3 sections** while
-passing every style check. Copying loses none. List the blocks with
-`edit_copy.py --list "<sample.docx>" [start] [count]`, then key the edits by
-those indices — only listed blocks change:
+`measure` leaves `.dsm/<name>/texts.json` (a PDF sample) or `edits.json` (a
+DOCX one) already in the right shape — **one entry per block, values only:**
 
 ```json
-{ "9": "Ілон Маск",
-  "11": ["Мета роботи - ", "новий текст"],
+{ "15": "ЛАБОРАТОРНА РОБОТА №7",
+  "19": ["Мета роботи - ", "новий текст"],
+  "23": {"text": "новий текст", "drop_math": true},
+  "31": {"rows": [["Варіант", "Тема"], ["1", "…"]]},
   "12": null,
-  "31": {"rows": [["ВСТУП", "4"]]} }
+  "__insert__": [{"after": 49, "blocks": [
+      {"kind": "spacer"},
+      {"text": "Варіанти", "align": "center", "bold": true, "size_pt": 14.0},
+      "1. Розпізнавання продуктів за фотографією."]}] }
 ```
 
-string = replace text · list = one entry per run (keeps a bold label bold)
-· `null` = delete · `{"rows": …}` = table cell text.
+string = replace the text · list = one entry per run, so a bold label stays a
+bold label · `null` = delete the block · `{"rows": …}` = table cells ·
+`{"…", "drop_math": true}` = replace the text *and* remove the equations this
+paragraph carries · `"__doc__": {"drop_math": true}` = remove them everywhere.
 
-**A label plus its own text is one line, not a heading.** The sample has
-`"Мета роботи"` bold, inline, justified — not a heading with the
-description below it.
+- **Keys are block indices**, 0-based, as `measure` wrote them. Not line
+  numbers in the file.
+- **A `<<TODO: N chars…>>` value is refused by `build`.** N is how much text
+  the sample had there; write about that much. A block given one sentence
+  where the sample had five ends on a half-empty line, and a page of those
+  reads broken.
+- **A `CARRIES n math` note means replacing the text leaves the equations
+  behind.** Keep them or `drop_math` them; both are defensible, saying
+  nothing is not.
+- **`The link text lives outside the runs`** — end your replacement where the
+  hyperlink begins (`"…, e-mail: "`), and the address survives.
+- **A label plus its own text is one line, not a heading.** The sample has
+  `"Мета роботи"` bold, inline, justified — not a heading with the
+  description below it.
+- In `__insert__`, a plain string inherits the anchor block's formatting; a
+  block object states its own.
 
 ## Step 3 — `build`
 
 ```
-python skills/document-style-match/run.py build "<sample>" <name> <plan> "<output.docx>"
+python skills/document-style-match/run.py build "<sample>" <name> <texts.json> "<output.docx>"
 ```
 
-Add `--pdf <path>` if you converted separately, `--keep` to keep the working
-files on a pass. It stops at the first step whose failure makes the next one
-meaningless, so fix what it names and re-run the same command.
+`--pdf <path>` if you converted separately. It stops at the first step whose
+failure makes the next one meaningless, so fix what it names and re-run the
+same command.
 
 ---
 
 ## Reading a failure
 
-| Check | Passes when | If it fails |
-|---|---|---|
-| `check_plan` | blocks ≥ 50 % of sample; each category (spacers, tables, breaks, headings, lists) ≥ 50 %; ≥ 80 % of plan blocks carry a `source_index`; total text within ±35 % of the summed `target_chars` | the plan was authored, not adapted — start again from the structure's blocks |
-| `verify_docx` | every contract field within ±0.05 cm / ±0.5 pt, **and** the sample's formatting vocabulary survived | a scalar mismatch means the generator ignored the contract for that field |
-| `verify_pdf` | no page-1 block narrower than 15 pt (collapsed text) | the font size never reached the run |
-| `verify_render` | split-line rate ≤ 1.5× the sample's; blank lines per 100 rows ≥ 55 % of the sample's; characters per row within ±30 %; line pitch within ±12 % | see below |
+Every failure is already specific — it names blocks, counts and a direction.
+Act on the line, not on this table.
 
-**`formatting lost` / `formatting invented`** — the reader-visible one.
-`verify_docx` compares the *share* of each `(align, bold, size, indent)`
-combination against the sample's. Measured on one real pair:
+| Check | Passes when |
+|---|---|
+| `check_plan` | blocks ≥ 50 % of the sample; each category (spacers, tables, breaks, headings, lists) ≥ 50 %; ≥ 80 % of paragraphs use a formatting combination the sample has; total text within ±35 % of the summed `target_chars` |
+| `verify_docx` | every contract field within ±0.05 cm / ±0.5 pt, **and** the sample's formatting vocabulary survived |
+| `verify_pdf` | no page-1 block narrower than 15 pt (collapsed text) |
+| `verify_render` | stretched-line rate ≤ 1.5× the sample's; blank lines per 100 rows ≥ 55 % of the sample's; characters per row within ±30 %; line pitch within ±12 % |
 
-```
-center+bold 20.0pt   7.3%  ->   absent   (title style gone)
-center+bold 14.0pt  12.2%  ->     1.6%   (headings no longer centered)
-left+bold   14.0pt  absent ->     6.3%   (what they became instead)
-```
+Two of these say something worth repeating:
 
-Fix it in the plan — the blocks kept their text and lost their `align`/`bold`.
+**`formatting lost` / `formatting invented`** is the reader-visible one — the
+blocks kept their text and lost their `align`/`bold`. Filling `texts.json`
+cannot cause it; hand-writing a plan can.
 
-**`line pitch`** — rendered line spacing. python-docx defaults to 1.15 and
-writes nothing unless told; against a 1.5 sample that measures 18.60 against
-24.12, and every other check passes it.
+**`stretched lines`** is justification opening the word gaps because a
+paragraph ends on a partly-filled line. It names each offending row, the block
+it came from, and whether to lengthen, trim or reword. Swapping renderers
+cannot move it — one session tried reportlab and Word COM in turn and got the
+same number both times. Table rows and hyperlinks are *not* counted here; they
+are reported separately as column merges.
 
-**`stretched lines`** — justification is opening up the word gaps because a
-paragraph ends on a half-filled line. **Fix the text, not the renderer.**
-Give the short blocks more prose, up to their `target_chars`. Every PDF
-converter splits an over-stretched line; one session spent *half its turn*
-disproving that — it tried reportlab, then Word COM, got the same number both
-times, and shipped a final report explaining it away as a converter artifact.
-It was not one.
-
-**`NOT checked: …`** is part of the result. Say it out loud.
+**`NOT checked: …`** and any `NOTE:` line are part of the result. Say them out
+loud.
 
 ## Reporting
 
-State the contract, flag what was assumed, name anything `NOT checked`, name
-any section of the sample you could not reproduce, and quote the `VERDICT:
-PASS` line. Never "looks similar" — that phrase, in a measured session,
-described a document on the wrong paper size. A referenced figure keeps its
-caption.
+State the contract, flag what was assumed, name anything `NOT checked` or
+`NOTE:`-d, name any section of the sample you could not reproduce, and quote
+the `VERDICT: PASS` line. Never "looks similar" — that phrase, in a measured
+session, described a document on the wrong paper size.

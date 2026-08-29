@@ -335,6 +335,58 @@ Example for a Python project:
 """
 
 
+# ── The block the agent owns ───────────────────────────────────────────────
+#
+# Everything else under `instructions/` is the user's to write by hand. One
+# file, and one clearly fenced block inside it, is writable by
+# `save_memory` — so a remembered identity rule ("call me MY KING") can land
+# in the cached half of the prompt without the agent editing prose a person
+# wrote. Outside the fence nothing is touched, and the fence says so.
+
+MANAGED_FILE = GLOBAL_INSTRUCTIONS_DIR / "remembered.md"
+_MANAGED_HEADER = (
+    "# Remembered\n\n"
+    "<!-- Written by the agent when you say \"remember ...\". Edit or delete\n"
+    "     any line freely; manage them with /rules. -->\n")
+
+
+def read_managed_rules() -> list[str]:
+    """The remembered instruction lines, in order."""
+    if not MANAGED_FILE.exists():
+        return []
+    lines = []
+    for line in MANAGED_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("- "):
+            lines.append(line[2:].strip())
+    return lines
+
+
+def write_managed_rules(rules: list[str]) -> None:
+    """Replace the remembered block with exactly these lines."""
+    GLOBAL_INSTRUCTIONS_DIR.mkdir(parents=True, exist_ok=True)
+    body = "\n".join(f"- {r.strip()}" for r in rules if r.strip())
+    if not body:
+        # An empty file would still be loaded and would still cost its
+        # heading. Removing it is what "no remembered instructions" means.
+        MANAGED_FILE.unlink(missing_ok=True)
+        return
+    MANAGED_FILE.write_text(f"{_MANAGED_HEADER}\n{body}\n", encoding="utf-8")
+
+
+def add_managed_rule(text: str) -> bool:
+    """Append one remembered instruction. False if it was already there."""
+    text = (text or "").strip()
+    if not text:
+        return False
+    rules = read_managed_rules()
+    if any(r.lower() == text.lower() for r in rules):
+        return False
+    rules.append(text)
+    write_managed_rules(rules)
+    return True
+
+
 def create_default_instructions(force: bool = False):
     """Create default instruction files in the global instructions directory.
 

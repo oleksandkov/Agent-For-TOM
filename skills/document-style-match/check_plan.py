@@ -48,11 +48,19 @@ def _blocks_of(payload):
     return payload["blocks"] if isinstance(payload, dict) else payload
 
 
-# Share of a plan's blocks that must carry a `source_index` pointing at a real
-# block of the structure. Not 100%: inserting a few genuinely new blocks (a
-# teacher line on the title page, an extra control question) is legitimate and
-# expected. Losing the provenance of nearly all of them is not.
+# Share of a plan's paragraphs whose formatting must be one the sample
+# actually uses. Not 100%: inserting a few genuinely new blocks (a teacher
+# line on the title page, an extra control question) is legitimate and
+# expected. Losing the sample's formatting vocabulary wholesale is not.
 MIN_TRACEABLE_RATIO = 0.8
+
+
+def _fingerprint(block: dict) -> tuple:
+    """The four fields a reader checks first, as a comparable key."""
+    return (block.get("align"), bool(block.get("bold")),
+            block.get("size_pt"),
+            round(block["indent_cm"], 2) if block.get("indent_cm") is not None
+            else None)
 
 # How far a plan's total text volume may sit from the sample's. Generous on
 # purpose — a new topic is not the same length as the old one — but a plan at
@@ -113,22 +121,51 @@ def _traceability(sample_blocks, plan_blocks) -> str | None:
     A structure written before this field existed has none to check, and
     silence is the right answer there: reporting every old structure as
     untraceable would train the reader to ignore the line that matters.
+
+    Provenance is judged on *formatting*, not on the index. `source_index`
+    is a number, and a number can be written: measured, a session stamped
+    `source_index: 39` onto ten blocks it had just authored, cleared the
+    ratio, and left a code comment justifying it. What cannot be faked by
+    writing a number is carrying the sample's own `(align, bold, size_pt,
+    indent_cm)` combinations — which is also the thing the check exists to
+    protect, since those four fields *are* the formatting a reader sees.
     """
-    indexed = [b for b in sample_blocks if "source_index" in b]
-    if not indexed:
-        return None
-    valid = {b["source_index"] for b in indexed}
     if not plan_blocks:
         return None
-    traced = sum(1 for b in plan_blocks if b.get("source_index") in valid)
-    if traced >= len(plan_blocks) * MIN_TRACEABLE_RATIO:
+    advice = (" Load the structure file's blocks and replace each \"text\", "
+              "keeping source_index, align, bold, size_pt and indent_cm "
+              "exactly as measured. `run.py plan` does this for you from a "
+              "{\"<index>\": \"<text>\"} file.")
+
+    # Signal 1: the index. Cheap, and catches a plan authored beside the
+    # structure without a thought for provenance.
+    indexed = [b for b in sample_blocks if "source_index" in b]
+    if indexed:
+        valid = {b["source_index"] for b in indexed}
+        traced = sum(1 for b in plan_blocks if b.get("source_index") in valid)
+        if traced < len(plan_blocks) * MIN_TRACEABLE_RATIO:
+            return (f"provenance: {traced} of {len(plan_blocks)} plan blocks "
+                    f"carry a source_index from the structure (need "
+                    f"{int(len(plan_blocks) * MIN_TRACEABLE_RATIO)})." + advice)
+
+    # Signal 2: the formatting. Not cheap to fake, which is the point — the
+    # index above is a number, and a number can be written. Measured: a
+    # session stamped `source_index: 39` onto ten blocks it had just
+    # authored, cleared signal 1, and left a comment justifying it. What it
+    # could not have faked this way is carrying the sample's own (align,
+    # bold, size_pt, indent_cm) combinations — which is also what the check
+    # is protecting, since those four fields are the formatting a reader sees.
+    known = {_fingerprint(b) for b in sample_blocks if not b.get("kind")}
+    body = [b for b in plan_blocks if not b.get("kind")]
+    if not known or not body:
         return None
-    return (f"provenance: {traced} of {len(plan_blocks)} plan blocks carry a "
-            f"source_index from the structure (need "
-            f"{int(len(plan_blocks) * MIN_TRACEABLE_RATIO)}) — this plan was "
-            f"written from scratch, not adapted. Load the structure file's "
-            f"blocks, replace each \"text\", and keep every other field "
-            f"including source_index.")
+    matched = sum(1 for b in body if _fingerprint(b) in known)
+    if matched >= len(body) * MIN_TRACEABLE_RATIO:
+        return None
+    return (f"provenance: {matched} of {len(body)} plan paragraphs use a "
+            f"formatting combination the sample actually has (need "
+            f"{int(len(body) * MIN_TRACEABLE_RATIO)}) — the blocks kept their "
+            f"text and lost their formatting." + advice)
 
 
 def check(structure_path: str, plan_path: str) -> list[str]:

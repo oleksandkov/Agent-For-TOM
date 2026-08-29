@@ -465,6 +465,59 @@ def forget(fact_id: str, scopes: tuple = ("global", "project")) -> Optional[dict
     return None
 
 
+def find_fact(fact_id: str, scopes: tuple = ("global", "project")) -> Optional[dict]:
+    """One stored fact by id, or a unique prefix of one.
+
+    Prefixes because the ids are twelve hex characters and the user is
+    reading them off a terminal to type them back. An ambiguous prefix
+    returns nothing rather than a guess — editing the wrong standing rule is
+    silent and applies to every later turn.
+    """
+    fact_id = (fact_id or "").strip()
+    if not fact_id:
+        return None
+    matches = [f for scope in scopes for f in load_facts(scope)
+               if f.get("id") == fact_id]
+    if matches:
+        return matches[0]
+    matches = [f for scope in scopes for f in load_facts(scope)
+               if str(f.get("id", "")).startswith(fact_id)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def edit_fact(fact_id: str, new_text: str,
+              scopes: tuple = ("global", "project")) -> Optional[dict]:
+    """Rewrite a stored fact's text in place, keeping its id and history.
+
+    Editing is not delete-then-add. A rule carries `first_seen`, its evidence
+    and its id, and the id is what the user has in front of them; re-creating
+    it hands back a different one and tombstones the old wording, so the next
+    reflection is forbidden from ever re-learning a rule the user only meant
+    to reword.
+    """
+    new_text = redact((new_text or "").strip())
+    if not new_text:
+        return None
+    for scope in scopes:
+        facts = load_facts(scope)
+        for fact in facts:
+            if fact.get("id") != fact_id:
+                continue
+            fact["fact"] = new_text
+            fact["keywords"] = extract_keywords(new_text)
+            fact["last_seen"] = time.time()
+            # Rewording a preference into unconditional terms is how a rule
+            # gets promoted, and the same wording test decides it here as at
+            # the front door — otherwise `/rules edit` could leave a
+            # directive that no longer reads like one, injected every turn.
+            if fact.get("kind") in (KIND_DIRECTIVE, KIND_EXPLICIT):
+                fact["kind"] = (KIND_DIRECTIVE if looks_like_directive(new_text)
+                                else KIND_EXPLICIT)
+            save_facts(scope, facts)
+            return fact
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Migration from the pre-Phase-3 stores
 # ═══════════════════════════════════════════════════════════════════════

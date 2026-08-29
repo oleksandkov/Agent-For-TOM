@@ -1,12 +1,16 @@
 """One entry point for the whole skill. Measure, build, verify, clean up.
 
     python run.py measure <sample.pdf|.docx> <name>
-    python run.py build   <sample> <name> <plan.json> <output.docx> [options]
+    python run.py build   <sample> <name> <texts.json> <output.docx> [options]
 
-`measure` writes `<name>_style_contract.json` and `<name>_structure.json` and
-prints the contract. `build` takes the plan you wrote against that structure
-and carries it all the way to a verified pair of deliverables, or says exactly
-which check stopped it.
+`measure` measures the sample into `.dsm/<name>/` and writes a `texts.json`
+you fill in — `{"<block index>": "<new text>"}`, the same shape for a PDF
+sample and a DOCX one. `build` takes that file and carries it all the way to
+a verified pair of deliverables, or says exactly which check stopped it and
+which blocks to change.
+
+`run.py plan <name>` expands the texts file into a content plan on its own,
+if you want to see or hand-tune it before building. `build` does it for you.
 
 ## Why this exists
 
@@ -36,16 +40,16 @@ partial success and no "looks similar": the last line is either
 
     VERDICT: PASS — <output.docx> and <output.pdf> match the sample.
 
-or `VERDICT: FAIL` followed by what to fix. A failed run leaves the working
-files in place so the next attempt can start from them; a passing run deletes
-them (Step Z), which two of three sessions otherwise got wrong in opposite
-directions — one left six scaffolding files beside two deliverables, one
-deleted nothing because its turn ended first.
+or `VERDICT: FAIL` followed by what to fix, naming the blocks to change.
+
+Working files live in `.dsm/<name>/` beside the deliverable and are kept
+across runs, keyed by the sample's size and mtime — nothing is littered next
+to the output, and a second pass over the same sample costs no measurement.
 
 ## Options
 
     --pdf <path>   use this already-converted PDF instead of converting
-    --keep         keep the scaffolding even on a pass
+    --keep         accepted and ignored; the cache is always kept
     --route a|b    override the route (default: from the sample's suffix)
 """
 import argparse
@@ -125,6 +129,16 @@ class Steps:
     def ribbon(self) -> str:
         return "  ".join(f"{'v' if ok else 'X'} {k}" for k, _, ok, _ in self.entries)
 
+    def notes(self) -> list[str]:
+        """`NOTE:` lines from every step, passing or not.
+
+        The one channel a step has for something the reader must carry into
+        the final answer but which is not a failure: a formula removed on
+        request, a check that had nothing to compare against.
+        """
+        return [line for _, _, _, out in self.entries
+                for line in out.splitlines() if line.startswith("NOTE:")]
+
     def detail(self) -> str:
         """Full output of the steps that failed, and nothing else."""
         blocks = []
@@ -176,15 +190,52 @@ def _convert_with_libreoffice(docx_path: str, pdf_path: str) -> str:
     return "LibreOffice"
 
 
+def _convert_with_docx2pdf(docx_path: str, pdf_path: str) -> str:
+    """Last resort, and the reason the MCP `word-docs` server exists here.
+
+    Word and LibreOffice are both absent often enough to matter, and the old
+    failure message ("pip install pywin32") is advice a session cannot act on
+    inside its own turn. `docx2pdf` is what the `word-docs` MCP server's own
+    `convert_to_pdf` uses, so reaching for the library directly gets the same
+    result without spending a turn and ~7.5k tokens of tool schema on the
+    server that wraps it.
+    """
+    from docx2pdf import convert
+    convert(os.path.abspath(docx_path), os.path.abspath(pdf_path))
+    if not os.path.exists(pdf_path):
+        raise RuntimeError("docx2pdf produced no PDF")
+    return "docx2pdf"
+
+
 def convert_to_pdf(docx_path: str, pdf_path: str) -> tuple[bool, str]:
     """Returns (ok, how). Never raises — a failure here is reportable, not fatal."""
     attempts = []
-    for convert in (_convert_with_word, _convert_with_libreoffice):
+    for convert in (_convert_with_word, _convert_with_libreoffice,
+                    _convert_with_docx2pdf):
         try:
             return True, convert(docx_path, pdf_path)
         except Exception as e:                      # noqa: BLE001 — see docstring
             attempts.append(f"{convert.__name__}: {type(e).__name__}: {e}")
     return False, "; ".join(attempts)
+
+
+def _text_layer_missing(sample: str) -> bool:
+    """Is this PDF a scan? Then nothing downstream can measure it.
+
+    `analyze_pdf` measures a scanned sample without objecting and reports
+    plausible numbers taken from nothing — page size is real, every font and
+    spacing figure is a default. One line here is worth more than any check
+    further down, because further down there is nothing left to check.
+    """
+    if not sample.lower().endswith(".pdf"):
+        return False
+    try:
+        import pymupdf
+        with pymupdf.open(sample) as doc:
+            pages = min(3, doc.page_count)
+            return not any(doc[i].get_text().strip() for i in range(pages))
+    except Exception:                                # noqa: BLE001
+        return False
 
 
 # ── provenance ──────────────────────────────────────────────────────────────
@@ -256,13 +307,44 @@ def _paths(name: str, work_dir: str) -> dict:
     root, so a failed build left six `course_ai_drones_*.json` files in the
     repository root — and Step Z could not clean them, because cleanup only
     happens on a pass.
+
+    They now live in a `.dsm/<name>/` cache rather than beside the
+    deliverable, because "don't litter the user's folder" and "throw the
+    measurement away" are different requirements and cleanup used to do
+    both. Measured: a session reached PASS, cleanup deleted the structure,
+    the user asked for one sentence to change, and the whole sample had to
+    be measured again to change it.
     """
+    cache = os.path.join(work_dir, ".dsm", name)
     return {
-        "contract": os.path.join(work_dir, f"{name}_style_contract.json"),
-        "structure": os.path.join(work_dir, f"{name}_structure.json"),
-        "plan": os.path.join(work_dir, f"{name}_content_plan.json"),
-        "edits": os.path.join(work_dir, f"{name}_edits.json"),
+        "cache": cache,
+        "contract": os.path.join(cache, "style_contract.json"),
+        "structure": os.path.join(cache, "structure.json"),
+        "plan": os.path.join(cache, "content_plan.json"),
+        "edits": os.path.join(cache, "edits.json"),
+        "texts": os.path.join(cache, "texts.json"),
+        "fingerprint": os.path.join(cache, "sample.json"),
     }
+
+
+def _fingerprint(sample: str) -> dict:
+    try:
+        st = os.stat(sample)
+        return {"path": os.path.abspath(sample), "size": st.st_size,
+                "mtime": round(st.st_mtime, 3)}
+    except OSError:
+        return {}
+
+
+def _cache_is_fresh(sample: str, p: dict) -> bool:
+    """Has this exact sample already been measured into this cache?"""
+    if not (os.path.exists(p["contract"]) and os.path.exists(p["structure"])):
+        return False
+    try:
+        with open(p["fingerprint"], encoding="utf-8") as f:
+            return json.load(f) == _fingerprint(sample)
+    except (OSError, ValueError):
+        return False
 
 
 def _write_edits_template(structure_path: str, edits_path: str) -> int:
@@ -292,12 +374,148 @@ def _write_edits_template(structure_path: str, edits_path: str) -> int:
         # section then fails loudly instead of shipping a truncated one.
         if b.get("full_len"):
             template[str(i)] = (f"{TODO_PREFIX} {b['full_len']} chars here — "
+                                f"{_embedded_note(b)}"
                                 f"the sample says: {b.get('text', '')}")
         else:
             template[str(i)] = b.get("text", "")
     with open(edits_path, "w", encoding="utf-8") as f:
         json.dump(template, f, ensure_ascii=False, indent=1)
     return len(template)
+
+
+def _embedded_note(block: dict) -> str:
+    """What this paragraph carries that replacing its text will not touch.
+
+    Route A copies formulas, images and hyperlinks and cannot edit them, and
+    nothing said so until `_lost_embedded` ran — after the copy. Measured: a
+    session facing 28 equations from a numerical-integration paper it was
+    re-theming to AI built a doctored copy of the sample, stripped the maths
+    with python-docx, reset `core_properties.author` to defeat the
+    provenance warning, and fed *that* to `build` as the reference. The skill
+    made rule 2 the only workable path. Saying it here, with the verb that
+    handles it, is what removes the incentive.
+    """
+    embedded = block.get("embedded") or {}
+    parts = [f"{n} {kind}" for kind, n in sorted(embedded.items()) if n]
+    if not parts:
+        return ""
+    note = f"CARRIES {', '.join(parts)}, kept as-is. "
+    if embedded.get("links"):
+        # A hyperlink is not droppable and does not want to be: the e-mail in
+        # an author line outlives a rewrite of that line. It is named because
+        # its text is *not* in the runs, so a replacement string has to stop
+        # where the link begins — "…, e-mail: " and no further.
+        note += ("The link text lives outside the runs: end your replacement "
+                 "where it begins. ")
+    if embedded.get("math") or embedded.get("images"):
+        note += ("To remove them write {\"text\": \"…\", \"drop_math\": true} "
+                 "(or \"__doc__\": {\"drop_math\": true} for all of them). ")
+    return note
+
+
+# ── texts -> plan ───────────────────────────────────────────────────────────
+
+def _is_texts_payload(payload) -> bool:
+    """`{index: text}` (route A's shape) rather than a rendered block list."""
+    if not isinstance(payload, dict) or "blocks" in payload:
+        return False
+    keys = [k for k in payload if not k.startswith("__")]
+    return bool(keys) and all(str(k).lstrip("-").isdigit() for k in keys)
+
+
+def expand_texts(structure_path: str, texts_path: str, out_path: str) -> dict:
+    """Turn `{block_index: new text}` into a content plan.
+
+    This is the whole of what two measured sessions wrote by hand: load the
+    structure, swap each block's `text`, carry `source_index`, `align`,
+    `bold`, `indent_cm` and `target_chars` through untouched, write the
+    result. One of them authored 8,562 characters of generator to do it,
+    then rewrote it at 9,012 to change one sentence — scaffolding for a
+    transformation with no decisions in it.
+
+    Carrying the fields is not bookkeeping: `align` and `bold` *are* the
+    formatting a reader checks first, and a plan that drops them renders a
+    document that passes the contract and looks nothing like the sample.
+
+    New blocks go in `__insert__`: `[{"after": 49, "blocks": [...]}]`, where
+    each entry is a block object or a plain string that inherits the anchor
+    block's formatting.
+    """
+    with open(structure_path, encoding="utf-8") as f:
+        blocks = json.load(f).get("blocks", [])
+    with open(texts_path, encoding="utf-8") as f:
+        payload = json.load(f)
+
+    inserts: dict[int, list] = {}
+    for spec in (payload.get("__insert__") or []):
+        inserts.setdefault(int(spec["after"]), []).extend(spec.get("blocks", []))
+    texts, unknown = {}, []
+    for key, value in payload.items():
+        if str(key).startswith("__"):
+            continue
+        index = int(key)
+        if not 0 <= index < len(blocks):
+            unknown.append(index)
+            continue
+        texts[index] = value
+    if unknown:
+        raise ValueError(
+            f"{texts_path}: block index {unknown[:6]} is outside the "
+            f"structure's 0..{len(blocks) - 1}. Indices are positions in "
+            f"`blocks`, not line numbers in the file.")
+
+    out, replaced, dropped, inserted = [], 0, 0, 0
+    for i, block in enumerate(blocks):
+        keep = dict(block)
+        if i in texts:
+            value = texts[i]
+            if value is None:
+                dropped += 1
+                keep = None
+            else:
+                if isinstance(value, list):
+                    value = "".join(value)
+                if isinstance(value, dict):
+                    value = value.get("text", "")
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"block {i}: expected a string, a list of strings or "
+                        f"null — got {type(value).__name__}")
+                if value.lstrip().startswith(TODO_PREFIX):
+                    raise ValueError(
+                        f"block {i}: still holds the `{TODO_PREFIX}…` "
+                        f"placeholder `measure` wrote. Replace it with the "
+                        f"text this section should contain.")
+                keep["text"] = value
+                replaced += 1
+        if keep is not None:
+            out.append(keep)
+        for extra in inserts.get(i, []):
+            if isinstance(extra, str):
+                anchor = {k: v for k, v in block.items()
+                          if k in ("align", "bold", "size_pt", "indent_cm",
+                                   "style_name")}
+                anchor["text"] = extra
+                out.append(anchor)
+            else:
+                out.append(dict(extra))
+            inserted += 1
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump({"blocks": out}, f, ensure_ascii=False, indent=1)
+
+    written = expected = 0
+    for b in out:
+        target = b.get("target_chars")
+        if target is None or b.get("kind"):
+            continue
+        written += len(b.get("text", ""))
+        expected += int(target)
+    return {"blocks": len(out), "replaced": replaced, "dropped": dropped,
+            "inserted": inserted, "written": written, "expected": expected,
+            "untouched": sum(1 for i, b in enumerate(blocks)
+                             if i not in texts and b.get("full_len"))}
 
 
 def measure(sample: str, name: str, work_dir: str = ".") -> int:
@@ -307,40 +525,90 @@ def measure(sample: str, name: str, work_dir: str = ".") -> int:
               f"document, not an original — {why}.\n"
               f"If it is a previous output, measuring it copies its defects "
               f"forward: use the file the user pointed at instead.\n")
-    os.makedirs(work_dir, exist_ok=True)
+    if _text_layer_missing(sample):
+        print(f"VERDICT: FAIL — {os.path.basename(sample)} has no text layer "
+              f"on its first pages: it is a scan, and every figure measured "
+              f"from it would be a default dressed as a measurement.\n"
+              f"Ask the user for the .docx, or OCR it first "
+              f"(mcp pdf server: textextraction__ocr_pdf).")
+        return 2
     p = _paths(name, work_dir)
+    os.makedirs(p["cache"], exist_ok=True)
     route = route_for(sample)
     analyzer = "analyze_docx.py" if route == "a" else "analyze_pdf.py"
 
-    steps = Steps()
-    code = steps.run("measure", f"measure the sample ({analyzer})",
-                     [_script(analyzer), sample, p["contract"], p["structure"]])
-    if code:
-        print(f"VERDICT: FAIL — could not measure {sample}.\n")
-        print(steps.detail())
-        return code
-    print(steps.entries[-1][3])          # the contract itself: read this
-
-    # The advice has to match the route `build` will actually take. It did not:
-    # `measure` printed route B's instructions for every sample, so a DOCX
-    # sample produced a content plan that `build` then fed to route A's
-    # `edit_copy`, which wrote the plan's *key names* into the document.
-    if route == "b":
-        print(f"\n{RULE}\nNext: write {p['plan']} from {p['structure']}'s "
-              f"blocks — replace each block's \"text\", keep everything else "
-              f"including source_index — then:\n"
-              f"  run.py build \"{sample}\" {name} \"{p['plan']}\" <output.docx>")
+    if _cache_is_fresh(sample, p):
+        print(f"{os.path.basename(sample)} is already measured in "
+              f"{p['cache']} — reusing it (delete that folder to re-measure).")
     else:
-        n = _write_edits_template(p["structure"], p["edits"])
-        print(f"\n{RULE}\nRoute A (the sample is a .docx): formatting is "
-              f"copied, not rebuilt — you replace text only.\n"
-              f"Wrote {p['edits']} with {n} entries, already in the right "
-              f"shape: {{\"<index>\": \"<text>\"}}.\n"
-              f"Edit the *values* — a string, a list of strings (one per run), "
-              f"null to delete, or {{\"rows\": …}} for a table. Never a block "
-              f"object. Then:\n"
-              f"  run.py build \"{sample}\" {name} \"{p['edits']}\" <output.docx>")
+        steps = Steps()
+        code = steps.run("measure", f"measure the sample ({analyzer})",
+                         [_script(analyzer), sample, p["contract"], p["structure"]])
+        if code:
+            print(f"VERDICT: FAIL — could not measure {sample}.\n")
+            print(steps.detail())
+            return code
+        with open(p["fingerprint"], "w", encoding="utf-8") as f:
+            json.dump(_fingerprint(sample), f)
+        # The sub-step's own stdout carried the whole contract — every
+        # `style_signature`, twelve of them on a real sample, ~2k characters
+        # nothing acts on. `verify_docx` reads them off disk. What a reader
+        # needs is the one line they are asked to quote back.
+        for line in steps.entries[-1][3].splitlines():
+            if line.startswith(("NOTE:", "WARNING:")) or "page_window" in line:
+                print(line)
+
+    print(_contract_line(p["contract"], p["structure"]))
+
+    # Both routes now take the same input shape: `{block index: new text}`.
+    # Route B used to be told to write the plan itself, and it did — one
+    # session's generator ran to 8.5k characters for a transformation with no
+    # decisions in it, and the asymmetry (route A got a filled template,
+    # route B got a paragraph of prose) is what produced it.
+    target = p["edits"] if route == "a" else p["texts"]
+    n = _write_edits_template(p["structure"], target)
+    how = ("Route A (.docx sample): formatting is copied, not rebuilt."
+           if route == "a" else
+           "Route B (.pdf sample): formatting is rebuilt from the contract.")
+    print(f"\n{RULE}\n{how}\n"
+          f"Wrote {target} — {n} entries, already the right shape:\n"
+          f"  {{\"<block index>\": \"<new text>\"}}\n"
+          f"Edit the *values only*: a string, a list of strings (one per run), "
+          f"null to delete, or {{\"rows\": …}} for a table. Never a block "
+          f"object. New blocks go in \"__insert__\": "
+          f"[{{\"after\": <index>, \"blocks\": [\"…\"]}}].\n"
+          f"Then, with no other step in between:\n"
+          f"  run.py build \"{sample}\" {name} \"{target}\" <output.docx>")
     return 0
+
+
+def _contract_line(contract_path: str, structure_path: str) -> str:
+    """The contract as the one line SKILL.md asks to be quoted back."""
+    try:
+        with open(contract_path, encoding="utf-8") as f:
+            c = json.load(f)
+        with open(structure_path, encoding="utf-8") as f:
+            s = json.load(f)
+    except (OSError, ValueError):
+        return ""
+    m = c.get("margins_cm", {})
+    margins = "/".join(
+        f"{m.get(k, 0):g}" for k in
+        ("left_margin", "right_margin", "top_margin", "bottom_margin"))
+    blocks = s.get("blocks", [])
+    shape = (f"{len(blocks)} blocks "
+             f"({sum(1 for b in blocks if b.get('kind') == 'spacer')} spacers, "
+             f"{sum(1 for b in blocks if b.get('kind') == 'table')} tables, "
+             f"{sum(1 for b in blocks if b.get('page_break_before'))} breaks)")
+    note = ""
+    if s.get("truncated"):
+        note = ("\nNOTE: only part of the sample was opened — say which of its "
+                "sections your document does not contain.")
+    return (f"\n{c.get('page_width_cm')}×{c.get('page_height_cm')}cm · "
+            f"{c.get('body_font')} · body {c.get('body_size_pt')}pt · "
+            f"title {c.get('title_size_pt')}pt · margins {margins}cm · "
+            f"spacing {c.get('line_spacing')} · "
+            f"indent {c.get('body_indent_cm')}cm\n{shape}{note}")
 
 
 def build(sample: str, name: str, plan: str, output: str, *,
@@ -348,7 +616,6 @@ def build(sample: str, name: str, plan: str, output: str, *,
     work_dir = os.path.dirname(os.path.abspath(output)) or "."
     p = _paths(name, work_dir)
     contract, structure = p["contract"], p["structure"]
-    scaffolding = [contract, structure, plan]
 
     for needed in (sample, plan):
         if not os.path.exists(needed):
@@ -359,6 +626,32 @@ def build(sample: str, name: str, plan: str, output: str, *,
               file=sys.stderr)
         if measure(sample, name, work_dir):
             return 2
+
+    # A `{index: text}` file is the input shape for both routes. Route A
+    # feeds it to `edit_copy` as-is; route B expands it into a plan here,
+    # which is the step two sessions wrote a generator for.
+    if route == "b":
+        try:
+            with open(plan, encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"VERDICT: FAIL — {plan} is not readable JSON: {e}")
+            return 2
+        if _is_texts_payload(payload):
+            try:
+                stats = expand_texts(structure, plan, p["plan"])
+            except (ValueError, KeyError) as e:
+                print(f"VERDICT: FAIL — {plan} could not be expanded.\n{e}")
+                return 2
+            ratio = (stats["written"] / stats["expected"]
+                     if stats["expected"] else 1.0)
+            print(f"plan: {stats['blocks']} blocks "
+                  f"({stats['replaced']} replaced, {stats['dropped']} dropped, "
+                  f"{stats['inserted']} inserted) · volume "
+                  f"{stats['written']}/{stats['expected']} = {ratio:.0%}"
+                  + (f" · {stats['untouched']} long blocks still hold the "
+                     f"sample's own text" if stats["untouched"] else ""))
+            plan = p["plan"]
 
     steps = Steps()
 
@@ -374,16 +667,16 @@ def build(sample: str, name: str, plan: str, output: str, *,
             # Stop here. Rendering a plan that does not match the sample's
             # shape produces a document every later check will fail for a
             # reason this one already named, three steps further from it.
-            return _verdict(output, None, steps, scaffolding, keep,
+            return _verdict(output, None, steps, p['cache'], keep,
                             note="Nothing was rendered — fix the plan and "
                                  "re-run the same command.")
         if steps.run("render", "render (render_from_structure.py)",
                      [_script("render_from_structure.py"),
                       contract, plan, output]):
-            return _verdict(output, None, steps, scaffolding, keep)
+            return _verdict(output, None, steps, p['cache'], keep)
 
     if not os.path.exists(output):
-        return _verdict(output, None, steps, scaffolding, keep,
+        return _verdict(output, None, steps, p['cache'], keep,
                         note=f"{output} was not produced.")
 
     # ── DOCX side ───────────────────────────────────────────────────────
@@ -403,7 +696,7 @@ def build(sample: str, name: str, plan: str, output: str, *,
             # reach for rather than reporting the document as broken.
             steps.note("convert", "convert to PDF", False,
                        f"could not convert: {how}")
-            return _verdict(output, None, steps, scaffolding, keep,
+            return _verdict(output, None, steps, p['cache'], keep,
                             note=f"No PDF converter available. Run the "
                                  f"convert_to_pdf tool on {output}, then "
                                  f"re-run this with --pdf <that file>. "
@@ -416,9 +709,10 @@ def build(sample: str, name: str, plan: str, output: str, *,
     if route == "b":
         steps.run("verify_render",
                   "compare the render with the sample (verify_render.py)",
-                  [_script("verify_render.py"), sample, pdf_path])
+                  [_script("verify_render.py"), sample, pdf_path,
+                   "--plan", plan])
 
-    return _verdict(output, pdf_path, steps, scaffolding, keep)
+    return _verdict(output, pdf_path, steps, p['cache'], keep)
 
 
 def _verdict_path(output: str) -> str:
@@ -460,7 +754,7 @@ def _record_verdict(output: str, failed: list[str]) -> None:
 
 
 def _verdict(output: str, pdf_path: str | None, steps: "Steps",
-             scaffolding: list[str], keep: bool, note: str = "") -> int:
+             cache: str, keep: bool, note: str = "") -> int:
     failed = steps.failed
     previous = _previous_failures(output)
     _record_verdict(output, failed)
@@ -475,19 +769,26 @@ def _verdict(output: str, pdf_path: str | None, steps: "Steps",
               + (f" and {pdf_path}" if pdf_path else "")
               + " match the sample.")
     print(steps.ribbon())
+    # A passing step can still have something to say — a formula removed on
+    # request, a check that could not run. `detail()` shows failures only, so
+    # without this those lines exist and are never read.
+    for line in steps.notes():
+        print(line)
     if note:
         print(note)
 
     if not failed:
-        if keep:
-            print(f"Working files kept (--keep): {', '.join(scaffolding)}")
-        else:
-            removed = [os.path.basename(f) for f in scaffolding
-                       if _try_remove(f)]
-            if removed:
-                print(f"Cleaned up: {', '.join(removed)}")
-            print("Any scratch scripts you wrote yourself are still yours "
-                  "to delete.")
+        # The measurement is kept, not deleted. "Don't litter the user's
+        # folder" and "throw away what it cost 20 seconds to derive" were one
+        # behaviour, and the second one has a price: a session reached PASS,
+        # cleanup removed the structure, the user asked for one sentence to
+        # change, and the sample had to be measured again to change it. The
+        # cache is hidden and self-invalidating; nothing is beside the
+        # deliverable either way.
+        print(f"Measurement kept in {cache} (re-used automatically; delete "
+              f"the folder to force a re-measure).")
+        print("Any scratch scripts you wrote yourself are still yours "
+              "to delete.")
         return 0
 
     # Repeating the same failure means the previous message did not land.
@@ -501,7 +802,7 @@ def _verdict(output: str, pdf_path: str | None, steps: "Steps",
               f"a different tool or a hand-written generator will not move "
               f"them, and abandoning this script means shipping a document "
               f"nothing has checked.")
-    print(f"Working files kept: {', '.join(scaffolding)}")
+    print(f"Working files kept in {cache}")
     print(f"Verdict recorded at {_verdict_path(output)} — it is removed only "
           f"by a pass. Do not report success while it exists.\n")
     print(steps.detail())
@@ -528,6 +829,12 @@ def main(argv: list[str]) -> int:
                         "deliverable will live in; `build` derives it from "
                         "the output path and expects them there.")
 
+    pl = sub.add_parser("plan", help="expand {index: text} into a content plan")
+    pl.add_argument("name")
+    pl.add_argument("texts", nargs="?", default=None,
+                    help="defaults to the cache's texts.json")
+    pl.add_argument("--work-dir", default=".")
+
     b = sub.add_parser("build", help="plan -> document -> PDF -> every check")
     b.add_argument("sample")
     b.add_argument("name")
@@ -540,6 +847,23 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     if args.command == "measure":
         return measure(args.sample, args.name, args.work_dir)
+    if args.command == "plan":
+        p = _paths(args.name, args.work_dir)
+        try:
+            stats = expand_texts(p["structure"], args.texts or p["texts"],
+                                 p["plan"])
+        except (OSError, ValueError, KeyError) as e:
+            print(f"FAIL — {e}")
+            return 2
+        ratio = stats["written"] / stats["expected"] if stats["expected"] else 1.0
+        print(f"Wrote {p['plan']}: {stats['blocks']} blocks "
+              f"({stats['replaced']} replaced, {stats['dropped']} dropped, "
+              f"{stats['inserted']} inserted) · volume "
+              f"{stats['written']}/{stats['expected']} = {ratio:.0%}")
+        if not 0.65 <= ratio <= 1.35:
+            print("Volume is outside check_plan's ±35% — adjust the text "
+                  "before building.")
+        return 0
     return build(args.sample, args.name, args.plan, args.output,
                  pdf=args.pdf, keep=args.keep,
                  route=args.route or route_for(args.sample))

@@ -117,6 +117,8 @@ def _coerce_runs(value, index) -> list[str]:
             f"block {index}: a list value must hold strings, one per run — "
             f"got {[type(v).__name__ for v in value][:4]}")
     if isinstance(value, dict):
+        if "drop_math" in value or "drop_embedded" in value:
+            return _coerce_runs(value.get("text", ""), index)
         if "text" in value:
             raise ValueError(
                 f"block {index}: the value is a content-plan block "
@@ -188,6 +190,37 @@ def _set_table(table, rows) -> None:
                 para.add_run(text)
 
 
+#: Elements `_drop_embedded` can remove. Formulas and images are content a
+#: re-themed document has no use for; hyperlinks are excluded on purpose,
+#: because the e-mail in an author line survives a rewrite of that line.
+_DROPPABLE = {
+    "math": ("{http://schemas.openxmlformats.org/officeDocument/2006/math}oMathPara",
+             "{http://schemas.openxmlformats.org/officeDocument/2006/math}oMath"),
+    "images": ("{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}inline",),
+}
+
+
+def _drop_embedded(item, kinds=("math",)) -> int:
+    """Remove formulas (and optionally images) from one paragraph.
+
+    Replacing a paragraph's text leaves its equations behind, because they
+    are siblings of the runs, not runs. On a document being re-themed to a
+    new subject that is worse than losing them: the old topic's mathematics
+    sits under the new topic's prose. Measured, the session that met this
+    had no way to say so through the edit file, so it doctored the sample
+    instead. One verb removes the incentive.
+    """
+    removed = 0
+    for kind in kinds:
+        for tag in _DROPPABLE.get(kind, ()):
+            for element in item._p.findall(f".//{tag}"):
+                parent = element.getparent()
+                if parent is not None:
+                    parent.remove(element)
+                    removed += 1
+    return removed
+
+
 def apply_edits(sample_path: str, edits_path: str, output_path: str) -> dict:
     edits = json.load(open(edits_path, encoding="utf-8"))
     if isinstance(edits, dict) and "replacements" in edits:
@@ -198,16 +231,21 @@ def apply_edits(sample_path: str, edits_path: str, output_path: str) -> dict:
             f"wants an object keyed by block index: "
             f'{{"0": "new text", "3": null}}. A list of blocks is a *content '
             f"plan* — that is route B, for a PDF sample.")
-    edits = {int(k): v for k, v in edits.items()}
+    options = edits.pop("__doc__", None) or {}
+    edits = {int(k): v for k, v in edits.items() if not str(k).startswith("__")}
     validate_edits(edits)          # before anything is written. See above.
 
     shutil.copyfile(sample_path, output_path)
     d = docx.Document(output_path)
 
-    replaced = deleted = 0
+    replaced = deleted = dropped = 0
     to_delete = []
     items = list(iter_body_items(d))
+    doc_wide = [k for k in ("math", "images")
+                if options.get(f"drop_{k}") or options.get("drop_embedded")]
     for i, item in enumerate(items):
+        if doc_wide and not isinstance(item, Table):
+            dropped += _drop_embedded(item, doc_wide)
         if i not in edits:
             continue
         value = edits[i]
@@ -219,6 +257,11 @@ def apply_edits(sample_path: str, edits_path: str, output_path: str) -> dict:
                 _set_table(item, value["rows"])
                 replaced += 1
         else:
+            if isinstance(value, dict) and not doc_wide:
+                kinds = [k for k in ("math", "images")
+                         if value.get(f"drop_{k}") or value.get("drop_embedded")]
+                if kinds:
+                    dropped += _drop_embedded(item, kinds)
             _set_runs(item, value, i)
             replaced += 1
 
@@ -239,7 +282,7 @@ def apply_edits(sample_path: str, edits_path: str, output_path: str) -> dict:
             continue
         if len(item.text.strip()) > 120:
             untouched += 1
-    return {"replaced": replaced, "deleted": deleted,
+    return {"replaced": replaced, "deleted": deleted, "dropped": dropped,
             "long_paragraphs_left_as_sample": untouched,
             "lost": _lost_embedded(sample, docx.Document(output_path))}
 
@@ -295,13 +338,27 @@ if __name__ == "__main__":
 
     failed = False
     lost = stats["lost"]
-    if lost:
+    if lost and stats["dropped"]:
+        # Asked for. `drop_math` is the documented way to say so, and a
+        # requested removal reported as a failure would push the next
+        # session back to doctoring the sample instead.
+        detail = ", ".join(f"{name} {before} -> {after}"
+                           for name, (before, after) in sorted(lost.items()))
+        # "NOTE:" is the marker `run.py` echoes from a *passing* step. A
+        # requested removal is still a difference from the sample, and a
+        # difference nobody is told about is one the final answer will claim
+        # does not exist.
+        print(f"NOTE: removed on request (drop_math/drop_images): {detail}. "
+              f"State this as a difference from the sample.")
+    elif lost:
         print("LOST FROM THE SAMPLE:")
         for name, (before, after) in sorted(lost.items()):
             print(f" - {name}: {before} in the sample, {after} in the output")
         print("These are carried by copying and cannot be edited by this "
-              "script. If removing them was deliberate, say so in your final "
-              "answer; otherwise restore them before shipping.")
+              "script. To remove them deliberately write "
+              "{\"text\": \"…\", \"drop_math\": true} on those blocks, or "
+              "\"__doc__\": {\"drop_math\": true} for the whole document. "
+              "Do not edit the sample to work around this.")
         failed = True
 
     left = stats["long_paragraphs_left_as_sample"]

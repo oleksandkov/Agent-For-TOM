@@ -198,6 +198,34 @@ def _table_block(t) -> dict:
     }
 
 
+#: What a paragraph can carry that `edit_copy` copies but cannot edit.
+_EMBEDDED_TAGS = {
+    "math": "{http://schemas.openxmlformats.org/officeDocument/2006/math}oMath",
+    "images": "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}inline",
+    "links": "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}hyperlink",
+}
+
+
+def _embedded_counts(p) -> dict:
+    """Formulas, images and hyperlinks this paragraph holds.
+
+    Route A carries these for free and can edit none of them, and the block
+    that holds one behaves differently from every other block: replacing its
+    text leaves the equation in place, beside prose that no longer refers to
+    it. That was invisible until after the copy. Measured: a session
+    re-theming a numerical-integration paper to AI found 28 equations it
+    could not remove through the edit file, so it built a doctored copy of
+    the sample instead and fed that to `build` as the reference — the one
+    thing rule 2 forbids, made unavoidable by the tool.
+    """
+    counts = {}
+    for kind, tag in _EMBEDDED_TAGS.items():
+        n = len(p._p.findall(f".//{tag}"))
+        if n:
+            counts[kind] = n
+    return counts
+
+
 def _blocks(document, *, limit: int = _BLOCK_LIMIT) -> list[dict]:
     """Every body item: paragraphs, tables, and the empty paragraphs too.
 
@@ -253,6 +281,12 @@ def _blocks(document, *, limit: int = _BLOCK_LIMIT) -> list[dict]:
             if list_id is not None:
                 block["list_id"] = list_id
                 block["list_level"] = list_level
+        # Also on a spacer: a display equation is a paragraph with no text,
+        # so the blocks that hold the sample's formulas are exactly the ones
+        # recorded as spacers, and annotating only the prose would hide them.
+        embedded = _embedded_counts(p)
+        if embedded:
+            block["embedded"] = embedded
         for key, value in (("space_before_pt", _pt(pf.space_before)),
                            ("space_after_pt", _pt(pf.space_after))):
             if value is not None:

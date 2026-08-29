@@ -91,6 +91,7 @@ except ImportError:
 # MCP and skills support
 from mcp_manager import MCPManager
 from skills_manager import (build_skills_section, build_triggered_skills,
+                            triggered_tool_allowlist,
                             discover_skills, cmd_skill_list, cmd_skill_run,
                             match_skills)
 
@@ -137,6 +138,13 @@ PROJECT_DIR = Path(os.environ.get("AGENT_PROJECT_DIR", os.getcwd())).resolve()
 # on every run.
 EXPORT_DIR = PROJECT_DIR
 MEMORY_DIR = Path.home() / ".tomas" / "memory"
+
+#: The four places a remembered thing can go. Named here rather than beside
+#: `route_memory` because the `save_memory` tool schema offers them as an
+#: enum, and TOOLS is built long before the routing code is reached.
+STORE_INSTRUCTION, STORE_RULE, STORE_FACT, STORE_NOTE = (
+    "instruction", "rule", "fact", "note")
+MEMORY_STORES = (STORE_INSTRUCTION, STORE_RULE, STORE_FACT, STORE_NOTE)
 
 # Where throwaway helper scripts belong. The sandbox allows writes only under
 # PROJECT_DIR, so "put it in a temp directory outside the project" — which
@@ -899,6 +907,7 @@ def _remember_tool_selection(names) -> None:
 
 def select_tools(all_tools: list[dict], context: str, budget: int,
                  server_of: Optional[Callable[[str], Optional[str]]] = None,
+                 allowlist: Optional[set] = None,
                  ) -> tuple[list[dict], list[dict]]:
     """Fit the tool list to the budget by relevance to the current turn.
 
@@ -923,20 +932,36 @@ def select_tools(all_tools: list[dict], context: str, budget: int,
 
     Returns (selected, withheld).
     """
+    # A triggered skill may declare the tools it needs (`tools:` in its
+    # frontmatter). Relevance scoring cannot reach this conclusion on its own:
+    # it ranks tools against the *user's words*, and "зроби схожий файл" scores
+    # the whole word-docs and pdf servers highly — ~13k tokens of schema per
+    # turn — for a skill whose entire job is running one subprocess. The skill
+    # knows; nothing else does. Built-ins are never withheld, so an allowlist
+    # narrows the MCP payload and cannot strand the agent.
+    if allowlist:
+        kept, dropped = [], []
+        for tool in all_tools:
+            (kept if tool["name"] in allowlist else dropped).append(tool)
+        all_tools = kept
+        budget = max(budget, len(kept))
+    else:
+        dropped = []
+
     builtin_names = {t["name"] for t in TOOLS}
     builtins = [t for t in all_tools if t["name"] in builtin_names]
     mcp = [t for t in all_tools if t["name"] not in builtin_names]
     remaining = max(0, budget - len(builtins))
 
     if len(mcp) <= remaining:
-        return builtins + mcp, []
+        return builtins + mcp, dropped
     if remaining == 0:
-        return builtins, mcp
+        return builtins, mcp + dropped
 
     from learning.text import extract_keywords
     query_keywords = set(extract_keywords(context or "", max_keywords=15))
     if not query_keywords:
-        return builtins + mcp[:remaining], mcp[remaining:]
+        return builtins + mcp[:remaining], mcp[remaining:] + dropped
 
     resolve = server_of or _server_of
     scores = [tool_relevance(t, query_keywords) for t in mcp]
@@ -961,7 +986,7 @@ def select_tools(all_tools: list[dict], context: str, budget: int,
                 kept = sorted(held, key=lambda t: t.get("name", ""))
                 names = {t.get("name", "") for t in kept}
                 return (builtins + kept,
-                        [t for t in mcp if t.get("name", "") not in names])
+                        [t for t in mcp if t.get("name", "") not in names] + dropped)
 
     # Rank servers by summed relevance, not by their single best tool: one
     # incidental keyword hit should not outrank a server the whole request is
@@ -1060,7 +1085,7 @@ def select_tools(all_tools: list[dict], context: str, budget: int,
     chosen = sorted((mcp[i] for i in taken), key=lambda t: t.get("name", ""))
     withheld = [mcp[i] for i in sorted(set(range(len(mcp))) - taken, key=rank)]
     _remember_tool_selection(t.get("name", "") for t in chosen)
-    return builtins + chosen, withheld
+    return builtins + chosen, withheld + dropped
 
 
 def withheld_tools_notice(withheld: list[dict]) -> str:
@@ -1806,13 +1831,27 @@ TOOLS: list[dict] = [
     },
     {
         "name": "save_memory",
-        "description": "Persist a note to the agent's memory for future sessions.",
+        "description": (
+            "Persist something the user asked to be remembered, for future "
+            "sessions. It is routed to the right store automatically — leave "
+            "`store` unset unless you have a reason. The result says which "
+            "store was chosen and why."),
         "input_schema": {
             "type": "object",
             "properties": {
                 "key": {"type": "string", "description": "Short identifier (kebab-case)"},
                 "description": {"type": "string", "description": "One-line summary for the index"},
                 "content": {"type": "string", "description": "Full memory content"},
+                "store": {
+                    "type": "string",
+                    "enum": list(MEMORY_STORES),
+                    "description": (
+                        "Optional override. instruction = permanent identity "
+                        "(cached, free per turn); rule = unconditional, "
+                        "injected every turn, max 10; fact = conditional "
+                        "preference, retrieved by relevance; note = long "
+                        "reference material, not in the prompt."),
+                },
             },
             "required": ["key", "description", "content"],
         },
@@ -2848,8 +2887,22 @@ def handle_save_memory(params: dict) -> str:
         return (f"Error: save_memory needs {', '.join(_SAVE_MEMORY_FIELDS)}; "
                 f"missing or empty: {', '.join(missing)}. "
                 f"Got: {sorted(params) or 'no arguments'}")
-    save_memory(params["key"], params["description"], params["content"])
-    return f"Saved memory '{params['key']}'"
+    store, why = save_memory(params["key"], params["description"],
+                             params["content"],
+                             store=str(params.get("store", "")).strip())
+    # Naming the store and the reason is not decoration: the model is the
+    # thing that can override a wrong guess next time, and it cannot learn
+    # the routing from a result that only says "Saved".
+    where = {
+        STORE_INSTRUCTION: "instructions (cached; applies every turn, costs nothing per turn)",
+        STORE_RULE: "standing rules (injected every turn — one of 10 slots)",
+        STORE_FACT: "learned facts (retrieved when the topic comes up)",
+        STORE_NOTE: "self-notes (reachable with /notes; not in the prompt)",
+    }[store]
+    return (f"Saved memory '{params['key']}' -> {where}.\n"
+            f"Why: {why}.\n"
+            f"If that is the wrong store, call save_memory again with "
+            f"store=\"instruction|rule|fact|note\".")
 
 
 def handle_read_mcp_resource(params: dict) -> str:
@@ -3561,7 +3614,7 @@ Rules:
 - Keep responses concise. Focus on code, not lengthy explanations.
 - Use absolute or project-relative paths.
 - If a task is done, stop calling tools and summarize.
-- Memory files listed in the memory index can be read with read_file when you need their detail.
+- What you have been asked to remember reaches you already: standing rules in the imperative section, everything else retrieved per message. There is no index to consult.
 
 Clarifying questions:
 - When a task has more than one reasonable interpretation, involves a choice
@@ -4031,19 +4084,283 @@ def load_memory_index() -> str:
         return idx.read_text(encoding="utf-8")
     return ""
 
-def save_memory(key: str, description: str, content: str) -> None:
-    """Persist an explicit "remember this" from the user.
 
-    Writes the markdown file (still useful to read and edit by hand) and
-    records the same thing as a fact, which is what the prompt actually reads.
-    Either way the user said it outright — no inference — so it goes active
-    immediately rather than through the evidence gate.
+# ── Where a remembered thing belongs ───────────────────────────────────────
+#
+# Four stores exist and they are not interchangeable — they differ in what
+# they cost per turn and in whether the model sees them at all:
+#
+#   instruction  ~/.tomas/instructions/  stable prompt half, memoised.
+#                Read on EVERY turn and billed once, because the stable half
+#                is what prefix caching matches on. Permanent identity.
+#   rule         directive fact          volatile tail, every turn, capped at
+#                MAX_DIRECTIVES and MAX_DIRECTIVE_CHARS. Unconditional.
+#   fact         explicit fact           volatile tail, top-5 by relevance to
+#                the message. Conditional preferences.
+#   note         ~/.tomas/self-notes/    NOT in the prompt at all — a
+#                user-facing scratchpad reachable through /notes.
+#
+# Routing used to be a two-way test (`looks_like_directive` → directive, else
+# explicit), which put "your name is TOMAS" and "prefer PowerShell on
+# Windows" in the same channel and gave the first one a per-turn price it
+# never needed to pay. The distinction that matters is not conditional vs
+# unconditional; it is *permanent* vs *revisable*.
 
-    The kind decides which prompt channel it lands in, and that decision is
-    what determines whether it gets followed. An unconditional rule ("always
-    append the date") becomes a `directive` and is injected on every turn; a
-    conditional preference ("prefers PowerShell") stays `explicit` and is
-    retrieved when the topic comes up.
+#: Identity: who the agent is, what it calls the user, what language it
+#: defaults to, how it signs off. These change about once and then never, so
+#: they belong in the half of the prompt that is cached rather than in the
+#: ten-slot budget that is re-sent every turn.
+_IDENTITY_RE = re.compile(
+    r"(?i)\b(?:your\s+name\s+is|call\s+me|address\s+(?:me|the\s+user)\s+as"
+    r"|refer\s+to\s+me\s+as|sign\s+(?:off|every\s+\w+)\s+with"
+    r"|end\s+(?:every|each|all)\s+\w+\s+with"
+    r"|(?:default|always\s+(?:reply|respond|write|answer))\s+(?:language|in)"
+    r"|звертайся\s+до\s+мене|називай\s+мене|твоє?\s+ім'?я"
+    r"|закінчуй\s+(?:кожн\w+|усі)|підписуй"
+    r"|обращайся\s+ко\s+мне|называй\s+меня|твоё?\s+имя)\b")
+
+#: Long or multi-paragraph material is reference, not a rule. Putting it in
+#: the tail would spend the standing-rule budget on something no turn needs
+#: in full.
+_NOTE_MIN_CHARS = 400
+
+
+def route_memory(text: str) -> tuple[str, str]:
+    """Which store this belongs in, and why. Returns (store, reason).
+
+    Pure and cheap on purpose: the model may override it, the user can see
+    it, and a wrong guess is one `/rules` command away from being fixed.
+    """
+    text = (text or "").strip()
+    if not text:
+        return STORE_FACT, "empty"
+    unconditional = learning.looks_like_directive(text)
+    if _IDENTITY_RE.search(text):
+        return (STORE_INSTRUCTION,
+                "identity or form of address — permanent, so it goes in the "
+                "cached instructions rather than spending a standing-rule "
+                "slot on every turn")
+    if len(text) >= _NOTE_MIN_CHARS or text.count("\n") >= 3:
+        return (STORE_NOTE,
+                "long reference material — too big for a prompt section that "
+                "is re-sent every turn")
+    if unconditional:
+        return (STORE_RULE,
+                "unconditional wording ('always'/'never'/'from now on') — it "
+                "applies to every turn, so it goes in the standing rules")
+    return (STORE_FACT,
+            "a conditional preference — retrieved when the topic comes up "
+            "rather than repeated on turns it has nothing to do with")
+
+
+# ── /rules ─────────────────────────────────────────────────────────────────
+#
+# A rule the user set lives in one of two places depending on how permanent
+# it is, and before this they could only *see* one of them and only delete
+# from it. Managing rules across both stores from one command is the point:
+# the split is an implementation detail of where the prompt puts them, not
+# something the user should have to hold in their head.
+#
+# Instruction rules are addressed as i1, i2 … (position in the file, which is
+# what a person can see); directives keep their content ids, which is what
+# reflection and /forget already use.
+
+def _rules_snapshot() -> tuple[list[str], list[dict]]:
+    try:
+        managed = instructions_manager.read_managed_rules()
+    except Exception:
+        managed = []
+    try:
+        directives = learning.load_directives()
+    except Exception:
+        directives = []
+    return managed, directives
+
+
+def _resolve_rule(ref: str):
+    """('instruction', index) | ('directive', fact) | (None, None)."""
+    ref = (ref or "").strip()
+    managed, _ = _rules_snapshot()
+    if re.fullmatch(r"(?i)i\d+", ref):
+        index = int(ref[1:]) - 1
+        if 0 <= index < len(managed):
+            return "instruction", index
+        return None, None
+    fact = learning.find_fact(ref)
+    if fact and fact.get("kind") == learning.KIND_DIRECTIVE:
+        return "directive", fact
+    return None, None
+
+
+def _handle_rules(rest: str) -> str:
+    verb, _, argument = rest.partition(" ")
+    verb, argument = verb.strip().lower(), argument.strip()
+
+    if verb in ("add", "new", "+"):
+        if not argument:
+            return (f'  {YELLOW}Usage:{RESET} {CYAN}/rules add <text>{RESET}\n'
+                    f'  {DIM}Or just type{RESET} {CYAN}#<text>{RESET}')
+        return _rules_add(argument)
+
+    if verb in ("edit", "change", "set"):
+        ref, _, new_text = argument.partition(" ")
+        if not ref or not new_text.strip():
+            return (f'  {YELLOW}Usage:{RESET} {CYAN}/rules edit <id> <new text>{RESET}')
+        kind, target = _resolve_rule(ref)
+        if kind == "instruction":
+            managed, _ = _rules_snapshot()
+            was = managed[target]
+            managed[target] = new_text.strip()
+            instructions_manager.write_managed_rules(managed)
+            invalidate_prompt_cache()
+            return (f'  {GREEN}✓{RESET} Rule {ref} updated.\n'
+                    f'     {DIM}was:{RESET} {was[:70]}\n'
+                    f'     {DIM}now:{RESET} {new_text.strip()[:70]}')
+        if kind == "directive":
+            updated = learning.edit_fact(target["id"], new_text.strip())
+            if not updated:
+                return f'  {RED}✗{RESET} Could not update {ref}.'
+            demoted = ("\n     " + DIM + "No longer worded unconditionally — "
+                       "it is now a retrieved preference, not a standing rule."
+                       + RESET) if updated.get("kind") != learning.KIND_DIRECTIVE else ""
+            return (f'  {GREEN}✓{RESET} Rule {updated["id"]} updated.\n'
+                    f'     {DIM}was:{RESET} {target.get("fact", "")[:70]}\n'
+                    f'     {DIM}now:{RESET} {updated.get("fact", "")[:70]}{demoted}')
+        return f'  {DIM}No rule {ref}. Run {RESET}{CYAN}/rules{RESET}{DIM} for the ids.{RESET}'
+
+    if verb in ("rm", "remove", "delete", "forget", "-"):
+        ref = argument.split(maxsplit=1)[0] if argument else ""
+        if not ref:
+            return (f'  {YELLOW}Usage:{RESET} {CYAN}/rules rm <id>{RESET}')
+        kind, target = _resolve_rule(ref)
+        if kind == "instruction":
+            managed, _ = _rules_snapshot()
+            removed = managed.pop(target)
+            instructions_manager.write_managed_rules(managed)
+            invalidate_prompt_cache()
+            return (f'  {GREEN}✓{RESET} Rule removed: {removed[:70]}\n'
+                    f'  {DIM}Ids below it shift up; run /rules to see them.{RESET}')
+        if kind == "directive":
+            removed = learning.forget(target["id"])
+            # Precise about what a tombstone does: it stops *reflection*
+            # inferring the rule again. Stating it yourself still brings it
+            # back, which is the behaviour you want — otherwise one /forget
+            # would permanently blacklist a rule you later change your mind on.
+            return (f'  {GREEN}✓{RESET} Rule removed: '
+                    f'{(removed or {}).get("fact", "")[:70]}\n'
+                    f'  {DIM}Reflection will not infer it again. Telling me the '
+                    f'rule yourself still restores it.{RESET}')
+        return f'  {DIM}No rule {ref}. Run {RESET}{CYAN}/rules{RESET}{DIM} for the ids.{RESET}'
+
+    if verb in ("help", "?"):
+        return _rules_help()
+
+    if verb:
+        # Unrecognised verb, but the user clearly typed a rule: "/rules always
+        # answer in Ukrainian" should not be an error message.
+        return _rules_add(rest)
+
+    return _rules_list()
+
+
+def _rules_add(text: str) -> str:
+    text = text.strip()
+    store, why = route_memory(text)
+    # `/rules add` is the user calling it a rule. Honour that: the only choice
+    # left is *which* rule store, never demotion to a retrieved preference.
+    if store not in (STORE_INSTRUCTION, STORE_RULE):
+        store = STORE_RULE
+        why = "you added it with /rules, so it is kept as a standing rule"
+    if store == STORE_INSTRUCTION:
+        if not instructions_manager.add_managed_rule(text):
+            return f'  {DIM}Already a rule.{RESET}'
+        invalidate_prompt_cache()
+        where = "instructions — applies every turn, costs nothing per turn"
+    else:
+        directives = learning.load_directives()
+        if len(directives) >= learning.MAX_DIRECTIVES:
+            return (f'  {RED}✗{RESET} {learning.MAX_DIRECTIVES} standing rules '
+                    f'already — that cap is real, they are re-sent every turn.\n'
+                    f'  {DIM}Drop one with{RESET} {CYAN}/rules rm <id>{RESET}'
+                    f'{DIM}, or reword this as identity so it lands in the '
+                    f'cached instructions.{RESET}')
+        learning.remember(learning.KIND_DIRECTIVE, text,
+                          evidence="added with /rules add", scope="global")
+        where = f"standing rules — one of {learning.MAX_DIRECTIVES} slots"
+    return (f'  {GREEN}✓{RESET} Rule added to {where}.\n'
+            f'  {DIM}{why}.{RESET}')
+
+
+def _rules_help() -> str:
+    return "\n".join([
+        f'  {BOLD}Managing rules{RESET}',
+        f'  {DIM}{"─" * 60}{RESET}',
+        f'  {CYAN}/rules{RESET}                    — list every rule, with ids',
+        f'  {CYAN}/rules add <text>{RESET}         — add one ({CYAN}#<text>{RESET} does the same)',
+        f'  {CYAN}/rules edit <id> <text>{RESET}   — reword one, keeping its id',
+        f'  {CYAN}/rules rm <id>{RESET}            — remove one',
+        '',
+        f'  {DIM}Rules live in two places, and /rules manages both:{RESET}',
+        f'  {DIM}  i1, i2 …  instructions — permanent identity, cached, free per turn{RESET}',
+        f'  {DIM}  hex ids   standing rules — re-sent every turn, max '
+        f'{learning.MAX_DIRECTIVES}{RESET}',
+    ])
+
+
+def _rules_list() -> str:
+    managed, directives = _rules_snapshot()
+    if not managed and not directives:
+        return (f'  {DIM}No rules yet. Tell me one ("always end every reply '
+                f'with the date"), type{RESET} {CYAN}#<text>{RESET}{DIM}, or run{RESET} '
+                f'{CYAN}/rules add <text>{RESET}{DIM}.{RESET}')
+
+    today = time.strftime("%Y-%m-%d")
+    lines = [f'  {BOLD}Rules ({len(managed) + len(directives)}){RESET}',
+             f'  {DIM}{"─" * 60}{RESET}']
+    if managed:
+        lines.append(f'  {BOLD}Instructions{RESET} {DIM}— permanent, cached, '
+                     f'free per turn{RESET}')
+        for i, text in enumerate(managed, 1):
+            lines.append(f'  {text[:96]}')
+            lines.append(f'     {DIM}i{i}{RESET}')
+    if directives:
+        if managed:
+            lines.append('')
+        conflicts = learning.find_conflicts(directives)
+        in_conflict = {i for pair in conflicts for i in pair}
+        lines.append(f'  {BOLD}Standing rules{RESET} {DIM}— re-sent every turn '
+                     f'({len(directives)}/{learning.MAX_DIRECTIVES}){RESET}')
+        for fact in directives:
+            text = (fact.get("fact") or "").replace("\n", " ")[:96]
+            fid = fact.get("id", "?")
+            lines.append(f'  {text}')
+            notes = []
+            expired = learning.stale_dates(fact.get("fact", ""), today)
+            if expired:
+                notes.append(f'names {", ".join(expired)}, today is {today}')
+            if fid in in_conflict:
+                notes.append('conflicts with another rule')
+            note = f'  {YELLOW}⚠ {"; ".join(notes)}{RESET}' if notes else ''
+            lines.append(f'     {DIM}{fid}{RESET}{note}')
+    lines.append('')
+    lines.append(f'  {DIM}Manage:{RESET} {CYAN}/rules add|edit|rm{RESET}'
+                 f'{DIM} — see{RESET} {CYAN}/rules help{RESET}')
+    return "\n".join(lines)
+
+def save_memory(key: str, description: str, content: str,
+                store: str = "") -> tuple[str, str]:
+    """Persist an explicit "remember this" from the user. Returns (store, why).
+
+    Writes the markdown file (still useful to read and edit by hand) and then
+    routes the same content to whichever store it belongs in. The user said it
+    outright — no inference — so it goes active immediately rather than
+    through the evidence gate.
+
+    Which store it lands in is what determines whether it gets followed, and
+    at what price. See `route_memory`: identity goes to the cached
+    instructions, unconditional rules to the standing-rule budget, conditional
+    preferences to relevance-retrieved facts, long reference material to a
+    note. `store` overrides the guess when the caller knows better.
     """
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     filename = f"{key.replace(' ', '-').lower()}.md"
@@ -4065,18 +4382,46 @@ def save_memory(key: str, description: str, content: str) -> None:
         lines.append(new_entry)
     idx.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    # Classify on the whole record: the rule wording can live in either half
+    # ("Never delete logs" / "see the runbook"). But when the content already
+    # *is* the rule — a whole sentence — prefixing it with the index summary
+    # produces "How to address the user: Address the user as MY KING", which
+    # is what then gets injected into every turn and read back to the user.
+    content_is_a_sentence = (content.strip().endswith((".", "!", "?"))
+                             and len(content.strip()) > 25)
+    body = (content.strip() if content_is_a_sentence
+            else f"{description}: {content}".strip(": "))
+    chosen, why = route_memory(body)
+    if store in MEMORY_STORES:
+        chosen, why = store, "you asked for this store"
+
+    if chosen == STORE_INSTRUCTION:
+        try:
+            instructions_manager.add_managed_rule(body)
+            invalidate_prompt_cache()
+            return chosen, why
+        except Exception:
+            # A file that cannot be written must not lose the memory: fall
+            # through to the store that needs nothing but the fact log.
+            chosen, why = STORE_RULE, "instructions file unwritable — kept as a standing rule"
+
+    if chosen == STORE_NOTE:
+        try:
+            self_notes.create_note(key, body, tags=["remembered"])
+            return chosen, why
+        except Exception:
+            chosen, why = STORE_FACT, "note store unavailable — kept as a fact"
+
     if learning.is_enabled():
         try:
-            body = f"{description}: {content}".strip(": ")
-            # Classify on the whole record: the rule wording can live in either
-            # half ("Never delete logs" / "see the runbook").
-            kind = (learning.KIND_DIRECTIVE if learning.looks_like_directive(body)
+            kind = (learning.KIND_DIRECTIVE if chosen == STORE_RULE
                     else learning.KIND_EXPLICIT)
             learning.remember(kind, body,
                               evidence=f"user asked to remember '{key}'",
                               scope="global")
         except Exception:
             pass
+    return chosen, why
 
 
 # ---------------------------------------------------------------------------
@@ -4777,7 +5122,16 @@ def tools_for_turn(messages: list) -> tuple[list[dict], list[dict]]:
     failure = _failure_context(messages)
     if failure:
         context = f"{context}\n{failure}"
-    return select_tools(pool, context, tool_ceiling())
+    # A skill that declares the tools it needs narrows the payload to them.
+    # Keyed off the user's own message, the same string `build_triggered_skills`
+    # matches on, so the allowlist and the skill body arrive together or not
+    # at all.
+    allowlist = set()
+    try:
+        allowlist = triggered_tool_allowlist(_recent_user_text(messages))
+    except Exception:
+        pass
+    return select_tools(pool, context, tool_ceiling(), allowlist=allowlist or None)
 
 
 TEXT_TOOL_PROTOCOL = """
@@ -5484,7 +5838,7 @@ SLASH_COMMANDS = {
     "load":         {"desc": "Load a saved session: /load <id>",  "icon": "📂"},
     "session":      {"desc": "Session mgmt: list/save/continue",  "icon": "📋"},
     "sessions":     {"desc": "Alias for /session list",            "icon": "📋"},
-    "rules":        {"desc": "Standing rules applied to every reply",  "icon": "📌"},
+    "rules":        {"desc": "Rules: list, add, edit, rm (or type #<text>)", "icon": "📌"},
     "note":         {"desc": "Create a self-note: /note <title> <content>", "icon": "📝"},
     "notes":        {"desc": "List all self-notes",               "icon": "📒"},
     "exit":         {"desc": "Exit TOMAS",                        "icon": "✕"},
@@ -7007,49 +7361,9 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
 
     # ── Standing rules ──
     if cmd == "rules":
-        rest = (parts[1] if len(parts) > 1 else "").strip()
-        if rest.startswith("forget"):
-            target = rest.split(maxsplit=1)
-            if len(target) < 2:
-                return (f'  {YELLOW}Usage:{RESET} {CYAN}/rules forget <id>{RESET}')
-            removed = learning.forget(target[1].strip())
-            if not removed:
-                return f'  {DIM}No rule with id {target[1].strip()}.{RESET}'
-            # Precise about what a tombstone does: it stops *reflection*
-            # inferring the rule again. Stating it yourself still brings it
-            # back, which is the behaviour you want — otherwise one /forget
-            # would permanently blacklist a rule you later change your mind on.
-            return (f'  {GREEN}✓{RESET} Rule removed: '
-                    f'{removed.get("fact", "")[:70]}\n'
-                    f'  {DIM}Reflection will not infer it again. Telling me the '
-                    f'rule yourself still restores it.{RESET}')
+        return _handle_rules((parts[1] if len(parts) > 1 else "").strip())
 
-        directives = learning.load_directives()
-        if not directives:
-            return (f'  {DIM}No standing rules. Tell me one ("always end every '
-                    f'reply with the date") and it will be saved.{RESET}')
-
-        today = time.strftime("%Y-%m-%d")
-        conflicts = learning.find_conflicts(directives)
-        in_conflict = {i for pair in conflicts for i in pair}
-        lines = [f'  {BOLD}Standing rules ({len(directives)}){RESET}',
-                 f'  {DIM}Applied to every reply, on every turn.{RESET}',
-                 f'  {DIM}{"─" * 60}{RESET}']
-        for i, fact in enumerate(directives, 1):
-            text = (fact.get("fact") or "").replace("\n", " ")[:96]
-            fid = fact.get("id", "?")
-            lines.append(f'  {i}. {text}')
-            notes = []
-            expired = learning.stale_dates(fact.get("fact", ""), today)
-            if expired:
-                notes.append(f'names {", ".join(expired)}, today is {today}')
-            if fid in in_conflict:
-                notes.append('conflicts with another rule')
-            note = f'  {YELLOW}⚠ {"; ".join(notes)}{RESET}' if notes else ''
-            lines.append(f'     {DIM}{fid}{RESET}{note}')
-        lines.append('')
-        lines.append(f'  {DIM}Remove one with{RESET} {CYAN}/rules forget <id>{RESET}')
-        return "\n".join(lines)
+    # (see _handle_rules, defined above)
 
     # ── Self-note commands ──
     if cmd == "note":
@@ -8209,6 +8523,18 @@ def main() -> int:
 
             # ── Record for self-improvement ──
             self_improve.record_user_message(user_input)
+
+            # ── `#` adds a rule ──
+            # The shortest path from "I want this to always happen" to a
+            # stored rule. A slash command is one keystroke longer and one
+            # decision harder: you have to remember whether it is /rules,
+            # /remember or /note. `#` is the whole gesture, and it routes to
+            # the same two stores /rules manages.
+            if user_input.startswith('#') and user_input[1:].strip():
+                print(f'  {MAGENTA}{BOLD}▌ TOMAS{RESET}')
+                print(f'  {_rules_add(user_input[1:].strip())}')
+                print()
+                continue
 
             # ── Slash command handling ──
             if user_input.startswith('/'):

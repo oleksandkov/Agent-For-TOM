@@ -114,6 +114,14 @@ def validate_frontmatter(frontmatter: dict, fallback_name: str) -> tuple[dict, l
         # document-style-match for anyone asking a question *about* a
         # document. Absent is fine; the gate still asks the model to decide.
         "skip_when": (frontmatter.get("skip_when") or "").strip(),
+        # Optional allowlist: the tools this skill actually needs. A triggered
+        # skill body sits in the volatile half of the prompt and the tool
+        # block is re-sent every turn behind it, so a skill that drives
+        # subprocesses does not want 250 MCP schemas riding along — measured
+        # at ~125 tokens each, `word-docs` alone is ~7.5k per turn, which
+        # dwarfs everything the skill itself costs. Absent means "no opinion",
+        # and selection works exactly as before.
+        "tools": _parse_list_value(frontmatter.get("tools", "")),
         "source": (frontmatter.get("source") or "").strip().lower(),
         "version": 1,
     }
@@ -360,6 +368,26 @@ def _skill_scope(skill: Skill) -> str:
     if skill.get("skip_when"):
         lines.append(f"Do NOT use when: {str(skill['skip_when']).strip()}")
     return "\n".join(lines)
+
+
+def triggered_tool_allowlist(message: str) -> set:
+    """Tools the skills this message triggers say they need, if they all say.
+
+    Union, not intersection, and only when *every* matched skill declares one:
+    a skill with no opinion must not have one imposed on it by whichever other
+    skill happened to match the same word. Empty means "no opinion" and
+    selection behaves exactly as it did before this existed.
+    """
+    matched = match_skills(message)
+    if not matched:
+        return set()
+    allowed: set = set()
+    for skill in matched:
+        names = skill.get("tools") or []
+        if not names:
+            return set()
+        allowed.update(names)
+    return allowed
 
 
 def build_triggered_skills(message: str, max_chars: int) -> str:

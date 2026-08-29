@@ -207,7 +207,11 @@ class TestConflicts(unittest.TestCase):
 class TestRulesCommand(StoreTestCase):
 
     def test_it_reports_when_there_is_nothing(self):
-        self.assertIn("No standing rules", agent.handle_slash_command("rules", []))
+        # The empty state is also the discovery surface: it is where someone
+        # who typed /rules to find out what rules are learns how to set one.
+        out = agent.handle_slash_command("rules", [])
+        self.assertIn("No rules yet", out)
+        self.assertIn("/rules add", out)
 
     def test_it_lists_rules_with_ids(self):
         record = learning.remember(KIND_DIRECTIVE, "Always reply in Ukrainian.")
@@ -245,8 +249,9 @@ class TestRulesCommand(StoreTestCase):
         self.assertIn("shout", learning.directives_for_prompt())
 
     def test_forget_with_an_unknown_id_says_so(self):
-        self.assertIn("No rule with id",
-                      agent.handle_slash_command("rules forget deadbeef", []))
+        out = agent.handle_slash_command("rules forget deadbeef", [])
+        self.assertIn("No rule", out)
+        self.assertIn("deadbeef", out)
 
     def test_forget_without_an_id_shows_usage(self):
         self.assertIn("Usage", agent.handle_slash_command("rules forget", []))
