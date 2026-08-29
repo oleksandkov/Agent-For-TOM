@@ -1426,6 +1426,78 @@ def groq_catalog(api_key: str = "") -> list[dict]:
     return out
 
 
+def huggingface_catalog(api_key: str = "") -> list[dict]:
+    """Every model HF's Inference Providers router can currently serve.
+
+    Went through the generic `openai_list` fetcher until 2026-08-29, which
+    reads only `{id}` off `/v1/models` — the same thin shape used for
+    endpoints that genuinely have nothing richer. HF's router is not one of
+    those: its `/v1/models` entry for one model is
+
+        {"id": "...", "architecture": {"input_modalities": [...],
+         "output_modalities": [...]},
+         "providers": [{"provider": "novita", "status": "live",
+                        "context_length": 1048576, "supports_tools": true,
+                        "is_free": false, ...}, ...]}
+
+    — a model routed through several backing providers, each with its own
+    window, price and tool support. Reading only `id` out of that and then
+    falling to the generic-fallback's guessed OpenRouter-shaped names (see
+    `agent_cli._provider_model_entries`) is how `qwen/qwen-2.5-72b-instruct`
+    ended up offered for this endpoint: a real OpenRouter slug, and not one
+    of the 136 ids `router.huggingface.co` actually serves — HF's own naming
+    is `Qwen/Qwen2.5-72B-Instruct` when it appears at all, case included.
+
+    One model can list several providers at different windows; the largest
+    live one is reported, on the theory that a menu picking a model is
+    choosing capability, not routing — the request itself does not name a
+    backing provider and HF picks one internally.
+    """
+    key = api_key or os.environ.get("HF_TOKEN", "")
+    if not key:
+        return []
+    spec = registry.spec("huggingface")
+    headers = {"Content-Type": "application/json",
+               "Authorization": f"Bearer {key}"}
+    if spec:
+        headers.update(spec.extra_headers)
+    base = spec.base_url if spec else "https://router.huggingface.co/v1"
+    try:
+        data = _get_json(f"{base}/models", headers, timeout=_PROBE_TIMEOUT)
+    except Exception:
+        return []
+
+    out: list[dict] = []
+    for entry in (data or {}).get("data") or []:
+        model_id = entry.get("id")
+        if not model_id:
+            continue
+        arch = entry.get("architecture") or {}
+        outputs = arch.get("output_modalities") or ["text"]
+        if "text" not in outputs:
+            continue
+        live = [p for p in (entry.get("providers") or [])
+                if p.get("status") == "live"]
+        if not live:
+            continue
+        out.append({
+            "id": model_id,
+            "name": model_id,
+            "label": model_id,
+            "context_window": max((p.get("context_length") or 0)
+                                  for p in live),
+            "vision": "image" in (arch.get("input_modalities") or []),
+            # Unlike Groq, every live model declares this explicitly — it is
+            # `tool_call_known=True` whichever way it comes out, never a
+            # default the picker has to guess past.
+            "tool_call": any(p.get("supports_tools") for p in live),
+            "tool_call_known": True,
+            "free": any(p.get("is_free") for p in live),
+        })
+    out.sort(key=lambda m: (-m["context_window"], m["id"]))
+    return out
+
+
 def zen_model_catalog(api_key: str = "") -> list[dict]:
     """`zen_catalog` in the shape every other fetcher returns."""
     try:
@@ -1478,6 +1550,7 @@ CATALOG_FETCHERS = {
     "zen_catalog": zen_model_catalog,
     "google_catalog": google_model_catalog,
     "groq_catalog": groq_catalog,
+    "huggingface_catalog": huggingface_catalog,
     "openrouter_catalog": openrouter_catalog,
     "ollama_catalog": _ollama_list_catalog,
 }

@@ -2372,6 +2372,63 @@ def _configure_generic(spec) -> bool:
     return True
 
 
+def _catalog_row(m: dict) -> tuple[str, str]:
+    """One `CANONICAL_CATALOG_KEYS` entry as a picker row: `(label, model_id)`.
+
+    The context window leads every row. It is the number that decides what a
+    model can be asked to do — a 512-token prompt-guard classifier and a
+    131,072-token coder sat next to each other in the Groq list, identical
+    apart from their names, and the menu gave the user nothing to tell them
+    apart. `? ctx` when the catalogue does not publish one, never a guess:
+    inventing windows is what made `MODEL_CONTEXT_MAP` wrong.
+
+    Shared by `_pick_model_from_catalog` (first-run configuration) and
+    `_provider_model_entries` (the Change model menu), so a model does not
+    describe itself one way while being chosen and another way while being
+    changed.
+    """
+    marks = [f"{m['context_window']:,} ctx" if m.get('context_window')
+             else '? ctx']
+    if not m.get('tool_call_known'):
+        marks.append('tools unknown')
+    elif not m.get('tool_call'):
+        marks.append('no tools')
+    if m.get('vision'):
+        marks.append('vision')
+    return f"  {m['id']}  {DIM}({' · '.join(marks)}){RESET}", m['id']
+
+
+def _static_rows(models: list[tuple[str, int]]) -> list[tuple[str, str | None]]:
+    """Rows for a provider with no readable listing, from `(id, window)` pairs.
+
+    The windows here are published figures for a list that is *already*
+    hardcoded — they rot at exactly the same rate as the model names beside
+    them, and no faster. Anything with a real catalogue goes through
+    `_catalog_row` instead and reads its window off the endpoint.
+    """
+    return [_catalog_row({'id': mid, 'context_window': ctx,
+                          'tool_call': True, 'tool_call_known': True})
+            for mid, ctx in models]
+
+
+def _live_catalog_rows(provider_id: str) -> list[tuple[str, str | None]]:
+    """Rows from the provider's own catalogue, or `[]` if it does not answer.
+
+    Cached: this runs on every redraw of the menu, and an endpoint round trip
+    per keypress is what the arrow-key list cannot afford.
+    """
+    import net_probe
+    import provider_manager
+    active = provider_manager.get_active()
+    key = active.api_key if active and active.type == provider_id else ''
+
+    def _fetch():
+        return provider_manager.catalog_for(provider_id, key)
+
+    catalog = net_probe.cached(f'{provider_id}_catalog_rows', 60.0, _fetch)
+    return [_catalog_row(m) for m in catalog] if catalog else []
+
+
 def _pick_model_from_catalog(spec, catalog: list) -> str:
     """Choose a model, saying what each one is before it is chosen.
 
@@ -2393,18 +2450,9 @@ def _pick_model_from_catalog(spec, catalog: list) -> str:
             rows.append(f'{DIM}{heading}{RESET}')
             values.append(None)
         for m in group[:120]:
-            marks = []
-            if m['context_window']:
-                marks.append(f"{m['context_window']:,} ctx")
-            if not m['tool_call_known']:
-                marks.append('tools unknown')
-            elif not m['tool_call']:
-                marks.append('no tools')
-            if m['vision']:
-                marks.append('vision')
-            note = f"  {DIM}({' · '.join(marks)}){RESET}" if marks else ''
-            rows.append(f'  {m["id"]}{note}')
-            values.append(m['id'])
+            label, value = _catalog_row(m)
+            rows.append(label)
+            values.append(value)
 
     idx = arrow_menu(f'{spec.label} — choose a model', rows,
                      footer=DEFAULT_FOOTER)
@@ -2788,6 +2836,7 @@ PROVIDER_TYPE_TO_DETECT = {
     "google": "google",
     "ollama": "ollama",
     "groq": "groq",
+    "huggingface": "huggingface",
 }
 
 
@@ -2810,6 +2859,7 @@ PROVIDER_LABELS = {
     "google": "Google AI",
     "ollama": "Ollama (local)",
     "groq": "Groq",
+    "huggingface": "Hugging Face",
     "other": "Generic",
 }
 
@@ -2838,25 +2888,35 @@ def _provider_model_entries(provider: str) -> list[tuple[str, str | None]]:
         # (unlike OpenRouter's public one), and unlike OpenRouter or Zen it
         # publishes no per-model pricing at all — every model on the account
         # is accessible the same way, so there is no free/paid split to draw.
-        import net_probe
-        import provider_manager
-        active = provider_manager.get_active()
-
-        def _probe_groq():
-            if active is None or active.type != "groq":
-                return []
-            try:
-                return provider_manager.list_models(active)
-            except Exception:
-                return []
-
-        model_ids = net_probe.cached('groq_models', 60.0, _probe_groq)
-        if model_ids:
-            entries = [('── Available to this key ──', None)]
-            entries += [(f'  {m}', m) for m in sorted(model_ids)]
+        #
+        # Through `groq_catalog`, not the bare `/v1/models` ids this used to
+        # read. Two things came with that listing and were being thrown away:
+        # `context_window`, so every row was a name and nothing else; and
+        # `output_modalities`, so `whisper-large-v3` (transcription) and both
+        # `canopylabs/orpheus` voices (speech) were offered as chat models —
+        # four rows out of fourteen that fail the moment they are picked.
+        entries = _live_catalog_rows('groq')
+        if entries:
+            entries.insert(0, ('── Available to this key ──', None))
         else:
             entries = [
                 ('── Groq is not answering ──', None),
+                (f'  {DIM}Check the API key under Connect / configure '
+                 f'provider.{RESET}', None),
+            ]
+    elif provider == "huggingface":
+        # Live, through `huggingface_catalog` — see its docstring for why
+        # this endpoint needed its own fetcher rather than the generic
+        # `openai_list` one: the router's real ids, windows and tool support
+        # are all in the listing, and reading only `id` out of it was what
+        # let the generic fallback's guessed OpenRouter-shaped names stand in
+        # for real ones and fail on selection.
+        entries = _live_catalog_rows('huggingface')
+        if entries:
+            entries.insert(0, ('── Available to this key ──', None))
+        else:
+            entries = [
+                ('── Hugging Face is not answering ──', None),
                 (f'  {DIM}Check the API key under Connect / configure '
                  f'provider.{RESET}', None),
             ]
@@ -2874,7 +2934,14 @@ def _provider_model_entries(provider: str) -> list[tuple[str, str | None]]:
         free = cat.free()
         if free:
             entries.append(('── Free (no charge) ──', None))
-            entries += [(f'  {m.label}', m.id) for m in free]
+            # `zen_catalog` has carried the window, tool and vision flags all
+            # along; the row showed the label alone. Rendered by the same
+            # helper as every other provider so the columns line up.
+            entries += [_catalog_row({'id': m.id, 'context_window': m.context,
+                                      'tool_call': m.tool_call,
+                                      'tool_call_known': True,
+                                      'vision': m.vision})
+                        for m in free]
         # Only when the list is actually doubtful. A fresh cache is the normal
         # fast path, not a degraded one — warning on it would train the user to
         # ignore the warning that matters.
@@ -2886,16 +2953,18 @@ def _provider_model_entries(provider: str) -> list[tuple[str, str | None]]:
             entries.insert(0, (f'{DIM}(offline — cached list, {hours}h old){RESET}',
                                None))
     elif provider == "anthropic":
-        entries = [
-            ('── Anthropic Direct ──', None),
-            ('claude-sonnet-4-5',                 'claude-sonnet-4-5'),
-            ('claude-opus-4-5',                   'claude-opus-4-5'),
-            ('claude-opus-4',                     'claude-opus-4'),
-            ('claude-sonnet-4',                   'claude-sonnet-4'),
-            ('claude-haiku-4-5',                  'claude-haiku-4-5'),
-            ('claude-3-5-sonnet-20241022',        'claude-3-5-sonnet-20241022'),
-            ('claude-3-5-haiku-20241022',         'claude-3-5-haiku-20241022'),
-        ]
+        # Static: api.anthropic.com publishes no listing this menu can read,
+        # so the windows come from the docs rather than the endpoint. Every
+        # current Claude model is 200,000 tokens.
+        entries = [('── Anthropic Direct ──', None)] + _static_rows([
+            ('claude-sonnet-4-5',          200_000),
+            ('claude-opus-4-5',            200_000),
+            ('claude-opus-4',              200_000),
+            ('claude-sonnet-4',            200_000),
+            ('claude-haiku-4-5',           200_000),
+            ('claude-3-5-sonnet-20241022', 200_000),
+            ('claude-3-5-haiku-20241022',  200_000),
+        ])
     elif provider == "ollama":
         # Live, never static: the only models worth offering are the ones
         # installed on this machine, and a hardcoded list of them would be
@@ -2916,7 +2985,12 @@ def _provider_model_entries(provider: str) -> list[tuple[str, str | None]]:
                 ctx = (f"{'' if m.get('exact', True) else '≤'}"
                        f"{m['context_window']:,} ctx"
                        if m['context_window'] else '? ctx')
-                note = f"{ctx}{', ' + '/'.join(marks) if marks else ''}"
+                # Same ` · ` separator every other provider's rows use — this
+                # branch kept its own `ctx, tools/vision` spelling, which read
+                # as a different menu once the other providers grew windows.
+                # The `≤` is why it is not simply `_catalog_row`: only Ollama
+                # distinguishes a declared window from a capped one.
+                note = ' · '.join([ctx, *marks])
                 # Tool use is not decoration here: without it the agent drops
                 # to the text protocol, so it is the single fact that decides
                 # whether a local model is usable for real work.
@@ -2949,37 +3023,52 @@ def _provider_model_entries(provider: str) -> list[tuple[str, str | None]]:
                  f'Connect / configure provider.{RESET}', None),
             ]
     elif provider == "openai":
-        entries = [
-            ('── OpenAI models ──', None),
-            ('gpt-4o-mini',                       'gpt-4o-mini'),
-            ('gpt-4o',                            'gpt-4o'),
-            ('gpt-4.1',                           'gpt-4.1'),
-            ('gpt-4.1-mini',                      'gpt-4.1-mini'),
-            ('gpt-4.1-nano',                      'gpt-4.1-nano'),
-            ('gpt-4.5-preview',                   'gpt-4.5-preview'),
-            ('o3-mini',                           'o3-mini'),
-            ('o4-mini',                           'o4-mini'),
-            ('o1',                                'o1'),
-            ('o1-mini',                           'o1-mini'),
-        ]
+        # OpenAI's `/v1/models` answers with ids and nothing else — no window,
+        # no capabilities — so it cannot fill this list the way Groq's or
+        # Google's does. Windows are the published figures.
+        entries = [('── OpenAI models ──', None)] + _static_rows([
+            ('gpt-4o-mini',     128_000),
+            ('gpt-4o',          128_000),
+            ('gpt-4.1',       1_047_576),
+            ('gpt-4.1-mini',  1_047_576),
+            ('gpt-4.1-nano',  1_047_576),
+            ('gpt-4.5-preview', 128_000),
+            ('o3-mini',         200_000),
+            ('o4-mini',         200_000),
+            ('o1',              200_000),
+            ('o1-mini',         128_000),
+        ])
     else:
-        # Generic fallback — broad coverage
-        entries = [
-            ('openai/gpt-4o-mini',                'openai/gpt-4o-mini'),
-            ('openai/gpt-4o',                     'openai/gpt-4o'),
-            ('anthropic/claude-sonnet-4.5',       'anthropic/claude-sonnet-4.5'),
-            ('anthropic/claude-3.5-sonnet',       'anthropic/claude-3.5-sonnet'),
-            ('anthropic/claude-3.5-haiku',        'anthropic/claude-3.5-haiku'),
-            ('google/gemini-2.5-flash',           'google/gemini-2.5-flash'),
-            ('google/gemini-2.5-pro',             'google/gemini-2.5-pro'),
-            ('meta-llama/llama-3.3-70b-instruct', 'meta-llama/llama-3.3-70b-instruct'),
-            ('meta-llama/llama-4-maverick',       'meta-llama/llama-4-maverick'),
-            ('deepseek/deepseek-chat',            'deepseek/deepseek-chat'),
-            ('deepseek/deepseek-r1',              'deepseek/deepseek-r1'),
-            ('mistral/mistral-large',             'mistral/mistral-large'),
-            ('qwen/qwen-2.5-72b-instruct',        'qwen/qwen-2.5-72b-instruct'),
-            ('cohere/command-r-plus',             'cohere/command-r-plus'),
-        ]
+        # Everything else with a spec — xai, deepseek, mistral, cerebras,
+        # together, fireworks, github_models, nvidia — reaches its own
+        # listing through `catalog_for` first. Most of them answer
+        # `/v1/models` with bare ids, so the rows read `? ctx`; that is the
+        # endpoint declining to say, and it is worth more than the guessed
+        # names below, which are OpenRouter-shaped and wrong for every direct
+        # provider in that list.
+        import provider_manager
+        active = provider_manager.get_active()
+        entries = _live_catalog_rows(active.type) if active else []
+        if entries:
+            entries.insert(0, ('── Available to this key ──', None))
+        else:
+            # Generic fallback — broad coverage, no live listing to read.
+            entries = _static_rows([
+                ('openai/gpt-4o-mini',                 128_000),
+                ('openai/gpt-4o',                      128_000),
+                ('anthropic/claude-sonnet-4.5',        200_000),
+                ('anthropic/claude-3.5-sonnet',        200_000),
+                ('anthropic/claude-3.5-haiku',         200_000),
+                ('google/gemini-2.5-flash',          1_048_576),
+                ('google/gemini-2.5-pro',            1_048_576),
+                ('meta-llama/llama-3.3-70b-instruct',  131_072),
+                ('meta-llama/llama-4-maverick',      1_048_576),
+                ('deepseek/deepseek-chat',              64_000),
+                ('deepseek/deepseek-r1',                64_000),
+                ('mistral/mistral-large',              131_072),
+                ('qwen/qwen-2.5-72b-instruct',          32_768),
+                ('cohere/command-r-plus',              128_000),
+            ])
 
     entries += [
         ('── Custom model ──', None),

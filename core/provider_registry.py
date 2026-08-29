@@ -233,6 +233,21 @@ SPECS: tuple = (
         extra_headers={"User-Agent": "tomas/1.0"},
         models="groq_catalog",
         free_tier=True,
+        # Groq answers *with* a `reasoning` field and refuses to be given one
+        # back. Measured 2026-08-29 against groq/compound: the reply carries
+        # `reasoning`, and replaying it on the assistant turn — under either
+        # spelling — is rejected with
+        #
+        #   400 invalid_request_error — "'messages.2' : for 'role:assistant'
+        #   the following must be satisfied[('messages.2' : property
+        #   'reasoning_content' is unsupported)]"
+        #
+        # That is the exact opposite of what DeepSeek and Zen require, and
+        # `zen_proxy.anthropic_to_openai` replayed it for every OpenAI-wire
+        # provider. So turn 1 answered, turn 2 posted the reasoning turn 1
+        # produced, and every turn from there was a 400 — a Groq session was
+        # one question long.
+        quirks=frozenset({"no_reasoning_replay"}),
     ),
     ProviderSpec(
         id="openrouter",
@@ -381,8 +396,17 @@ SPECS: tuple = (
         key_aliases=("HUGGINGFACE_API_KEY", "HUGGING_FACE_HUB_TOKEN"),
         key_hint="hf_…",
         signup_url="https://huggingface.co/settings/tokens",
-        models="openai_list",
+        # Not `openai_list`: HF's router answers `/v1/models` with real
+        # context windows, tool support and a routed-provider list per model
+        # — `openai_list`'s bare-id reading threw all of it away, and the
+        # menu's guessed-name fallback then offered ids the router does not
+        # serve at all (`qwen/qwen-2.5-72b-instruct` — an OpenRouter slug,
+        # not one of HF's, which are `Qwen/Qwen2.5-...` when present). See
+        # `provider_manager.huggingface_catalog`.
+        models="huggingface_catalog",
         free_tier=True,
+        notes="Some models on the router are free-tier; `is_free` is read "
+              "per model, not assumed account-wide the way it is for Groq.",
     ),
     ProviderSpec(
         id="cohere",
