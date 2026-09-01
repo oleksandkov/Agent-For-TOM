@@ -97,7 +97,13 @@ _BUSY_RETRIES = 6
 _BUSY_BACKOFF_S = 0.25
 
 EDIT_ACTIONS = ("replace", "insert_after", "insert_before", "delete",
-                "style", "find_replace")
+                "style", "find_replace", "insert_equation", "equation")
+
+#: Word's Find is capped at 255 characters per argument. Over it, the call
+#: raises "String parameter too long" -- seen three times in one live session,
+#: each time on a paragraph the model was legitimately trying to rewrite. Past
+#: this length `_op_edit` rewrites the paragraph directly instead of refusing.
+MAX_FIND_CHARS = 255
 
 #: Built-in styles by `wdBuiltinStyle` constant rather than by name.
 #:
@@ -333,6 +339,178 @@ def _clean(text: str, limit: int = OUTLINE_SNIPPET) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Equations
+# ---------------------------------------------------------------------------
+#
+# A built-up Word equation reads back as rubble. Measured: the equation
+# `E = ∫_0^T P(t)dt` comes out of `Range.Text` as
+# `'𝐸 = \r0\r𝑇\r𝑃\r𝑡\r𝑑𝑡'` -- the carriage returns are structural
+# boundaries (limits, numerator/denominator) flattened onto one line, and the
+# letters are math-italic codepoints rather than ASCII. That is exactly what a
+# live session saw: five formulas rendered as `𝐸= 0 𝑇 𝑃(𝑡)𝑑𝑡` and no way to
+# edit any of them.
+#
+# `OMath.Linearize()` converts the equation back to its UnicodeMath source and
+# `BuildUp()` restores it, byte-identical -- verified round-trip. That pair is
+# how an equation is read and written here.
+
+#: Word's own maths autocorrect table: 780 entries mapping `\int` to ∫, `\sum`
+#: to ∑, `\le` to ≤ and so on. `BuildUp` does NOT apply these -- measured,
+#: `\int_0^T` builds with a literal backslash and no integral sign, while
+#: `∫_0^T` builds correctly. Reading Word's table rather than shipping our own
+#: means the vocabulary matches what the user's Word accepts, in their build.
+_AUTOCORRECT: dict = {}
+
+
+def _autocorrect_table(app: Any) -> dict:
+    r"""The `
+ame` -> symbol map, read from Word once per session."""
+    if _AUTOCORRECT:
+        return _AUTOCORRECT
+    try:
+        entries = app.OMathAutoCorrect.Entries
+        for i in range(1, entries.Count + 1):
+            entry = entries(i)
+            name, value = str(entry.Name), str(entry.Value)
+            if name.startswith("\\") and value:
+                _AUTOCORRECT[name] = value
+    except Exception:
+        pass
+    return _AUTOCORRECT
+
+
+def expand_math(text: str, table: dict) -> str:
+    r"""Turn LaTeX-shaped maths into the UnicodeMath `BuildUp` understands.
+
+    A model asked for an equation writes LaTeX, because that is what maths
+    looks like in text. Word does not read LaTeX. Measured, building each of
+    these directly:
+
+        \int_0^T P(t)dt     ->  literal backslash, no integral sign
+        \sum_{i=1}^{N} P_i  ->  ∑_({i=1}_i^{N}P)   -- structurally wrong
+        ∑_(i=1)^N P_i       ->  correct
+
+    So two conversions happen before `BuildUp`. Grouping braces become
+    parentheses, which is what UnicodeMath uses; and `\name` control words are
+    resolved through Word's own 780-entry table, so the vocabulary is whatever
+    the user's Word accepts rather than a list we would have to maintain.
+
+    Pure, and testable without Word — the table is an argument.
+
+    Only braces that *group* are touched: those after `_` or `^`, and the two
+    arguments of `\frac`. A brace anywhere else is left alone, because in
+    UnicodeMath it is a literal brace and a set is not a subscript.
+    """
+    if not text:
+        return ""
+    import re
+
+    # The LaTeX constructs whose *shape* differs, handled before the table
+    # turns their names into symbols. `\sqrt` is in Word's table and becomes √,
+    # but the brace group after it is not a subscript so the `_{}`/`^{}` rule
+    # below never reaches it — measured, `\sqrt{x}` built as `√({x} )`.
+    text = re.sub(r"\\d?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r"(\1)/(\2)", text)
+    text = re.sub(r"\\sqrt\s*\{([^{}]*)\}", r"√(\1)", text)
+
+    for name in sorted(table or {}, key=len, reverse=True):
+        if name in text:
+            text = text.replace(name, table[name])
+
+    # _{x} -> _(x) and ^{x} -> ^(x); repeated so nested groups collapse too.
+    for _ in range(3):
+        replaced = re.sub(r"([_^])\s*\{([^{}]*)\}", r"\1(\2)", text)
+        if replaced == text:
+            break
+        text = replaced
+    return text
+
+
+def readable_math(text: str) -> str:
+    """Math-italic codepoints back to ASCII, for something a model can read.
+
+    `NFKC` maps 𝐸 to E, 𝑇 to T and leaves ∫, ∑, ≤ alone -- so the operators
+    survive and the variable names stop being unreadable escapes.
+    """
+    import unicodedata
+    return unicodedata.normalize("NFKC", text or "")
+
+
+def _linear_source(omath: Any) -> str:
+    """The editable UnicodeMath source of one equation.
+
+    Linearize/BuildUp mutates and restores, so `doc.Saved` is put back: reading
+    an equation must not leave the document looking edited. The two undo steps
+    it costs cancel each other out.
+    """
+    try:
+        raw = str(getattr(omath.Range, "Text", "") or "")
+    except Exception:
+        raw = ""
+
+    try:
+        omath.Linearize()
+    except Exception:
+        return readable_math(raw)          # never linearised; nothing to undo
+
+    # From here the equation is FLAT in the user's document and must be built
+    # back up whatever happens. Reading its text is the part that can throw,
+    # and without the `finally` a failed read would leave the equation
+    # permanently destroyed by what the user asked to be a read.
+    try:
+        source = str(omath.Range.Text or "")
+    except Exception:
+        source = raw
+    finally:
+        try:
+            omath.BuildUp()
+        except Exception:
+            pass
+    return readable_math(source).replace(chr(13), " ").strip()
+
+
+def _read_equations(doc: Any) -> list[dict]:
+    """Every equation, with the paragraph it sits in and its linear source.
+
+    The paragraph is found by asking each paragraph whether it holds an
+    equation, not by converting the equation's character offset into a
+    paragraph number. The offset arithmetic —
+    `doc.Range(0, omath.Range.Start).Paragraphs.Count` — is off by one at a
+    paragraph boundary, which put every equation one paragraph early and made
+    the outline list the same equation twice: once as itself and once as the
+    rubble its own paragraph reads as. `Range.OMaths.Count` per paragraph is
+    exact, and costs one pass.
+    """
+    equations: list[dict] = []
+    try:
+        if not doc.OMaths.Count:
+            return equations
+    except Exception:
+        return equations
+
+    was_saved = bool(getattr(doc, "Saved", True))
+    seen = 0
+    for index in range(1, doc.Paragraphs.Count + 1):
+        try:
+            holder = doc.Paragraphs(index).Range.OMaths
+            for k in range(1, holder.Count + 1):
+                seen += 1
+                omath = holder(k)
+                equations.append({
+                    "index": seen,
+                    "paragraph": index,
+                    "display": int(getattr(omath, "Type", 0)) == 0,
+                    "source": _linear_source(omath),
+                })
+        except Exception:
+            continue
+    try:
+        doc.Saved = was_saved
+    except Exception:
+        pass
+    return equations
+
+
+# ---------------------------------------------------------------------------
 # Outline
 # ---------------------------------------------------------------------------
 
@@ -350,6 +528,7 @@ def fingerprint(descriptors: list[dict]) -> str:
 
 
 def format_outline(descriptors: list[dict], tables: list[dict], header: dict,
+                   equations: Optional[list[dict]] = None,
                    max_paragraphs: int = MAX_OUTLINE_PARAGRAPHS) -> str:
     """Render the outline the model reads. Pure, and the ref is a raw index.
 
@@ -379,14 +558,51 @@ def format_outline(descriptors: list[dict], tables: list[dict], header: dict,
         lines.append(f"! {note}")
     lines.append("")
 
+    # A paragraph that *is* a display equation is listed as the equation
+    # rather than as the rubble its text reads as: `[p21] Звичайний
+    # "𝐸= 0 𝑇 𝑃(𝑡)𝑑𝑡"` told a live session nothing it could act on.
+    #
+    # An *inline* equation is a different case and replacing the line there
+    # loses the sentence around it. Measured: "The energy is E=a^2 where a is
+    # amplitude..." was listed as just `=a^2`, so the prose the model needed
+    # to edit had disappeared from the outline entirely. Inline equations are
+    # therefore annotated onto the paragraph, never substituted for it.
+    display_by_paragraph: dict = {}
+    inline_by_paragraph: dict = {}
+    for eq in (equations or []):
+        target = (display_by_paragraph if eq.get("display")
+                  else inline_by_paragraph)
+        target.setdefault(eq["paragraph"], []).append(eq)
+
     shown = skipped_empty = truncated = 0
     for descriptor in descriptors:
         text = descriptor.get("text") or ""
-        if not text.strip():
+        index = descriptor["index"]
+        display_here = display_by_paragraph.get(index) or []
+        inline_here = inline_by_paragraph.get(index) or []
+        if not text.strip() and not display_here and not inline_here:
             skipped_empty += 1
             continue
         if shown >= max_paragraphs:
             truncated += 1
+            continue
+        if display_here:
+            for equation in display_here:
+                lines.append(
+                    f'[p{index}] [eq{equation["index"]}]  display eq  '
+                    f'{equation.get("source") or "(unreadable)"}')
+            shown += 1
+            continue
+        if inline_here:
+            # The sentence first — it is what the model is usually asked to
+            # change — then the equations it carries, by ref.
+            lines.append(f'[p{index}]  {(descriptor.get("style") or "Normal"):<12} '
+                         f'"{_clean(text)}"')
+            for equation in inline_here:
+                lines.append(
+                    f'       [eq{equation["index"]}]  inline eq   '
+                    f'{equation.get("source") or "(unreadable)"}')
+            shown += 1
             continue
         style = descriptor.get("style") or "Normal"
         snippet = _clean(text)
@@ -411,11 +627,19 @@ def format_outline(descriptors: list[dict], tables: list[dict], header: dict,
         footer.append(f"{skipped_empty} empty")
     if tables:
         footer.append(f"{len(tables)} table(s)")
+    if equations:
+        footer.append(f"{len(equations)} equation(s)")
     lines.append("; ".join(footer) + ".")
     lines.append(
         "Address these by ref, e.g. doc_edit action=replace ref=p3. Refs are "
-        "void after any edit that adds or removes a paragraph — and after the "
+        "void after an edit that adds or removes a paragraph — and after the "
         "user types. Prefer action=find_replace, which needs no ref.")
+    if equations:
+        lines.append(
+            "Equations are shown as their editable source. Rewrite one with "
+            "doc_edit action=equation ref=eq1 text=..., or add one with "
+            "action=insert_equation. Write maths as ∫_0^T P(t)dt or as "
+            "\\int_0^T P(t)dt — Word's own \\name table is applied.")
     return "\n".join(lines)
 
 
@@ -511,9 +735,10 @@ def _op_outline(app_key: str) -> str:
     app = _attach(app_key, start=False)
     doc = _ensure_doc(app)
     descriptors, tables, header = _retrying(lambda: _read_outline(doc))
+    equations = _retrying(lambda: _read_equations(doc))
     _STATE.outline_fingerprint = fingerprint(descriptors)
     _STATE.outline_taken_at = time.time()
-    return format_outline(descriptors, tables, header)
+    return format_outline(descriptors, tables, header, equations)
 
 
 def _op_read(app_key: str, ref: Optional[str], max_chars: int) -> str:
@@ -584,6 +809,111 @@ def _guard_unchanged(doc: Any) -> Optional[str]:
     return None
 
 
+def _replace_long(doc: Any, find: str, replacement: str) -> str:
+    """Find/replace for strings Word's own Find refuses to take.
+
+    Scans paragraphs and rewrites the ones that contain `find`. Slower than
+    Word's Find and exact rather than case-insensitive, which is the honest
+    trade for handling the case Find cannot: at 256 characters it does not
+    degrade, it raises.
+    """
+    changed = []
+    for i in range(1, doc.Paragraphs.Count + 1):
+        paragraph = doc.Paragraphs(i)
+        body = paragraph.Range.Text or ""
+        stripped = body.rstrip(chr(13))
+        if find not in stripped:
+            continue
+
+        # Only the matched span is rewritten, not the paragraph. Setting the
+        # whole paragraph's `.Text` was measured to flatten it: bold runs, and
+        # any inline equation, are lost across the parts that never matched.
+        # Word's own Find does not do that, and a fallback for a long string
+        # must not be worse than the thing it stands in for.
+        #
+        # Backwards, so that replacing one occurrence does not move the
+        # offsets of the ones still to come.
+        start = paragraph.Range.Start
+        offsets = []
+        at = stripped.find(find)
+        while at != -1:
+            offsets.append(at)
+            at = stripped.find(find, at + len(find))
+        for at in reversed(offsets):
+            doc.Range(start + at, start + at + len(find)).Text = replacement
+        changed.append(i)
+    _STATE.outline_fingerprint = ""
+    if not changed:
+        return (f"Nothing matched that {len(find)}-character string, so "
+                f"nothing changed. Over {MAX_FIND_CHARS} characters the match "
+                f"is exact, including case and punctuation — use doc_find with "
+                f"a short fragment to see the text as Word holds it.")
+    refs = ", ".join(f"p{i}" for i in changed)
+    return (f"Replaced a {len(find)}-character string in {refs} of "
+            f"{doc.Name}.\nWord's Find caps arguments at {MAX_FIND_CHARS} "
+            f"characters, so this went paragraph by paragraph instead.\n"
+            f"The outline is void; call doc_outline. Ctrl+Z in Word undoes "
+            f"this — once per paragraph.")
+
+
+def _op_equation(app: Any, doc: Any, action: str, ref: Optional[str],
+                 text: Optional[str]) -> str:
+    """Insert a new equation, or rewrite an existing one.
+
+    Both go through `BuildUp`, which is what turns linear source into a real
+    Word equation object rather than a line of maths-looking text.
+    """
+    if not text:
+        return (f"Error: action={action} needs text — the equation in linear "
+                f"form, e.g. 'E = ∫_0^T P(t)dt' or 'x^2 + y^2 = z^2'.")
+
+    source = expand_math(text, _autocorrect_table(app))
+
+    if action == "equation":
+        number = _parse_ref(ref or "", "eq")
+        if number is None:
+            return (f"Error: '{ref}' is not an equation ref. They look like "
+                    f"'eq1' and come from doc_outline.")
+        try:
+            total = doc.OMaths.Count
+        except Exception:
+            total = 0
+        if not 1 <= number <= total:
+            return (f"Error: no equation {number}; the document has {total}. "
+                    f"Call doc_outline again.")
+        omath = doc.OMaths(number)
+        was = _linear_source(omath)
+        omath.Linearize()
+        omath.Range.Text = source
+        doc.OMaths(number).BuildUp()
+        _STATE.outline_fingerprint = ""
+        return (f"Rewrote eq{number} of {doc.Name}.\n"
+                f"  was: {was}\n  now: {readable_math(source)}\n"
+                f"The outline is void; call doc_outline. Ctrl+Z undoes this.")
+
+    # insert_equation
+    if ref:
+        index = _parse_ref(ref, "p")
+        if index is None:
+            return _unknown_ref(ref)
+        if not 1 <= index <= doc.Paragraphs.Count:
+            return f"Error: no paragraph {index}."
+        doc.Paragraphs(index).Range.InsertParagraphAfter()
+        target_index = index + 1
+    else:
+        doc.Content.InsertParagraphAfter()
+        target_index = doc.Paragraphs.Count
+
+    target = _text_range(doc, doc.Paragraphs(target_index))
+    target.Text = source
+    target.OMaths.Add(target)
+    target.OMaths.BuildUp()
+    _STATE.outline_fingerprint = ""
+    return (f"Inserted an equation as paragraph {target_index} of "
+            f"{doc.Name}:\n  {readable_math(source)}\n"
+            f"The outline is void; call doc_outline. Ctrl+Z undoes this.")
+
+
 def _op_edit(app_key: str, action: str, ref: Optional[str], text: Optional[str],
              find: Optional[str], style: Optional[str]) -> str:
     app = _attach(app_key, start=False)
@@ -598,10 +928,22 @@ def _op_edit(app_key: str, action: str, ref: Optional[str], text: Optional[str],
                 "edits. Remove the restriction in Word first — this tool will "
                 "not do it for you.")
 
+    # ── equations, which are objects rather than text ──
+    if action in ("insert_equation", "equation"):
+        return _op_equation(app, doc, action, ref, text)
+
     # ── find_replace needs no ref, and is the preferred path ──
     if action == "find_replace":
         if not find:
             return "Error: action=find_replace needs `find`."
+
+        # Word's Find takes at most 255 characters per argument and raises
+        # "String parameter too long" above it. A live session hit this three
+        # times in a row rewriting whole paragraphs. Falling back to a direct
+        # paragraph rewrite does what was asked instead of refusing it.
+        if len(find) > MAX_FIND_CHARS or len(text or "") > MAX_FIND_CHARS:
+            return _replace_long(doc, find, text or "")
+
         before_text = doc.Range().Text or ""
 
         def replace_all() -> None:
@@ -688,10 +1030,24 @@ def _op_edit(app_key: str, action: str, ref: Optional[str], text: Optional[str],
                     f"spelled exactly as it appears in Word.")
         return f"Error: {action} on {ref} failed: {str(exc).splitlines()[0]}"
 
-    # Anything that adds or removes a paragraph re-indexes the rest.
-    _STATE.outline_fingerprint = ""
-    tail = ("The outline is void; call doc_outline before the next ref. "
-            "Ctrl+Z in Word undoes this.")
+    # Only an edit that adds or removes a paragraph re-indexes the rest. A
+    # `replace` or a `style` leaves every ref pointing where it did, so the
+    # fingerprint is *recomputed* rather than cleared and the next edit can go
+    # straight through. Clearing it unconditionally cost a live session about
+    # twenty round-trips: every one of its edits was followed by a doc_outline
+    # it did not need, each one re-reading the whole document.
+    #
+    # This is still safe against the case the guard exists for. The new
+    # fingerprint describes the document as it stands *after* this edit, so a
+    # human typing before the next call still mismatches and is still refused.
+    if doc.Paragraphs.Count == count:
+        _STATE.outline_fingerprint = fingerprint(_read_outline(doc)[0])
+        tail = ("Paragraph refs are still valid — this edit changed no "
+                "paragraph count. Ctrl+Z in Word undoes it.")
+    else:
+        _STATE.outline_fingerprint = ""
+        tail = ("Paragraphs were added or removed, so every ref has shifted; "
+                "call doc_outline before the next one. Ctrl+Z undoes this.")
 
     # A style change leaves the text alone, so reporting was/now would print
     # the same string twice and read as "nothing happened". Report what

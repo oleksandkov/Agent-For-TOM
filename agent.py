@@ -1766,7 +1766,8 @@ BOLD_OFF = '\033[22m'
 #: pywin32 in at module load, and `agent_cli`'s menus never touch Word.
 #: `test_office_control.py` asserts the two lists agree.
 EDIT_ACTIONS_FOR_SCHEMA = ("replace", "insert_after", "insert_before",
-                           "delete", "style", "find_replace")
+                           "delete", "style", "find_replace",
+                           "insert_equation", "equation")
 
 ACTIONS_FOR_SCHEMA = ("click", "double_click", "type", "press", "select",
                       "hover", "check", "uncheck", "clear", "scroll")
@@ -2051,12 +2052,12 @@ TOOLS: list[dict] = [
     },
     {
         "name": "doc_edit",
-        "description": "Edit the document in the user's Word window. Prefer action=find_replace, which needs no ref and cannot be invalidated by the user typing. Every edit is undoable with Ctrl+Z in Word. Editing does NOT save -- use doc_save.",
+        "description": "Edit the document in the user's Word window. Prefer action=find_replace, which needs no ref. Equations are real Word objects, not text: rewrite one with action=equation ref=eqN, add one with action=insert_equation. Write maths in linear form -- 'E = \u222b_0^T P(t)dt' or 'x^2+y^2=z^2'; LaTeX-style \\int, \\sum, \\le are translated using Word's own table, but \\frac{a}{b} is not -- write a/b. Every edit is undoable with Ctrl+Z. Editing does NOT save -- use doc_save.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": list(EDIT_ACTIONS_FOR_SCHEMA), "description": "What to do."},
-                "ref": {"type": "string", "description": "Target paragraph, e.g. 'p3', from doc_outline or doc_find. Required for everything except find_replace."},
+                "ref": {"type": "string", "description": "Target: a paragraph like 'p3', or an equation like 'eq1' for action=equation. Required for everything except find_replace and a bare insert_equation."},
                 "text": {"type": "string", "description": "New text (replace/insert_after/insert_before), or the replacement (find_replace)."},
                 "find": {"type": "string", "description": "Text to search for, with action=find_replace."},
                 "style": {"type": "string", "description": "Style name for action=style, e.g. 'Heading 1'."},
@@ -8294,6 +8295,14 @@ def read_input_with_suggestions(prompt: str) -> str:
     from version import VERSION as _VERSION
 
     buffer: list[str] = []
+    #: Where the next character goes, as an index into `buffer`.
+    #:
+    #: Until this existed the buffer was append-only: every key landed at
+    #: the end and backspace was the only way back, so correcting the
+    #: start of a long prompt meant deleting all of it. Left/Right, Home,
+    #: End and Delete all move or act on this one number, and `_place`
+    #: turns it into a screen position after each redraw.
+    pos = 0
     showing = False
     selected: int | None = None  # index of the currently highlighted suggestion
     drawn_rows = 1               # rows the input block occupied on the last draw
@@ -8345,6 +8354,17 @@ def read_input_with_suggestions(prompt: str) -> str:
     def _repr() -> str:
         return ''.join(buffer)
 
+    def _clamp() -> None:
+        """Keep the insertion point inside the buffer.
+
+        Every mutation goes through here rather than each site doing its
+        own arithmetic, because the ways to get it wrong are silent: a
+        `pos` past the end inserts nowhere, and a negative one inserts at
+        the end.
+        """
+        nonlocal pos
+        pos = max(0, min(pos, len(buffer)))
+
     def _checkpoint() -> None:
         """Remember the line before something destructive happens to it."""
         if undo_stack and undo_stack[-1] == buffer:
@@ -8385,7 +8405,30 @@ def read_input_with_suggestions(prompt: str) -> str:
         from text_display import hard_wrap, term_columns
         return hard_wrap(_build_prompt() + _repr(), max(1, term_columns() - 1))
 
-    def _refresh():
+    def _place() -> None:
+        """Put the terminal cursor at `pos`, from the end of the block.
+
+        Exact rather than approximate, because `hard_wrap` breaks on
+        width and not on words: wrapping the text *up to* `pos` lays out
+        identically to the first part of wrapping all of it, so the last
+        row of that prefix is the row the cursor belongs on and its
+        display width is the column. Word wrapping would make this a
+        guess, and a cursor one column out is worse than no cursor.
+        """
+        if pos >= len(buffer):
+            return                      # the redraw already left it here
+        from text_display import hard_wrap, term_columns, display_width
+        head = hard_wrap(_build_prompt() + ''.join(buffer[:pos]),
+                         max(1, term_columns() - 1))
+        up = (drawn_rows - 1) - (len(head) - 1)
+        move = (f'\033[{up}A' if up > 0 else '') + '\r'
+        column = display_width(head[-1])
+        if column:
+            move += f'\033[{column}C'
+        sys.stdout.write(move)
+        sys.stdout.flush()
+
+    def _refresh(place: bool = True):
         """Redraw prompt + buffer across as many rows as it needs.
 
         This used to be one row: `\\r\\033[K` clears only the row the cursor is
@@ -8400,6 +8443,9 @@ def read_input_with_suggestions(prompt: str) -> str:
         redraws it after; clearing per-row would leave that one behind.
         """
         nonlocal drawn_rows
+        # One place where `pos` is guaranteed sane, rather than trusting
+        # sixteen mutation sites to agree.
+        _clamp()
         if drawn_rows > 1:
             sys.stdout.write(f'\033[{drawn_rows - 1}A')
         sys.stdout.write('\r\033[J')
@@ -8407,6 +8453,11 @@ def read_input_with_suggestions(prompt: str) -> str:
         sys.stdout.write('\n'.join(rows))
         drawn_rows = len(rows)
         sys.stdout.flush()
+        # `_show` draws the suggestion row *below* this block and needs
+        # the cursor left at the end to get there, so it places the
+        # cursor itself once it is done.
+        if place:
+            _place()
 
     def _show():
         nonlocal showing, selected
@@ -8444,12 +8495,13 @@ def read_input_with_suggestions(prompt: str) -> str:
         # leaves the cursor after the final character, where typing continues,
         # instead of at column 0.
         from text_display import shorten, term_columns
-        _refresh()
+        _refresh(place=False)
         last_row = _rows()[-1]
         sys.stdout.write('\033[1B\r\033[2K')
         sys.stdout.write(shorten(text, max(1, term_columns() - 1)))
         sys.stdout.write('\033[1A\r' + last_row)
         sys.stdout.flush()
+        _place()
         showing = True
 
     def _hide():
@@ -8506,6 +8558,7 @@ def read_input_with_suggestions(prompt: str) -> str:
         return ''.join(chunk)
 
     def _insert(text: str) -> None:
+        nonlocal pos
         """Add pasted text, standing in a marker for anything long.
 
         A pasted file is worth sending and not worth *looking* at while you
@@ -8521,9 +8574,11 @@ def read_input_with_suggestions(prompt: str) -> str:
             marker = (f'[#{len(pastes) + 1} pasted {len(text)} chars'
                       f'{f", {lines} lines" if lines > 1 else ""}]')
             pastes[marker] = text
-            buffer.extend(marker)
+            buffer[pos:pos] = list(marker)
+            pos += len(marker)
         else:
-            buffer.extend(text)
+            buffer[pos:pos] = list(text)
+            pos += len(text)
 
     def _absorb_burst(seed: str = '') -> None:
         _insert(seed + _drain())
@@ -8569,7 +8624,8 @@ def read_input_with_suggestions(prompt: str) -> str:
                     if msvcrt.kbhit():
                         _absorb_burst()
                     else:
-                        buffer.append('\n')
+                        buffer.insert(pos, '\n')
+                        pos += 1
                     selected = None
                     _refresh()
                     _hide()
@@ -8582,7 +8638,7 @@ def read_input_with_suggestions(prompt: str) -> str:
                 if chosen is not None and _is_slash():
                     matches = _get_matches()
                     if chosen < len(matches):
-                        buffer = ['/', matches[chosen]]
+                        buffer[:] = list('/' + matches[chosen])
                 result = _expand(_repr())
                 # Save non-empty, non-command input to history (max 100)
                 if result.strip() and not result.startswith('/'):
@@ -8603,6 +8659,7 @@ def read_input_with_suggestions(prompt: str) -> str:
                 if buffer:
                     _checkpoint()
                     buffer.clear()
+                    pos = 0
                     selected = None
                     _hide()
                     _refresh()
@@ -8673,6 +8730,7 @@ def read_input_with_suggestions(prompt: str) -> str:
                         if _history_index > 0:
                             _history_index -= 1
                         buffer[:] = list(_input_history[_history_index])
+                        pos = len(buffer)
                         _refresh()
                 elif ext == 'P':  # ↓ Down arrow — history forward
                     _hide()
@@ -8683,8 +8741,44 @@ def read_input_with_suggestions(prompt: str) -> str:
                     else:
                         _history_index = len(_input_history)
                         buffer.clear()
+                    pos = len(buffer)
                     _refresh()
-                # ← / → are silently consumed
+
+                # ── Cursor movement ────────────────────────────
+                # These were 'silently consumed' -- the buffer was
+                # append-only, so the only way to fix the start of a long
+                # prompt was to delete everything after it.
+                elif ext == 'K':        # ←
+                    pos = max(0, pos - 1)
+                    _refresh()
+                elif ext == 'M':        # →
+                    pos = min(len(buffer), pos + 1)
+                    _refresh()
+                elif ext == 'G':        # Home
+                    pos = 0
+                    _refresh()
+                elif ext == 'O':        # End
+                    pos = len(buffer)
+                    _refresh()
+                elif ext == 's':        # Ctrl+← -- word left
+                    while pos > 0 and buffer[pos - 1].isspace():
+                        pos -= 1
+                    while pos > 0 and not buffer[pos - 1].isspace():
+                        pos -= 1
+                    _refresh()
+                elif ext == 't':        # Ctrl+→ -- word right
+                    while pos < len(buffer) and not buffer[pos].isspace():
+                        pos += 1
+                    while pos < len(buffer) and buffer[pos].isspace():
+                        pos += 1
+                    _refresh()
+                elif ext == 'S':        # Delete -- forward, not back
+                    if pos < len(buffer):
+                        _checkpoint()
+                        buffer.pop(pos)
+                        selected = None
+                        _refresh()
+                        _show() if _is_slash() else _hide()
                 continue
 
             # ── Tab — auto-complete slash commands OR cycle risk mode ──────
@@ -8698,13 +8792,15 @@ def read_input_with_suggestions(prompt: str) -> str:
                         )
                         if len(matches) == 1:
                             # Unambiguous → replace buffer with full command
-                            buffer = ['/', matches[0]]
+                            buffer[:] = list('/' + matches[0])
+                            pos = len(buffer)
                             selected = None
                         elif len(matches) > 1:
                             # Several matches → extend to the longest common prefix
                             prefix = os.path.commonprefix(matches)
                             if prefix and prefix != cf:
-                                buffer = ['/', prefix]
+                                buffer[:] = list('/' + prefix)
+                                pos = len(buffer)
                                 selected = None
                     _refresh()
                     _show()
@@ -8724,8 +8820,9 @@ def read_input_with_suggestions(prompt: str) -> str:
 
             # ── Backspace ─────────────────────────────────────────────────
             if ch in ('\x08', '\x7f'):
-                if buffer:
-                    buffer.pop()
+                if buffer and pos > 0:
+                    pos -= 1
+                    buffer.pop(pos)
                     selected = None
                     _refresh()
                     if _is_slash():
@@ -8740,10 +8837,12 @@ def read_input_with_suggestions(prompt: str) -> str:
             # Ctrl+U are the two readline keys that pay off without one.
             if ch == '\x17':
                 _checkpoint()
-                while buffer and buffer[-1].isspace():
-                    buffer.pop()
-                while buffer and not buffer[-1].isspace():
-                    buffer.pop()
+                while pos > 0 and buffer[pos - 1].isspace():
+                    pos -= 1
+                    buffer.pop(pos)
+                while pos > 0 and not buffer[pos - 1].isspace():
+                    pos -= 1
+                    buffer.pop(pos)
                 selected = None
                 _refresh()
                 _show() if _is_slash() else _hide()
@@ -8754,6 +8853,7 @@ def read_input_with_suggestions(prompt: str) -> str:
                 if buffer:
                     _checkpoint()
                     buffer.clear()
+                    pos = 0
                     selected = None
                     _hide()
                     _refresh()
@@ -8767,6 +8867,7 @@ def read_input_with_suggestions(prompt: str) -> str:
             if ch == '\x1a':
                 if undo_stack:
                     buffer[:] = undo_stack.pop()
+                    pos = len(buffer)
                     selected = None
                     _hide()
                     _refresh()
@@ -8806,6 +8907,7 @@ def read_input_with_suggestions(prompt: str) -> str:
                     if buffer and not _repr().endswith(' '):
                         buffer.append(' ')
                     buffer.extend(str(shot))
+                    pos = len(buffer)
                 else:
                     _hide()
                     sys.stdout.write('\033[1B\r\033[2K'
@@ -8866,7 +8968,8 @@ def read_input_with_suggestions(prompt: str) -> str:
                 if msvcrt.kbhit():
                     _absorb_burst(ch)
                 else:
-                    buffer.append(ch)
+                    buffer.insert(pos, ch)
+                    pos += 1
                 selected = None
                 _refresh()
                 if _is_slash():
