@@ -519,7 +519,8 @@ class OpenAICompatAdapter:
     def __init__(self, base_url: str, api_key: str = "",
                  extra_headers: Optional[dict] = None,
                  timeout: int = DEFAULT_TIMEOUT,
-                 preserve_tool_extras: bool = False):
+                 preserve_tool_extras: bool = False,
+                 replay_reasoning: bool = True):
         self.base_url = (base_url or "").rstrip("/")
         self.api_key = api_key or ""
         self.extra_headers = dict(extra_headers or {})
@@ -534,6 +535,13 @@ class OpenAICompatAdapter:
         #: otherwise post a Google signature to OpenAI — stripping here is
         #: what keeps that switch working.
         self.preserve_tool_extras = preserve_tool_extras
+        #: Whether an assistant turn's chain-of-thought is sent back upstream.
+        #:
+        #: On by default because the providers that reason mostly *require* it
+        #: (see `zen_proxy.reasoning_of`), and off for the ones that refuse it.
+        #: Groq is the refusing case, and the two are indistinguishable from
+        #: the response alone — both emit reasoning; only one takes it back.
+        self.replay_reasoning = replay_reasoning
         self.messages = _Messages(self)
         self._pool = _ConnectionPool(self._endpoint, timeout)
 
@@ -613,7 +621,7 @@ class OpenAICompatAdapter:
         ("Model {{model}} is not supported"). A stub that ignores the model
         field cannot catch this; a real endpoint does immediately.
         """
-        body = anthropic_to_openai(kw)
+        body = anthropic_to_openai(kw, replay_reasoning=self.replay_reasoning)
         body["model"] = kw.get("model", "")
         max_tokens = kw.get("max_tokens")
         if max_tokens:
@@ -731,5 +739,11 @@ def build_from_active():
 
     if not base or ":6446" in base:
         return None                # nothing sane to point at
-    return OpenAICompatAdapter(base, key, headers,
-                               preserve_tool_extras=provider.type == "google")
+    return OpenAICompatAdapter(
+        base, key, headers,
+        preserve_tool_extras=provider.type == "google",
+        # Read off the spec rather than matched on the type here, so adding
+        # another endpoint that refuses reasoning is a one-line spec edit and
+        # not a second place that has to be kept in sync with the first.
+        replay_reasoning="no_reasoning_replay" not in (
+            spec.quirks if spec else frozenset()))

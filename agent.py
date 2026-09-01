@@ -1824,7 +1824,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "run_command",
-        "description": "Execute a shell command. Returns '[exit N — ok|FAILED]' followed by stdout and any stderr, so you never need to append '2>&1' or infer success from the text. For a process that stays running (a dev server, a watcher), launch it detached with Windows `start /b ...` (or a trailing `&`) rather than waiting on it directly — the call returns immediately once it's launched, and its output is not captured.",
+        "description": "Execute a shell command. Returns '[exit N — ok|FAILED]' followed by stdout and any stderr, so you never need to append '2>&1' or infer success from the text. For a process that stays running (a dev server, a watcher), launch it detached with Windows `start /b ...` (or a trailing `&`) rather than waiting on it directly — the call returns immediately once it's launched, and its output is not captured. Redirect its output to a log file, then use check_progress on that file instead of polling with more run_command calls.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1832,6 +1832,17 @@ TOOLS: list[dict] = [
                 "timeout": {"type": "integer", "description": "Timeout in seconds. Default 120."},
             },
             "required": ["command"],
+        },
+    },
+    {
+        "name": "check_progress",
+        "description": "Check whether a background job is still making progress, without polling by hand. Point it at the log file a backgrounded command writes to (or a growing output directory like node_modules) — it reports the size, how much it changed since your last check on this same path, and flags a likely stall (e.g. from a full disk) instead of you re-running dir/type/tasklist in a loop.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Log file or directory to check for growth since the last call on this same path."},
+            },
+            "required": ["path"],
         },
     },
     {
@@ -2143,6 +2154,7 @@ RISK_LEVELS: dict[str, str] = {
     "write_file": "medium",
     "save_memory": "low",
     "run_command": "high",
+    "check_progress": "low",
     "fetch_url": "low",
     "fetch_url_with_browser": "medium",
     "search_web": "low",
@@ -2933,7 +2945,8 @@ def _run_command_foreground(cmd: str, env: dict, timeout: int) -> str:
                 partial = "\n".join(timed_out)
                 if len(partial) > 30000:
                     partial = partial[:15000] + "\n\n... [truncated] ...\n\n" + partial[-15000:]
-                return f"{notice} — output produced before the kill:\n{partial}"
+                return (f"{notice} — output produced before the kill:\n{partial}"
+                        + _diagnose_disk_full(partial))
 
     parts = []
     if (stdout or "").strip():
@@ -2957,7 +2970,7 @@ def _run_command_foreground(cmd: str, env: dict, timeout: int) -> str:
                   f"— earlier commands may have succeeded; their output is below")
     else:
         status = f"FAILED (exit {proc.returncode})"
-    return f"[exit {proc.returncode} — {status}]\n{body}"
+    return f"[exit {proc.returncode} — {status}]\n{body}" + _diagnose_disk_full(body)
 
 
 #: Shell separators that chain several commands into one call. `&&` and `||`
@@ -2976,6 +2989,125 @@ def _is_compound(cmd: str) -> bool:
     return any(sep in outside for sep in _COMPOUND_SEPARATORS)
 
 
+# ---------------------------------------------------------------------------
+# run_command advisories — checked before execution, never block it
+# ---------------------------------------------------------------------------
+#
+# A saved session spent 48 minutes hand-polling an `npm install` that was
+# never going to finish: its own log showed each package taking longer than
+# the last (7s -> 11s -> 57s -> 142s -> 223s) before stalling completely, and
+# nothing ever checked the one fact that explained it — the volume npm's
+# cache lives on was at 0.06 GB free. A write that slow on a near-full disk
+# looks exactly like a hang; only the free-space number tells them apart.
+# These checks put that number in front of the model before and after the
+# fact, instead of dozens of `dir`/`tasklist` calls discovering it by hand.
+
+#: Command shapes that write enough to disk for "how much room is there" to
+#: matter. Not exhaustive — a warning that fires sometimes is still worth
+#: more than the silence that let the session above run for 48 minutes.
+_DISK_HUNGRY_CMD_RE = re.compile(
+    r'\b(npm|pnpm|yarn)\s+(install|i|ci|add)\b'
+    r'|\bpip3?\s+install\b'
+    r'|\bgit\s+clone\b'
+    r'|\bdocker\s+(build|pull)\b'
+    r'|\b(choco|winget)\s+install\b'
+    r'|\bapt(-get)?\s+install\b',
+    re.IGNORECASE,
+)
+
+#: Below this, an install of any real size is more likely to stall or fail
+#: from disk exhaustion than to just be slow. Not a hard floor — actual
+#: installs vary by an order of magnitude — just the point below which the
+#: warning is worth the noise.
+LOW_DISK_WARN_GB = 2.0
+
+
+def _disk_free_gb(path: Optional[Path] = None) -> float:
+    """Free space, in GB, on the volume holding `path` (project root by
+    default). -1 if it cannot be read — this must never raise into a tool
+    result over a diagnostic that is itself optional."""
+    try:
+        return shutil.disk_usage(str(path or PROJECT_DIR)).free / (1024 ** 3)
+    except Exception:
+        return -1.0
+
+
+def _low_disk_warning(cmd: str) -> str:
+    """A prefix warning for install-shaped commands on a near-full disk, or
+    "" if neither condition holds."""
+    if not _DISK_HUNGRY_CMD_RE.search(cmd):
+        return ""
+    free = _disk_free_gb()
+    if free < 0 or free >= LOW_DISK_WARN_GB:
+        return ""
+    return (f"[warning] Only {free:.2f} GB free on this drive. Installs "
+            f"this size have previously stalled or failed here from disk "
+            f"exhaustion rather than any problem with the command itself — "
+            f"consider freeing space before this runs.\n\n")
+
+
+#: Substrings that mean "the volume ran out of room," across the OSes and
+#: tools this agent touches (Windows' own [Errno 28] wording, Linux's ENOSPC
+#: text, npm/pip's phrasing of the same). Matched against combined
+#: stdout+stderr so one check covers every command shape.
+_DISK_FULL_SIGNATURES = (
+    "no space left on device",
+    "[errno 28]",
+    "there is not enough space on the disk",
+    "disk full",
+)
+
+
+def _diagnose_disk_full(output: str) -> str:
+    """A diagnosis to append to a command's result, or "" if its output shows
+    no sign of disk exhaustion.
+
+    Also records the pattern through the learning system (`kind="note"`, the
+    same gated path self-notes uses for auto-generated observations — see
+    `self_notes._bridge_to_learning`) so a second occurrence on this machine
+    starts building toward a standing fact instead of being rediscovered
+    from scratch every session.
+    """
+    low = (output or "").lower()
+    if not any(sig in low for sig in _DISK_FULL_SIGNATURES):
+        return ""
+    free = _disk_free_gb()
+    where = f"{free:.2f} GB free" if free >= 0 else "free space unknown"
+    try:
+        learning.remember(
+            "note",
+            "This machine's project drive has run out of disk space during "
+            "a shell command. Check free space before large installs "
+            "(npm/pip/git clone/docker) rather than assuming a slow "
+            "command is merely slow.",
+            evidence=f"run_command hit a disk-full signature ({where})")
+    except Exception:
+        pass
+    return (f"\n\n[diagnosis] The volume is out of space ({where}). That is "
+            f"very likely the real cause, not the command itself — a "
+            f"near-full disk makes writes pathologically slow before they "
+            f"fail outright, which can look like a hang for a long time "
+            f"first. Free up space before retrying.")
+
+
+#: Not blocked — sometimes genuinely needed — but killing by process *name*
+#: takes out every match on the machine, not just the one this session
+#: started. `_kill_process_tree` already does this right (by PID) for
+#: processes the tool itself launched; this only reaches commands the model
+#: writes by hand.
+_UNSCOPED_KILL_RE = re.compile(
+    r'\btaskkill\b[^&|;\n]*/im\b|\bpkill\b|\bkillall\b', re.IGNORECASE)
+
+
+def _unscoped_kill_warning(cmd: str) -> str:
+    if not _UNSCOPED_KILL_RE.search(cmd):
+        return ""
+    return ("[warning] This kills every process matching that name on the "
+            "whole machine, not just ones this session started. Prefer a "
+            "PID-scoped kill (`taskkill /F /PID <pid>`) when the PID is "
+            "known, e.g. from `tasklist` or a port lookup.\n\n")
+
+
 def handle_run_command(params: dict) -> str:
     cmd = params["command"]
     for bad in BLOCKED_PATTERNS:
@@ -2983,17 +3115,136 @@ def handle_run_command(params: dict) -> str:
             return f"Error: blocked dangerous pattern: {bad}"
     timeout = int(params.get("timeout", 120))
 
+    # Advisory only — neither check blocks execution, and both are judged
+    # against what the model actually typed, before Windows normalisation
+    # rewrites it.
+    advisory = _low_disk_warning(cmd) + _unscoped_kill_warning(cmd)
+
     cmd, temp_dir = _normalise_windows_command(cmd)
     # Child processes must emit UTF-8 rather than the console codepage,
     # otherwise non-ASCII output is mangled beyond recovery on the way back.
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     try:
         if _looks_backgrounded(cmd):
-            return _run_command_background(cmd, env)
-        return _run_command_foreground(cmd, env, timeout)
+            result = _run_command_background(cmd, env)
+        else:
+            result = _run_command_foreground(cmd, env, timeout)
     finally:
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
+    return advisory + result
+
+
+#: Last-seen (size_bytes, checked_at) for a path `check_progress` has been
+#: asked to watch. Keyed by the resolved absolute path so two different
+#: spellings of the same file share one baseline.
+_PROGRESS_BASELINES: dict[str, tuple[int, float]] = {}
+
+#: Below this gap between checks, "no growth" is not evidence of a stall —
+#: it is evidence the model checked too soon. A background install writes in
+#: bursts (one fetch, one extract), not a steady drip.
+PROGRESS_MIN_STALL_SECONDS = 5.0
+
+#: Past this many files, a directory scan for `check_progress` stops and
+#: reports what it had — a stall detector must not itself become the slow
+#: part, which a full walk of a half-installed `node_modules` risks being.
+_PROGRESS_DIR_FILE_CAP = 50_000
+
+
+def _dir_size(path: Path) -> tuple[int, bool]:
+    """Recursive byte size of `path`, and whether the scan hit the cap."""
+    total = 0
+    count = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            count += 1
+            if count > _PROGRESS_DIR_FILE_CAP:
+                return total, True
+            try:
+                total += (Path(root) / name).stat().st_size
+            except OSError:
+                continue
+    return total, False
+
+
+def _tail_file(path: Path, n_lines: int = 15, max_bytes: int = 8000) -> str:
+    """The last few lines of a file, read from the end so a multi-GB log
+    costs a few KB to check rather than a full read."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            f.seek(max(0, size - max_bytes))
+            data = f.read()
+        return "\n".join(data.decode("utf-8", errors="replace").splitlines()[-n_lines:])
+    except OSError:
+        return ""
+
+
+def handle_check_progress(params: dict) -> str:
+    """Report whether a background job is still making progress, without the
+    model hand-rolling a polling loop out of run_command calls.
+
+    A saved session tried to answer "is npm still working" across two dozen
+    `dir`/`type`/`tasklist` calls, each starting from nothing, because no
+    single one of them remembered what the last one saw. This keeps that
+    baseline itself — one call answers "did anything change since I last
+    asked" — and folds in the same disk-space check `_diagnose_disk_full`
+    uses, since a stall and a full disk are usually the same event.
+    """
+    raw = (params or {}).get("path", "").strip()
+    if not raw:
+        return ("Error: check_progress needs a path — the log file a "
+                 "backgrounded command is writing to, or a growing output "
+                 "directory such as node_modules.")
+    path = _resolve(raw)
+    if not _safe(path):
+        return _outside_project_error(path)
+    if not path.exists():
+        return f"'{raw}' does not exist yet — nothing to check."
+
+    now = time.monotonic()
+    tail = ""
+    if path.is_dir():
+        size, capped = _dir_size(path)
+    else:
+        try:
+            size = path.stat().st_size
+        except OSError as e:
+            return f"Error: could not stat '{raw}': {e}"
+        capped = False
+        tail = _tail_file(path)
+
+    key = str(path)
+    prev = _PROGRESS_BASELINES.get(key)
+    _PROGRESS_BASELINES[key] = (size, now)
+
+    lines = [f"{'Directory' if path.is_dir() else 'File'}: {raw}",
+             f"Size: {size:,} bytes"
+             + (" (capped scan — larger than shown)" if capped else "")]
+
+    if prev is None:
+        lines.append("No earlier check on this path — this call is the "
+                      "baseline; call again in a bit to see whether it moved.")
+    else:
+        prev_size, prev_time = prev
+        elapsed = now - prev_time
+        delta = size - prev_size
+        lines.append(f"Since last check ({elapsed:.1f}s ago): {delta:+,} bytes")
+        if delta == 0 and elapsed >= PROGRESS_MIN_STALL_SECONDS:
+            free = _disk_free_gb(path)
+            note = f"{free:.2f} GB free on that volume" if free >= 0 else "free space unknown"
+            lines.append(f"[stalled] No growth in {elapsed:.1f}s — likely "
+                        f"stuck rather than merely slow ({note}; a near-full "
+                        f"disk is the most common cause seen here). Check "
+                        f"disk space and the process list rather than "
+                        f"waiting longer.")
+        elif delta > 0:
+            lines.append("Still growing — likely still working.")
+
+    if tail:
+        lines.append("Last lines:")
+        lines.append(tail)
+    return "\n".join(lines)
 
 SEARCH_PAGE_SIZE = 50
 
@@ -3846,6 +4097,7 @@ HANDLERS: dict[str, Callable[[dict], str]] = {
     "edit_file": handle_edit_file,
     "list_files": handle_list_files,
     "run_command": handle_run_command,
+    "check_progress": handle_check_progress,
     "search_code": handle_search_code,
     "save_memory": handle_save_memory,
     "fetch_url": handle_fetch_url,

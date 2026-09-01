@@ -336,8 +336,16 @@ def _reasoning_window() -> "int | None":
     return 4
 
 
-def anthropic_to_openai(ant_body: dict) -> dict:
-    """Convert an Anthropic-format request body to OpenAI format."""
+def anthropic_to_openai(ant_body: dict, replay_reasoning: bool = True) -> dict:
+    """Convert an Anthropic-format request body to OpenAI format.
+
+    `replay_reasoning=False` sends no `reasoning_content` at all. Not every
+    upstream that *emits* reasoning will *accept* it: Groq answers with a
+    `reasoning` field and rejects a request carrying one back
+    (`property 'reasoning_content' is unsupported`), which is the mirror image
+    of the DeepSeek requirement `reasoning_of` documents. Declared per
+    endpoint via `ProviderSpec.quirks`, not guessed from the model name.
+    """
     messages = []
 
     # Which assistant turns still carry their reasoning. Counted from the end
@@ -345,7 +353,16 @@ def anthropic_to_openai(ant_body: dict) -> dict:
     # entries, so the window means the same thing whatever a turn contained.
     window = _reasoning_window()
     source = ant_body.get("messages", [])
-    if window is None:
+    # Past the end of the list, so `_reasoning_at` is empty for every index —
+    # one branch instead of a second condition at both call sites.
+    send_none = len(source) + 1
+    if not replay_reasoning or window == 0:
+        # `window == 0` is `TOMAS_REPLAY_REASONING=0`, documented as "send
+        # none". It used to do the exact opposite: `assistant_positions[-0]`
+        # is `[0]`, so the escape hatch for an upstream that chokes on
+        # reasoning widened the window to every turn in the conversation.
+        keep_reasoning_from = send_none
+    elif window is None:
         keep_reasoning_from = 0
     else:
         assistant_positions = [i for i, m in enumerate(source)

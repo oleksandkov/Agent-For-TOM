@@ -961,7 +961,21 @@ def _client_error(err: Exception) -> ErrorOccurred:
     """
     text = str(err)
     excerpt = _upstream_excerpt(err)
-    if "reasoning_content" in text:
+    if "reasoning_content" in text or "'reasoning'" in text:
+        # Two opposite faults share this field, and telling the user the wrong
+        # one sends them to /model when the fix is a spec line. DeepSeek and
+        # Zen *require* the chain-of-thought back; Groq answers with one and
+        # refuses to be given it. Both 400 on `reasoning_content`, and only
+        # the word "unsupported" separates them — so it is read, not assumed.
+        if "unsupported" in text or "not supported" in text:
+            return ErrorOccurred(
+                "This endpoint sends a chain-of-thought back with its replies "
+                "but refuses to accept one on the way in, and the request "
+                "replayed the reasoning from an earlier turn. Mark the "
+                "provider `no_reasoning_replay` in core/provider_registry.py, "
+                "or set TOMAS_REPLAY_REASONING=0 for this session. "
+                f"Upstream said: {excerpt}",
+                detail=text, recoverable=False)
         return ErrorOccurred(
             "This endpoint answered in thinking mode and rejected a request that "
             "replayed one of its earlier turns without the reasoning it produced "
