@@ -1752,6 +1752,25 @@ BOLD_OFF = '\033[22m'
 # Tool definitions (schema sent to the model)
 # ---------------------------------------------------------------------------
 
+#: What `tab_act` accepts, spelled out here rather than imported from
+#: `core.browser.ACTIONS`.
+#:
+#: The import would be the better dependency and costs 72 ms of `asyncio` at
+#: module load — paid by every `agent_cli` menu, on every start, for a feature
+#: most sessions never touch. agent.py already defers `asyncio` twice for the
+#: same reason (see handle_fetch_url_with_browser), so the browser handlers
+#: import their engine when they run. The duplication is the price, and
+#: `test_browser_control.py` asserts the two lists agree.
+#: What `doc_edit` accepts. Duplicated from `core.office.EDIT_ACTIONS` for
+#: the same reason as ACTIONS_FOR_SCHEMA below: importing it would pull
+#: pywin32 in at module load, and `agent_cli`'s menus never touch Word.
+#: `test_office_control.py` asserts the two lists agree.
+EDIT_ACTIONS_FOR_SCHEMA = ("replace", "insert_after", "insert_before",
+                           "delete", "style", "find_replace")
+
+ACTIONS_FOR_SCHEMA = ("click", "double_click", "type", "press", "select",
+                      "hover", "check", "uncheck", "clear", "scroll")
+
 TOOLS: list[dict] = [
     {
         "name": "read_file",
@@ -1897,6 +1916,154 @@ TOOLS: list[dict] = [
             "required": ["query"],
         },
     },
+    # ── Browser control ──
+    # These attach to the browser the user already has open (see
+    # core/browser.py); they are not the headless fetcher above. The
+    # descriptions say so, because a model that picks `tab_read` to read
+    # an arbitrary URL will get whatever tab happens to be in front.
+    {
+        "name": "tab_list",
+        "description": "List the tabs of the user's OWN running browser and choose which one to work in. This attaches to a real browser with the user's logins -- it is not the headless fetcher. Call with no arguments to list tabs and see which one is attached. Use start_browser=true if no debuggable browser is running yet.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "select": {"type": "integer", "description": "Attach to this tab number (from a previous listing)."},
+                "new_tab": {"type": "string", "description": "Open a new tab at this URL and attach to it. Prefer this over navigating the user's current tab away from what they were doing."},
+                "start_browser": {"type": "boolean", "description": "Start a debuggable browser if none is running. It opens with its own profile, so the user signs in once."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "tab_snapshot",
+        "description": "List the visible interactive elements of the attached tab as numbered refs ([e7] button \"Send\"). Call this before acting: tab_act addresses elements by ref, and refs come from here. Re-snapshot after any navigation. Covers the main frame only -- controls inside an iframe are not listed.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "tab_read",
+        "description": "Read the visible text of the attached tab, or of one element by ref. Use this to understand page content; use tab_snapshot to find things to click.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Read only this element (from tab_snapshot). Omit to read the whole page."},
+                "max_chars": {"type": "integer", "description": "Clip at this many characters. Default 20000."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "tab_navigate",
+        "description": "Point the attached tab at a URL, or move through its history. This changes what the user is looking at -- to avoid disturbing their current tab, open a new one with tab_list new_tab instead.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL to open in the attached tab."},
+                "action": {"type": "string", "enum": ["back", "forward", "reload"], "description": "History action, instead of a url."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "tab_act",
+        "description": "Act in the attached tab as the user would: click, type, press a key, choose from a dropdown, hover, tick a box, scroll. Elements are addressed by ref from tab_snapshot. This runs in the user's real, logged-in browser, so an action here can send, buy, or delete for real -- act only on what was asked for.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": list(ACTIONS_FOR_SCHEMA), "description": "What to do."},
+                "ref": {"type": "string", "description": "Target element, e.g. 'e7', from tab_snapshot. Required for everything except a bare press or scroll."},
+                "text": {"type": "string", "description": "Text for action=type; pixels for action=scroll."},
+                "key": {"type": "string", "description": "Key for action=press, e.g. 'Enter', 'Escape', 'Control+A'."},
+                "option": {"type": "string", "description": "Option label or value for action=select."},
+                "submit": {"type": "boolean", "description": "Press Enter after typing. Default false."},
+                "clear_first": {"type": "boolean", "description": "Replace the field's contents rather than appending. Default true."},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "tab_screenshot",
+        "description": "Save a PNG of the attached tab and return its path. Read the file afterwards to look at it. Use when the layout matters and the text outline does not answer the question.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Where to save it. Defaults to a timestamped file under ~/.tomas/screenshots/."},
+                "full_page": {"type": "boolean", "description": "Capture the whole scrollable page rather than the viewport. Default false."},
+            },
+            "required": [],
+        },
+    },
+    # ── Live Office documents ──
+    # These attach to the Word the user already has open (see core/office.py).
+    # The descriptions say so, because a model that reaches for these to build
+    # a document from scratch will edit whatever the user is looking at.
+    {
+        "name": "doc_list",
+        "description": "List the documents open in the user's OWN running Word and choose which to work in. This edits the live document in their visible window -- it is not a file tool, and it is not for building a document from scratch (use write_file or the word-docs MCP server for a closed file). Call with no arguments to list.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "select": {"type": "integer", "description": "Attach to this document number from a previous listing."},
+                "new_document": {"type": "boolean", "description": "Create a new empty document and attach to it."},
+                "start_app": {"type": "boolean", "description": "Start Word if it is not running."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "doc_outline",
+        "description": "List the paragraphs of the attached document as numbered refs with their styles ([p12] Heading 1 \"Introduction\"). Call before editing by ref. Refs are void after any edit that adds or removes a paragraph, and after the user types -- doc_edit refuses rather than guessing.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "doc_read",
+        "description": "Read the text of the attached document, or of one paragraph by ref.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Read only this paragraph, e.g. 'p3'. Omit for the whole document."},
+                "max_chars": {"type": "integer", "description": "Clip at this many characters. Default 20000."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "doc_find",
+        "description": "Find paragraphs containing text and return their refs. Preferred over reading the whole outline when you know what you are looking for, and the refs it returns are fresh.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Literal text to look for (case-insensitive)."},
+                "max_hits": {"type": "integer", "description": "Stop after this many. Default 20."},
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "doc_edit",
+        "description": "Edit the document in the user's Word window. Prefer action=find_replace, which needs no ref and cannot be invalidated by the user typing. Every edit is undoable with Ctrl+Z in Word. Editing does NOT save -- use doc_save.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": list(EDIT_ACTIONS_FOR_SCHEMA), "description": "What to do."},
+                "ref": {"type": "string", "description": "Target paragraph, e.g. 'p3', from doc_outline or doc_find. Required for everything except find_replace."},
+                "text": {"type": "string", "description": "New text (replace/insert_after/insert_before), or the replacement (find_replace)."},
+                "find": {"type": "string", "description": "Text to search for, with action=find_replace."},
+                "style": {"type": "string", "description": "Style name for action=style, e.g. 'Heading 1'."},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "doc_save",
+        "description": "Save the attached document. Separate from doc_edit on purpose: saving is the one action Ctrl+Z cannot undo, so it is never implicit.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Save as this path instead of saving in place. Required if the document has never been saved."},
+            },
+            "required": [],
+        },
+    },
     {
         "name": "read_mcp_resource",
         "description": (
@@ -1979,6 +2146,32 @@ RISK_LEVELS: dict[str, str] = {
     "fetch_url": "low",
     "fetch_url_with_browser": "medium",
     "search_web": "low",
+    # Browser control acts in the user's *own* signed-in browser, which is a
+    # different proposition from the headless fetcher above. Reading is cheap
+    # and reversible; `tab_act` is "high" for the same reason
+    # `run_command` is — a click there can send the email, place the order or
+    # delete the repo, and it does so as the user, with their session. There
+    # is no sandbox to fall back on, so the permission prompt is the control.
+    # `tab_list` is refined by params in `risk_for`: listing reads,
+    # starting a browser launches a process.
+    "tab_list": "low",
+    "tab_snapshot": "low",
+    "tab_read": "low",
+    "tab_navigate": "medium",
+    "tab_act": "high",
+    "tab_screenshot": "low",
+    # Live Office documents. Editing is "medium" where `tab_act` is "high",
+    # and the difference is measured rather than assumed: Phase 0 showed one
+    # Ctrl+Z reverses one COM edit, so a wrong edit is recoverable by the user
+    # with a keystroke they already know. A browser click is not. `doc_save`
+    # is "medium" for the opposite reason -- it is the one action Undo cannot
+    # reverse. `doc_list` is refined by params in `risk_for`.
+    "doc_list": "low",
+    "doc_outline": "low",
+    "doc_read": "low",
+    "doc_find": "low",
+    "doc_edit": "medium",
+    "doc_save": "medium",
     "read_mcp_resource": "low",
     # "none", not "low": asking the user a question has no side effects at
     # all, and gating it behind "approve this tool call?" would put a
@@ -2000,6 +2193,15 @@ RISK_LEVELS: dict[str, str] = {
 #:   search_web    — drives a headless browser. Two launches is two Chromes.
 #:   read_mcp_resource — one stdio pipe per server carrying JSON-RPC; two
 #:                   concurrent calls would interleave frames on it.
+#:   tab_*        — one attached page and one ref map, shared by all six.
+#:                   Even the reads: a snapshot taken while another call is
+#:                   navigating would number elements on a page that no
+#:                   longer exists, and the refs are what a later click
+#:                   trusts.
+#:   doc_*         — one COM thread, one attached document, one outline
+#:                   fingerprint. Two calls at once would interleave on the
+#:                   same Word instance, and the fingerprint guard would be
+#:                   comparing against an edit still in flight.
 #:   save_memory   — writes.
 #:   ask_user_question — is a conversation, and those are sequential.
 PARALLEL_SAFE_TOOLS = frozenset({
@@ -2054,6 +2256,23 @@ def risk_for(name: str, params: Optional[dict] = None) -> str:
         if re.search(r'\b(del|rm|rmdir|erase|move|ren|format|curl|wget)\b', cmd, re.I):
             return "high"
         return "low" if READONLY_CMD.match(cmd) else "high"
+    if name == "doc_list":
+        # Listing and switching read. Starting Word, or adding a document to
+        # the user's session, is a change to what is on their screen.
+        params = params or {}
+        if params.get("start_app") or params.get("new_document"):
+            return "medium"
+        return "low"
+    if name == "tab_list":
+        # Listing tabs and switching between them reads. Starting a browser
+        # spawns a detached process, which is not something to auto-approve
+        # on the strength of the tool's name.
+        params = params or {}
+        if params.get("start_browser"):
+            return "medium"
+        if params.get("new_tab"):
+            return "medium"
+        return "low"
     return RISK_LEVELS.get(name, "high")
 
 # Patterns that are always blocked from run_command
@@ -3487,6 +3706,140 @@ def handle_search_web(params: dict) -> str:
     return f"No results found for '{query}'"
 
 
+# ── Browser control ────────────────────────────────────────────────────────
+# Thin by design: `core/browser.py` owns the connection, the loop thread and
+# every message the model reads. These six functions do argument coercion and
+# nothing else, so there is one place where "what does a failed click say"
+# is answered.
+
+def _browser_interrupt() -> bool:
+    """Whether Esc has been pressed, asked the way core/browser.py asks it.
+
+    A function and not a captured reference: `_CURRENT_INTERRUPT` is rebound
+    per turn, so a closure over the *event object* would poll the previous
+    turn's event and never fire.
+    """
+    return _CURRENT_INTERRUPT is not None and _CURRENT_INTERRUPT.is_set()
+
+
+def _browser():
+    """The engine, imported when it is used. See ACTIONS_FOR_SCHEMA."""
+    from core import browser as core_browser
+    return core_browser
+
+
+def handle_tab_list(params: dict) -> str:
+    select = params.get("select")
+    return _browser().tabs(
+        select=int(select) if select is not None else None,
+        new_tab=params.get("new_tab") or None,
+        start_browser=bool(params.get("start_browser")),
+        interrupt=_browser_interrupt,
+    )
+
+
+def handle_tab_snapshot(params: dict) -> str:
+    return _browser().snapshot(interrupt=_browser_interrupt)
+
+
+def handle_tab_read(params: dict) -> str:
+    engine = _browser()
+    return engine.read(
+        ref=params.get("ref") or None,
+        max_chars=int(params.get("max_chars", engine.MAX_READ_CHARS)),
+        interrupt=_browser_interrupt,
+    )
+
+
+def handle_tab_navigate(params: dict) -> str:
+    return _browser().navigate(
+        url=params.get("url") or None,
+        action=(params.get("action") or "").strip().lower(),
+        interrupt=_browser_interrupt,
+    )
+
+
+def handle_tab_act(params: dict) -> str:
+    return _browser().act(
+        action=(params.get("action") or "").strip().lower(),
+        ref=params.get("ref") or None,
+        text=params.get("text"),
+        key=params.get("key") or None,
+        option=params.get("option"),
+        submit=bool(params.get("submit")),
+        # Defaults to replacing the field, because a model that means to set
+        # a value and gets an append writes into whatever the user had
+        # already typed there.
+        clear_first=params.get("clear_first", True) is not False,
+        interrupt=_browser_interrupt,
+    )
+
+
+def handle_tab_screenshot(params: dict) -> str:
+    return _browser().screenshot(
+        path=params.get("path") or None,
+        full_page=bool(params.get("full_page")),
+        interrupt=_browser_interrupt,
+    )
+
+
+# ── Live Office documents ─────────────────────────────────────────────────
+# Thin, like the tab_* handlers: `core/office.py` owns the COM thread and
+# every message the model reads.
+
+def _office():
+    """The engine, imported when it is used. See EDIT_ACTIONS_FOR_SCHEMA."""
+    from core import office as core_office
+    return core_office
+
+
+def handle_doc_list(params: dict) -> str:
+    select = params.get("select")
+    return _office().documents(
+        select=int(select) if select is not None else None,
+        new_document=bool(params.get("new_document")),
+        start_app=bool(params.get("start_app")),
+        interrupt=_browser_interrupt,
+    )
+
+
+def handle_doc_outline(params: dict) -> str:
+    return _office().outline(interrupt=_browser_interrupt)
+
+
+def handle_doc_read(params: dict) -> str:
+    engine = _office()
+    return engine.read(
+        ref=params.get("ref") or None,
+        max_chars=int(params.get("max_chars", engine.MAX_READ_CHARS)),
+        interrupt=_browser_interrupt,
+    )
+
+
+def handle_doc_find(params: dict) -> str:
+    return _office().find(
+        text=params.get("text") or "",
+        max_hits=int(params.get("max_hits", 20)),
+        interrupt=_browser_interrupt,
+    )
+
+
+def handle_doc_edit(params: dict) -> str:
+    return _office().edit(
+        action=(params.get("action") or "").strip().lower(),
+        ref=params.get("ref") or None,
+        text=params.get("text"),
+        find=params.get("find") or None,
+        style=params.get("style") or None,
+        interrupt=_browser_interrupt,
+    )
+
+
+def handle_doc_save(params: dict) -> str:
+    return _office().save(path=params.get("path") or None,
+                          interrupt=_browser_interrupt)
+
+
 HANDLERS: dict[str, Callable[[dict], str]] = {
     "read_file": handle_read_file,
     "write_file": handle_write_file,
@@ -3498,6 +3851,18 @@ HANDLERS: dict[str, Callable[[dict], str]] = {
     "fetch_url": handle_fetch_url,
     "fetch_url_with_browser": handle_fetch_url_with_browser,
     "search_web": handle_search_web,
+    "tab_list": handle_tab_list,
+    "tab_snapshot": handle_tab_snapshot,
+    "tab_read": handle_tab_read,
+    "tab_navigate": handle_tab_navigate,
+    "tab_act": handle_tab_act,
+    "tab_screenshot": handle_tab_screenshot,
+    "doc_list": handle_doc_list,
+    "doc_outline": handle_doc_outline,
+    "doc_read": handle_doc_read,
+    "doc_find": handle_doc_find,
+    "doc_edit": handle_doc_edit,
+    "doc_save": handle_doc_save,
     "read_mcp_resource": handle_read_mcp_resource,
     "ask_user_question": handle_ask_user_question,
 }

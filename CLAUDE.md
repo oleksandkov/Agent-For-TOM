@@ -292,6 +292,31 @@ TOMAS (Terminal Operated Modular Agent System) — a self-hosted AI coding agent
   `run_turn` uses mid-turn, so a long exit shows *why* it is still running
   instead of leaving the terminal looking frozen right after "saved".
 
+- **The browser the user already has open is a different tool from one we
+  launch.** `fetch_url_with_browser` starts a headless, logged-out Chrome per
+  call; `core/browser.py` attaches over CDP so `tab_*` acts in the user's real
+  tabs. Four constraints, each of which cost a live run — the full reasoning is
+  in that module's docstring: the connection cannot live under `asyncio.run`
+  (one loop on a daemon thread, which also gives Esc a cancellation point);
+  the endpoint must say `localhost`, because Chrome answers `127.0.0.1` on the
+  DevTools port with a bare 404 while LISTENING; the launcher must pass
+  `--user-data-dir`, because Chrome 136+ silently ignores
+  `--remote-debugging-port` on the default profile; and the tools are `tab_*`,
+  because `browser_navigate`/`browser_snapshot` belong to the playwright MCP
+  server and a built-in taking those renames the user's own tools.
+- **Two lists that must align come from one traversal, never two queries that
+  ought to agree.** `tab_snapshot` paired `page.query_selector_all` with
+  `document.querySelectorAll`; Playwright's engine pierces open shadow roots
+  and the browser's does not, so on gemini.google.com they were 48 against 42
+  on every call. Had they matched, the outline would have silently omitted the
+  controls a component app keeps there. `_WALK_JS` returns the nodes once,
+  `_DESCRIBE_JS` describes that array. The same trap is in
+  `OFFICE_LIVE_PLAN.md` §5, where the user may type between two passes over
+  `doc.Paragraphs`. Corollary: **never advise retrying a deterministic
+  failure** — the old message said "call tab_snapshot again" and manufactured
+  the loop the loop guard had to stop, so `mismatch_message` is a function a
+  test holds to its words.
+
 ## Architecture essentials
 
 - `agent.py` — core REPL, agent loop, built-in tool definitions, permission system, slash command handler
@@ -314,6 +339,8 @@ TOMAS (Terminal Operated Modular Agent System) — a self-hosted AI coding agent
 | `skills_manager.py` | Discovers skills for `/skills` and `/skill <name>`. One format everywhere (`name`/`description`/`triggers`/`source`/`version`); malformed frontmatter is reported, never fatal; bodies load on demand; `improve_skill()` bumps the version and keeps provenance |
 | `skills/document-style-match/` | Reproduces a sample document's layout with new content. `run.py` is the entry point — `measure` then `build`, one verdict; the other scripts are its steps and are read when one fails |
 | `core/budget.py` | Context budget policy — presets as shares of the window, section toggles, per-tool/server enable. Pure: computes and persists, never draws. `/budget` and the TUI page both render `agent.render_budget`, so they cannot disagree |
+| `core/office.py` | Attaches over COM to the Word the user already has running and edits their open document live — the `doc_*` built-ins. Owns the COM thread, the busy-retry and the outline fingerprint. Not a file tool: `python-docx` and the `word-docs` MCP server write the file, which an open document ignores and then overwrites |
+| `core/browser.py` | Attaches over CDP to the browser the user already has running and drives their open tab — the `tab_*` built-ins. Owns the session's one event loop, the CDP connection and the snapshot ref map |
 | `core/features.py` | Feature switches (`~/.tomas/features.json`). Pure like `budget.py`; `/settings` and the TUI both render `FEATURES` |
 | `core/debug_log.py` | Bounded recorder for raw payloads, off unless `features.debug_view` is on. Shown by `/debug`, Ctrl+Alt+X |
 | `mcp_manager.py` | MCP server management (shared config with Claude Code at `~/.claude.json`); tools, resources and prompts |

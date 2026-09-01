@@ -65,6 +65,19 @@ _HEADLINE_ARG = {
     "fetch_url": "url",
     "fetch_url_with_browser": "url",
     "search_web": "query",
+    # For a browser action the argument worth seeing is what it does, not
+    # where: `ref` is "e7" and tells the user nothing, while "click" in front
+    # of a permission prompt is the whole decision.
+    "tab_act": "action",
+    "tab_navigate": "url",
+    "tab_read": "ref",
+    "tab_screenshot": "path",
+    # Same rule as tab_act: for an edit the argument worth seeing in a
+    # permission prompt is what it does, not which paragraph.
+    "doc_edit": "action",
+    "doc_read": "ref",
+    "doc_find": "text",
+    "doc_save": "path",
     "read_mcp_resource": "uri",
 }
 
