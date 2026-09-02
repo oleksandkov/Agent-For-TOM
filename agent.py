@@ -363,6 +363,11 @@ _session_tokens = {"input": 0, "output": 0, "calls": 0, "cached_input": 0,
                    "duplicate_input": 0, "duplicate_calls": 0,
                    "would_have_served": 0, "stream_malformed_tool_args": 0}
 _last_turn_usage = {"input": 0, "output": 0, "cached_input": 0}
+# How the last turn ended, for the `advanced_diagnostics` line. The core
+# already records all three on `AgentState` — they reached the session file
+# and nothing else, so the answer to "why did that turn stop there?" existed
+# on disk while the user watching it happen had no way to ask.
+_last_turn_diag = {"stop_reason": "", "error": "", "tool_calls": 0}
 
 # ── Session telemetry (P6-8) ──
 # Per-turn wall clock and per-tool-call outcome, so a saved session can say
@@ -417,6 +422,8 @@ def reset_session_state() -> None:
     # exact bug TestSessionTokenIsolation exists to catch.
     _session_tokens.update(dict.fromkeys(_session_tokens, 0))
     _last_turn_usage.update(dict.fromkeys(_last_turn_usage, 0))
+    _last_turn_diag.update({"stop_reason": "", "error": "", "tool_calls": 0})
+    _ollama_window_checked.clear()
     _turn_timings.clear()
     _tool_log.clear()
     _failed_turns.clear()
@@ -1268,6 +1275,110 @@ def effective_max_tokens(caps) -> int:
     reserve = output_reserve()
     ceiling = getattr(caps, "max_output_tokens", 0) or reserve
     return min(reserve, ceiling) or reserve
+
+
+def _claim_local_model() -> None:
+    """Tell `ollama_runtime` this session is about to load a local model.
+
+    Silent and best-effort: every failure here costs a model staying resident
+    for the five minutes it would have stayed resident before this existed.
+    """
+    try:
+        import provider_manager
+        import ollama_runtime
+        active = provider_manager.get_active()
+        if active is None or active.type != "ollama" or not active.model:
+            return
+        ollama_runtime.claim(active.model,
+                             provider_manager.ollama_native_root(active),
+                             provider_manager.ollama_request_headers(active))
+    except Exception:
+        pass
+
+
+def _release_local_models() -> None:
+    """Give back the VRAM this session's local models are holding.
+
+    Ollama keeps a model resident for five minutes after the last request, so
+    a session that has ended goes on occupying the card for no reason —
+    measured, three models and 8.5 GB left over from earlier runs. Unloading
+    is one call; the care is in *not* unloading a model another live TOMAS is
+    still using, which `ollama_runtime` decides by whether that session
+    still holds its lock.
+
+    Runs after the session is saved and after MCP is disconnected, because it
+    is the one piece of cleanup whose failure genuinely does not matter: the
+    five-minute timer is the fallback, and it is the behaviour that shipped.
+    """
+    try:
+        import ollama_runtime
+        results = ollama_runtime.unload_session_models()
+    except Exception:
+        return
+    for model, freed, note in results:
+        if freed:
+            print(f'  {DIM}⏏  Unloaded {model} from memory{RESET}')
+        elif note:
+            print(f'  {DIM}⏏  Kept {model} loaded — {note}{RESET}')
+
+
+#: Models whose real served window has already been checked this session, so
+#: the reading costs one HTTP GET per model rather than one per turn.
+_ollama_window_checked: set = set()
+# Reset by `reset_session_state`, like every other per-session counter: a
+# `/clear` starts a new session and the notice is worth showing again.
+
+
+def _verify_ollama_window() -> None:
+    """Compare the window TOMAS is budgeting against with what Ollama served.
+
+    Every estimate made before the first call is reasoning about a server this
+    process cannot see the configuration of. A request through the OpenAI shim
+    allocates the runner itself, so `/api/ps` immediately afterwards reports
+    the number that request was actually given — see
+    `provider_manager.ollama_shim_window`. This is that reading, taken once
+    per model per session, on a turn that has already happened.
+
+    It reports and corrects; it never raises and never retries. When the two
+    disagree the served number wins, because the disagreement is not a
+    difference of opinion: the smaller one is what the model was handed, and
+    everything past it was discarded before inference began.
+    """
+    global CONTEXT_WINDOW
+    try:
+        import provider_manager
+        active = provider_manager.get_active()
+        if active is None or active.type != "ollama" or not active.model:
+            return
+        if active.model in _ollama_window_checked:
+            return
+        served = provider_manager.ollama_shim_window(active)
+        if not served:
+            return                      # not loaded: no reading, not "no window"
+        _ollama_window_checked.add(active.model)
+        believed = CONTEXT_WINDOW
+        if served >= believed:
+            return
+        # Persist it, so the next session budgets correctly from turn one
+        # instead of re-learning this after the first prompt is truncated.
+        try:
+            active.capabilities.context_window = served
+            provider_manager.persist_capabilities(active)
+        except Exception:
+            pass
+        _context_window_cache.pop(active.model, None)
+        CONTEXT_WINDOW = served
+        print(f'\n  {RED}⚠{RESET}  {BOLD}Ollama served {served:,} tokens of '
+              f'context, not the {believed:,} this model advertises.{RESET}')
+        print(f'     {DIM}Anything past {served:,} is dropped before the model '
+              f'sees it — no error, no warning. Budgeting at {served:,} from '
+              f'here.{RESET}')
+        print(f'     {DIM}Raise it by starting Ollama with '
+              f'{RESET}{CYAN}OLLAMA_CONTEXT_LENGTH{RESET}{DIM} set, or give the '
+              f'model a Modelfile with{RESET} {CYAN}PARAMETER num_ctx{RESET}'
+              f'{DIM}.{RESET}')
+    except Exception:
+        pass
 
 
 def _active_capabilities():
@@ -5422,8 +5533,15 @@ def maybe_compact(messages: list, system_prompt: str = "",
     if not plan.needed and not (force and len(messages) > 4):
         return messages
     before_tok = plan.used
-    print(f'  {DIM}[context] compacting conversation '
-          f'({plan.used:,} ≥ {plan.trigger:,} tokens, {plan.reason} limit)...{RESET}')
+    # The line itself is not optional whatever the diagnostics switch says:
+    # this is a model call the user is sitting through, with no spinner over
+    # it because it happens before the turn starts, and silence there is the
+    # dead screen `Thinking` exists to prevent. Only the arithmetic behind it
+    # is a diagnostic — "why now" is the question you ask when you are already
+    # asking why the agent is slow.
+    why = (f' ({plan.used:,} ≥ {plan.trigger:,} tokens, {plan.reason} limit)'
+           if features().enabled("advanced_diagnostics") else '')
+    print(f'  {DIM}[context] compacting conversation{why}...{RESET}')
     try:
         resp = _get_client().messages.create(
             model=_get_model(),
@@ -6312,8 +6430,15 @@ def agent_loop(system_prompt: str, messages: list) -> str:
 
     interactive = bool(getattr(sys.stdin, "isatty", lambda: False)())
     adapter = TerminalAdapter(interactive=interactive,
-                              show_status=features().enabled("status_indicator"))
+                              show_status=features().enabled("status_indicator"),
+                              diagnostics=features().enabled("advanced_diagnostics"))
     state = build_state(system_prompt, messages, adapter)
+
+    # A local model is about to be loaded into VRAM and will stay there for
+    # five minutes after this session stops talking to it. Claimed before the
+    # call rather than after, so a session killed mid-turn still leaves a
+    # record another session can see and sweep — see ollama_runtime.py.
+    _claim_local_model()
 
     turn_index = len(_turn_timings) + 1
     t0 = time.perf_counter()
@@ -6392,6 +6517,12 @@ def agent_loop(system_prompt: str, messages: list) -> str:
         _last_turn_usage["input"] = state.usage.get("input", 0)
         _last_turn_usage["output"] = state.usage.get("output", 0)
         _last_turn_usage["cached_input"] = state.usage.get("cached_input", 0)
+        _last_turn_diag["stop_reason"] = state.last_stop_reason or ""
+        _last_turn_diag["error"] = state.last_error or ""
+        _last_turn_diag["tool_calls"] = len(_tool_log) - tools_before
+        # A call has now gone through the shim, which is the only moment
+        # Ollama's real served window can be read rather than estimated.
+        _verify_ollama_window()
         _session_tokens["input"] += state.usage.get("total_input", 0)
         _session_tokens["output"] += state.usage.get("total_output", 0)
         _session_tokens["cached_input"] += state.usage.get("total_cached_input", 0)
@@ -6873,6 +7004,15 @@ def _handle_settings(arg: str) -> str:
                     f'\n  {DIM}Recorded payloads discarded.{RESET}')
         elif key == "prefill_context":
             note = f'\n  {DIM}Applies to the next new session.{RESET}'
+        elif key == "advanced_diagnostics":
+            # Says what changes, not that something changed. The switch is
+            # invisible until a turn does something unusual, so "on" with no
+            # further word looks like nothing happened.
+            note = (f'\n  {DIM}Retries, output limits, cache and token counts, '
+                    f'why each turn ended, and the detail behind every '
+                    f'error.{RESET}' if now_on else
+                    f'\n  {DIM}Back to errors, permissions and the reply '
+                    f'itself.{RESET}')
         return f'  {GREEN}✓{RESET} {matches[0]["label"]}: {state}{note}'
 
     lines = [
@@ -9320,9 +9460,14 @@ def main() -> int:
                 print(f'  {MAGENTA}{BOLD}▌ TOMAS{RESET}')
                 print(f'  {result}')
             # ── Token usage info ──
+            # Behind `advanced_diagnostics`: it is per-turn accounting, and
+            # accounting under every answer is the line that made the chat
+            # read as a machine report rather than a conversation. Nothing is
+            # lost by hiding it — `/status` asks the same question on demand,
+            # and the session file records all of it either way.
             t = _last_turn_usage
             s = _session_tokens
-            if s["calls"] > 0:
+            if s["calls"] > 0 and features().enabled("advanced_diagnostics"):
                 pct = (t["input"] + t["output"]) / CONTEXT_WINDOW * 100
                 elapsed = _fmt_duration(_turn_timings[-1]) if _turn_timings else "?"
                 # Only shown when the provider actually reports it: a hardcoded
@@ -9350,6 +9495,27 @@ def main() -> int:
                                f' ({s.get("duplicate_calls", 0)} calls'
                                + (f': {breakdown}' if breakdown else '') + ')')
                 print(f'  {DIM}┄  {t["input"]:,} in  {t["output"]:,} out  ·  total: {s["input"]:,} in  {s["output"]:,} out{cached}  ·  {pct:.1f}% of {CONTEXT_WINDOW:,} ctx  ·  {elapsed}{RESET}')
+                # How the turn ended, in the model's own vocabulary. This is
+                # the "reached the limit" question: `max_tokens` says the
+                # reply was cut off at the output ceiling, `tool_use` that it
+                # stopped to run something, `end_turn` that it was simply
+                # done. The core has recorded it on every turn since
+                # `last_stop_reason` was added and nothing displayed it, so a
+                # turn that stopped short looked identical to one that
+                # finished.
+                d = _last_turn_diag
+                ending = d["stop_reason"] or "—"
+                calls = (f'  ·  {d["tool_calls"]} tool call'
+                         f'{"" if d["tool_calls"] == 1 else "s"}'
+                         if d["tool_calls"] else '')
+                # Only when it did not already surface as an error on screen:
+                # `ErrorOccurred` prints its own detail line above, and
+                # repeating it here would say the same thing twice in four
+                # lines.
+                why = (f'  ·  {d["error"]}'
+                       if d["error"] and not d["error"].startswith("truncated")
+                       else '')
+                print(f'  {DIM}┄  ended: {ending}{calls}{why}{RESET}')
             # ── Self-improvement analysis, after the reply so it never adds latency ──
             try:
                 self_improve.maybe_analyze_after_turn()
@@ -9386,6 +9552,8 @@ def main() -> int:
         # ── Clean up MCP connections ──
         if mcp_manager:
             mcp_manager.disconnect_all()
+        # ── Release local models this session loaded ──
+        _release_local_models()
     return 0
 
 if __name__ == "__main__":

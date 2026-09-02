@@ -87,13 +87,32 @@ GOOGLE_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 OLLAMA_DEFAULT_URL = "http://localhost:11434/v1"
 
-# Ollama serves this many tokens of context unless OLLAMA_CONTEXT_LENGTH says
-# otherwise. Measured on 0.30.6: qwen3-vl:2b advertises a 262,144-token window
-# and still loads with `num_ctx=32768` (`/api/ps`), as does gemma3:4b at
-# 131,072. The OpenAI shim exposes no `num_ctx` parameter, so a model's own
+# Ollama serves this many tokens of context when nothing else specifies a
+# window. The OpenAI shim exposes no `num_ctx` parameter, so a model's own
 # maximum is a ceiling the server will not actually allocate — reporting it
 # would promise the agent a window it cannot spend.
-OLLAMA_DEFAULT_NUM_CTX = 32768
+#
+# This was 32768, recorded from a machine that had `OLLAMA_CONTEXT_LENGTH` set
+# without the measurement saying so, and it was wrong by a factor of eight.
+# Re-measured on 0.30.6 with no `OLLAMA_*` variable set anywhere: gemma3:4b
+# (advertises 131,072), qwen2.5-coder:3b (32,768), qwen3-coder-256k (262,144)
+# and smallthinker:3b (32,768) each load at **4,096** — `/api/ps` after a call
+# through `/v1/chat/completions`. This is Ollama's own shipped default and the
+# only number that is true of a server nobody has configured.
+#
+# What that costs when it is wrong, measured on the same server: an
+# 8,078-token prompt with a passphrase in the first line came back
+# `prompt_tokens: 4095`, HTTP 200, no error and no warning, and the model
+# invented an answer. Over-reporting here does not produce a failure the user
+# can see — it produces a confident wrong answer, which is why this errs low.
+#
+# Three things were ruled out as ways round it, all on 0.30.6:
+#   * the shim ignores `num_ctx`, both nested in `options` and top-level;
+#   * pre-warming through the native `/api/chat` at a larger window does not
+#     carry — the next shim call *reloads* the model back down to this value;
+#   * only a server-side `OLLAMA_CONTEXT_LENGTH`, or the model's own Modelfile
+#     `PARAMETER num_ctx`, changes what the shim allocates.
+OLLAMA_DEFAULT_NUM_CTX = 4096
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -641,18 +660,26 @@ def ollama_model_facts(provider: Provider) -> dict:
 def _ollama_served_default(declared_num_ctx: int = 0) -> int:
     """The window this server hands out when nothing asks for more.
 
-    `OLLAMA_CONTEXT_LENGTH` is the user's own explicit setting and wins
-    outright, same as before. Absent that, `declared_num_ctx` — this specific
-    model's own `PARAMETER num_ctx` from its Modelfile, read by
-    `ollama_model_facts` — is a fact about *that* model and is preferred over
-    `OLLAMA_DEFAULT_NUM_CTX`, which is one number applied to every model
-    regardless of what it actually asks to be loaded with.
+    Ordered by what Ollama itself actually does, which is the reverse of what
+    this function used to assume. Measured on 0.30.6, a server started with
+    `OLLAMA_CONTEXT_LENGTH=16384` loading a model whose Modelfile declares
+    `PARAMETER num_ctx 8192`: the model loads at **8,192**. The model's own
+    declaration is the more specific of the two and wins, so putting the
+    environment variable first reported 16,384 for a model that would be
+    served 8,192 — an over-promise, which is the direction that truncates.
+
+    `OLLAMA_CONTEXT_LENGTH` is read from *this* process's environment while
+    Ollama runs as its own service, so it is a hint rather than a reading of
+    the server: it is right when the user set it system-wide, which is how it
+    is normally set, and invisible when they set it for the server alone.
+    `ollama_shim_window` is what settles it by observation once a call has
+    actually been made.
     """
     try:
         configured = int(os.environ.get("OLLAMA_CONTEXT_LENGTH", "") or 0)
     except ValueError:
         configured = 0
-    return configured or declared_num_ctx or OLLAMA_DEFAULT_NUM_CTX
+    return declared_num_ctx or configured or OLLAMA_DEFAULT_NUM_CTX
 
 
 def _ollama_remote_models(provider: Provider) -> set:
@@ -682,26 +709,83 @@ def _ollama_served_context(provider: Provider, model_max: int,
                            declared_num_ctx: int = 0) -> int:
     """How much of `model_max` this server will actually hand out.
 
-    A loaded model reports its allocated `context_length` on `/api/ps`, which
-    is ground truth and needs no guessing. For one that is not loaded, the
-    server's default applies — configurable through OLLAMA_CONTEXT_LENGTH, else
-    this model's own declared `num_ctx` (see `_ollama_served_default`), else
-    the measured `OLLAMA_DEFAULT_NUM_CTX`. A cloud-routed model is not subject
-    to any of these and keeps its own window.
+    A loaded model reports its allocated `context_length` on `/api/ps`. That
+    used to be taken as ground truth and returned outright, which is only
+    sound if the thing that loaded it was the same endpoint we are about to
+    use. It often is not: measured on 0.30.6, a model warmed through the
+    native `/api/chat` at `num_ctx=16384` was **reloaded at 4,096** by the
+    very next call through the OpenAI shim, so `/api/ps` had been describing
+    a runner the shim was about to discard.
+
+    So the two sources are combined rather than ranked: whichever is smaller
+    is the one the shim can be relied on to serve. Under-reporting wastes
+    window; over-reporting truncates the prompt silently and is answered with
+    a confident invention. Once a real call has gone through the shim,
+    `ollama_shim_window` reads the same field and *is* authoritative, because
+    by then our own request is what allocated it.
+
+    A cloud-routed model is not subject to any of this and keeps its window.
     """
     if remote and model_max:
         return model_max
+
+    cap = _ollama_served_default(declared_num_ctx)
+    loaded = _ollama_loaded_context(provider, provider.model)
+    if loaded:
+        cap = min(cap, loaded)
+    return min(model_max, cap) if model_max else cap
+
+
+def _ollama_loaded_context(provider: Provider, model: str) -> int:
+    """The window `model` is currently loaded with, or 0 if it is not loaded."""
     try:
         ps = _get_json(f"{_ollama_root(provider)}/api/ps",
                        _headers_for(provider), timeout=_PROBE_TIMEOUT)
         for entry in (ps or {}).get("models") or []:
-            if entry.get("name") == provider.model and entry.get("context_length"):
+            if entry.get("name") == model and entry.get("context_length"):
                 return int(entry["context_length"])
     except Exception:
         pass
+    return 0
 
-    cap = _ollama_served_default(declared_num_ctx)
-    return min(model_max, cap) if model_max else cap
+
+def ollama_native_root(provider: Provider) -> str:
+    """Public name for the native API root behind the shim.
+
+    `core.ollama_runtime` needs it to send an unload, and the core is not
+    allowed to reach into this module's private helpers — the same boundary
+    that keeps `core/` free of `agent.py`.
+    """
+    return _ollama_root(provider)
+
+
+def ollama_request_headers(provider: Provider) -> dict:
+    """Headers for a native-API call to this provider.
+
+    Ordinarily just a content type; a remote Ollama behind auth needs more,
+    and getting that from the one function the probes already use is what
+    stops the unload path from being the only caller that forgets.
+    """
+    return _headers_for(provider)
+
+
+def ollama_shim_window(provider: Provider) -> int:
+    """What the shim *actually* served, read after a real call has been made.
+
+    The one reading that needs no guessing. Every estimate before the first
+    call has to reason about a server whose configuration this process cannot
+    see — `OLLAMA_CONTEXT_LENGTH` belongs to the Ollama service, not to us —
+    but a request through `/v1/chat/completions` allocates the runner itself,
+    so `/api/ps` immediately afterwards reports the number that request was
+    given rather than one some other client asked for.
+
+    Call it after a turn, never before: on a model that is not loaded this
+    returns 0, and 0 is "no reading", not "no window". Cheap enough to run
+    once a session — one local HTTP GET, no model work.
+    """
+    if provider.type != "ollama" or not provider.model:
+        return 0
+    return _ollama_loaded_context(provider, provider.model)
 
 
 def _probe_context_window(provider: Provider) -> int:

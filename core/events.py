@@ -234,3 +234,62 @@ class ErrorOccurred(AgentEvent):
     message: str
     detail: str = ""
     recoverable: bool = True
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Tiers — what survives a quiet screen
+# ══════════════════════════════════════════════════════════════════════
+#
+# `core.features.advanced_diagnostics` decides whether the user watches the
+# machinery work or only hears from it when something is wrong. The rule is
+# stated here, next to the events themselves, rather than as a list of
+# `isinstance` checks inside an adapter: an adapter's renderer is where a new
+# event gets forgotten, and a tier that has to be looked up in the same file
+# where the event is defined is one the author cannot avoid choosing.
+#
+# **An event is essential if a person has to do something about it, if it
+# explains text that is already on screen, or if it says the turn stopped.**
+# Everything else describes how the turn was carried out, which is worth
+# seeing when you are asking that question and is noise when you are not.
+#
+# Two consequences that are not obvious:
+#
+#   * `TruncatedOutputDiscarded` and `AnnouncedWithoutActing` are essential
+#     even though both are pure machinery, because both annotate text the
+#     user has already read. Hiding them leaves the answer restarting, or the
+#     model apparently repeating its plan, with nothing saying why.
+#   * `ToolCallsRecovered` is essential *only when it was streamed*. Streamed,
+#     the raw JSON went to the screen token by token and this line is its
+#     explanation; non-streamed nothing was shown, so it is a note about the
+#     model's protocol and belongs with the rest of the diagnostics. This is
+#     why `is_essential` takes an event and not a class.
+
+#: Rendered whatever the diagnostics switch says.
+ESSENTIAL_EVENTS: frozenset = frozenset({
+    TurnStarted, ThinkingStarted, ReasoningProgress, TextDelta,
+    AssistantMessage, TurnFinished,
+    ToolStarted, ToolFinished,
+    PermissionNeeded, ContinuationNeeded, ContinuationGranted,
+    LoopDetected, TruncatedOutputDiscarded, AnnouncedWithoutActing,
+    ErrorOccurred,
+})
+
+#: Rendered only when `advanced_diagnostics` is on.
+DIAGNOSTIC_EVENTS: frozenset = frozenset({
+    ToolResultTruncated, RetryScheduled, StreamingDisabled,
+    ToolCallsRecovered, ContextCompacted, LearnedSomething,
+})
+
+
+def is_essential(event: AgentEvent) -> bool:
+    """Whether this event is shown with the diagnostics switch off.
+
+    Unclassified events read as essential. That direction is deliberate: a new
+    event that nobody remembered to file appears on screen, where it will be
+    noticed and filed, rather than vanishing into a tier the author never
+    chose. `tests/test_features.py` closes the gap by requiring every
+    `AgentEvent` subclass to be in exactly one of the two sets.
+    """
+    if isinstance(event, ToolCallsRecovered):
+        return bool(event.streamed)
+    return type(event) not in DIAGNOSTIC_EVENTS

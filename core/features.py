@@ -14,10 +14,19 @@ forgotten in the menu — the failure `MODE_CYCLE` exists to prevent for modes.
 **A default is a claim about what the agent is for.** `streaming`,
 `status_indicator` and `context_controls` default *on* because an agent that
 answers in one silent block, shows nothing while it works, and cannot be
-cleared is worse at its job. `debug_view`, `prefill_context` and
-`short_every_third` default *off* because each one costs the user something
-real — screen space, tokens, or the length of every third answer — and a
-feature that takes something away has to be asked for.
+cleared is worse at its job. `advanced_diagnostics`, `debug_view`,
+`prefill_context` and `short_every_third` default *off* because each one costs
+the user something real — screen space, tokens, or the length of every third
+answer — and a feature that takes something away has to be asked for.
+
+`advanced_diagnostics` is the shallow end of `debug_view`, not a duplicate of
+it. Debug view records whole payloads to a file for a second window to tail;
+this one changes nothing about what is recorded and only decides how much of
+what already happens reaches the chat. The two questions a user actually has
+— "what did the agent send?" and "why did that turn behave oddly?" — are
+answered by different amounts of evidence, and making the second one cost the
+first is how a diagnostic gets left switched off. What counts as essential is
+`core.events.is_essential`, stated beside the events rather than here.
 """
 
 from __future__ import annotations
@@ -68,6 +77,9 @@ FEATURES: tuple[dict, ...] = (
     {"key": "context_controls", "label": "Context controls",
      "detail": "/clear to reset the conversation, /export to save the log",
      "default": True},
+    {"key": "advanced_diagnostics", "label": "Advanced diagnostics",
+     "detail": "retries, limits, cache and error detail as the chat happens",
+     "default": False},
     {"key": "debug_view", "label": "Debug view",
      "detail": "Ctrl+Alt+X or /debug — raw JSON requests, schemas, responses",
      "default": False},
@@ -102,6 +114,7 @@ class Features:
     streaming: bool = True
     status_indicator: bool = True
     context_controls: bool = True
+    advanced_diagnostics: bool = False
     debug_view: bool = False
     prefill_context: bool = False
     short_every_third: bool = False

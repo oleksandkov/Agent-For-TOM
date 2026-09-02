@@ -1743,6 +1743,17 @@ def run_turn(state: AgentState, user_message: Optional[str] = None) -> Iterator[
                                overran_by=_overrun(state, started))
             return
 
+        # Why this call ended, for whichever of the three responses above the
+        # turn actually took. `_stream_call` set it for its own assembly and
+        # nothing set it anywhere else, so the field documented as "why the
+        # last model call ended" was blank for every non-streaming provider
+        # and stale for a turn that streamed once and then fell through —
+        # exactly the one-branch change the path-parity rule exists to stop.
+        # Recorded here rather than in `_model_call` for the usual reason:
+        # `_stream_call` reports, `run_turn` decides, and this is the point
+        # where the turn has decided which response it is working from.
+        state.last_stop_reason = response.stop_reason
+
         if response.stop_reason != "tool_use":
             text = "".join(b.text for b in response.content if hasattr(b, "text"))
             if response.stop_reason == "max_tokens":

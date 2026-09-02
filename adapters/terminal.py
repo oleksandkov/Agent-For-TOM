@@ -42,6 +42,7 @@ from core.events import (
     ToolStarted,
     TruncatedOutputDiscarded,
     TurnFinished,
+    is_essential,
 )
 from core.console import CONSOLE, console_is_busy
 from core.permissions import Decision
@@ -245,13 +246,22 @@ class Thinking:
 class TerminalAdapter:
     """Drives a run_turn generator, printing as it goes."""
 
-    def __init__(self, interactive: bool = True, show_status: bool = True):
+    def __init__(self, interactive: bool = True, show_status: bool = True,
+                 diagnostics: bool = False):
         self.interactive = interactive
         # Whether the spinner names what the agent is doing between steps.
         # Off, the turn still runs identically and Esc still works — the
         # spinner is the *watcher* for Esc, so switching this off replaces it
         # with a bare watcher rather than removing one (see _watch).
         self.show_status = show_status
+        # `core.features.advanced_diagnostics`. Display only: the turn runs
+        # identically either way, the core emits every event either way, and
+        # this decides which of them reach the screen (`core.events.
+        # is_essential`) plus how much of an error is shown. Deliberately not
+        # a level — quiet and loud are the two states anyone asked for, and a
+        # middle one would have to be defined by what it drops, which is the
+        # decision `is_essential` already makes once.
+        self.diagnostics = diagnostics
         self._streaming_header_shown = False
         self._non_interactive_notice_shown = False
         self._stream: StreamWrap | None = None
@@ -312,6 +322,14 @@ class TerminalAdapter:
     # ── Rendering ──────────────────────────────────────────────────
 
     def render(self, event) -> None:
+        # The diagnostics gate, first and before every side effect below.
+        # Returning here leaves the spinner running rather than stopping it,
+        # which is the right answer for the events this drops: a retry or a
+        # streaming fallback is a *wait*, and the screen should go on saying
+        # the agent is working instead of going blank for the same seconds.
+        if not self.diagnostics and not is_essential(event):
+            return
+
         # Reasoning prints nothing, so it must not count as "the wait is over".
         # Handled before the stop below and returning here: it arrives once per
         # chunk — hundreds of times in a single call — and anything that tore
@@ -357,6 +375,15 @@ class TerminalAdapter:
             self._end_stream_line()
             if event.interrupted:
                 print(f'\n  {YELLOW}⎋{RESET}  Stopped ({event.seconds:.0f}s) — Esc was pressed.')
+            # How far past the ceiling the turn actually ran. `_report_deadline`
+            # already says the limit was hit — this says by how much, which is
+            # the number that tells you whether the limit is nearly right or
+            # nowhere near it. Carried on the event since it was added and
+            # rendered nowhere: measured, 1279.8s against a 1200s limit.
+            elif self.diagnostics and event.overran_by > 0:
+                print(f'  {DIM}┄  turn overran its limit by '
+                      f'{event.overran_by:.0f}s (a step that started inside it '
+                      f'finished outside){RESET}')
 
         elif isinstance(event, ToolStarted):
             self._end_stream_line()
@@ -457,6 +484,16 @@ class TerminalAdapter:
         elif isinstance(event, ErrorOccurred):
             self._end_stream_line()
             print(f'\n  {RED}✗{RESET} {event.message}')
+            # `detail` is what the core actually recorded — "truncated at
+            # max_tokens=8192", the provider's own words, the endpoint that
+            # refused. It has been carried on this event since the event
+            # existed and rendered nowhere, so the one line that says *which*
+            # limit was hit only ever reached the session file. It is also
+            # the whole of "advanced error handling" the message paraphrases
+            # for a reader who does not want it.
+            if self.diagnostics and event.detail:
+                kind = 'recoverable' if event.recoverable else 'fatal'
+                print(f'     {DIM}{event.detail}  ·  {kind}{RESET}')
 
     def _end_stream_line(self) -> None:
         if self._streaming_header_shown:
