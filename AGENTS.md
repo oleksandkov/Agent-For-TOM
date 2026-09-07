@@ -21,8 +21,7 @@ Self-hosted AI coding agent — Python 3.10+, Windows-only REPL (`msvcrt`), agen
 - **Tool selection per turn**: `select_tools()` picks by `tool_relevance()` score against the current message, not list order. Budget = provider's probed `max_tools`. Tools that don't fit are named via `withheld_tools_notice()` — gap is recoverable. Empty slot left empty beats filling with irrelevant schemas (~125 tokens/tool, ~16k at 128 tools). Quota: `SERVER_CORE_QUOTA=8` + `relevance_floor` + `STICKY_CARRY_OVER=8`.
 - **Permissions**: `AGENT_AUTO_APPROVE=1` auto-approves `low`. Modes in `agent.py:ALL_MODES` = `auto`/`default`/`strict`/`yolo`/`bypass` (F5–F9, Tab cycles). `yolo` answers "may tool run?"; `bypass` also sets `AgentState.auto_continue` so budget checkpoint `needs_continuation_approval()` doesn't halt at 40 calls (max `max_auto_continuations=9` → ~400 calls). `a`/`always` approves *that exact call* only.
 - **Blocked**: `run_command` rejects `rm -rf /`, `mkfs`, `> /dev/sd`, `dd if=/dev/zero`, fork bombs.
-- **Writable location**: `_scratch/` inside `PROJECT_DIR` — sandbox only allows writes under project root; `~/.tomas/tmp` or `%TEMP%` will be denied. `SCRATCH_DIR` is the constant.
-- **Blocked read/write**: `~/.tomas/` is readable but not writable via file tools; write via `save_memory`/`self_notes`/`session_manager` (`_safe(path, write=...)`).
+- **Filesystem access**: Default working directory is `PROJECT_DIR`. Files outside `PROJECT_DIR` are accessible across the computer: in normal modes (`auto`/`default`/`strict`) reading outside project is elevated to `medium` risk and writing to `high` risk, prompting the user; in `bypass` and `yolo` modes access is auto-approved without prompts. Direct raw writes to `~/.tomas/` remain blocked (`_safe(path, write=...)`).
 
 ## System Prompt — Two Halves (Prefix Cache)
 

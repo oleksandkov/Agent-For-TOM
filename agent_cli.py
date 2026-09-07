@@ -2387,8 +2387,13 @@ def _catalog_row(m: dict) -> tuple[str, str]:
     describe itself one way while being chosen and another way while being
     changed.
     """
-    marks = [f"{m['context_window']:,} ctx" if m.get('context_window')
-             else '? ctx']
+    marks = []
+    if m.get('max_context') and m.get('context_window') and m['max_context'] > m['context_window']:
+        marks.append(f"{m['context_window']:,} ctx (max {m['max_context']:,})")
+    elif m.get('context_window'):
+        marks.append(f"{m['context_window']:,} ctx")
+    else:
+        marks.append('? ctx')
     if not m.get('tool_call_known'):
         marks.append('tools unknown')
     elif not m.get('tool_call'):
@@ -2557,6 +2562,8 @@ def _configure_ollama(spec) -> bool:
         if m_idx < 0:
             return False
         model = ollama_models[m_idx]
+
+    model = _prompt_ollama_context_selection(model)
 
     provider = provider_manager.Provider(
         name=spec.label, type='ollama',
@@ -2982,14 +2989,12 @@ def _provider_model_entries(provider: str) -> list[tuple[str, str | None]]:
                     marks.append('tools')
                 if m['vision']:
                     marks.append('vision')
-                ctx = (f"{'' if m.get('exact', True) else '≤'}"
-                       f"{m['context_window']:,} ctx"
-                       if m['context_window'] else '? ctx')
-                # Same ` · ` separator every other provider's rows use — this
-                # branch kept its own `ctx, tools/vision` spelling, which read
-                # as a different menu once the other providers grew windows.
-                # The `≤` is why it is not simply `_catalog_row`: only Ollama
-                # distinguishes a declared window from a capped one.
+                if m.get('max_context') and m.get('context_window') and m['max_context'] > m['context_window']:
+                    ctx = f"{m['context_window']:,} ctx (max {m['max_context']:,})"
+                else:
+                    ctx = (f"{'' if m.get('exact', True) else '≤'}"
+                           f"{m['context_window']:,} ctx"
+                           if m['context_window'] else '? ctx')
                 note = ' · '.join([ctx, *marks])
                 # Tool use is not decoration here: without it the agent drops
                 # to the text protocol, so it is the single fact that decides
@@ -3118,10 +3123,80 @@ def _show_filtered_model_menu(model_entries, label, current, initial_query=None)
     else:
         model = selected
     if model:
+        if label == "Ollama (local)":
+            model = _prompt_ollama_context_selection(model)
         update_dotenv("AGENT_MODEL", model)
         # Also update saved provider config if available
         _update_provider_model(model)
         show_info_page('Done', [f'  ✓ Model set to: {model}'])
+
+
+def _prompt_ollama_context_selection(model: str) -> str:
+    """If `model` is an Ollama model with max_context > 4096, offer to configure context window."""
+    try:
+        import provider_manager
+        cat = provider_manager.ollama_catalog()
+        entry = next((m for m in cat if m["name"] == model or m["name"] == f"{model}:latest"), None)
+        if not entry:
+            base_prefix = model.split(":")[0]
+            entry = next((m for m in cat if m["name"].startswith(base_prefix)), None)
+        if not entry:
+            return model
+
+        max_ctx = int(entry.get("max_context") or 0)
+        current_ctx = int(entry.get("context_window") or 4096)
+        if max_ctx <= 4096:
+            return model
+
+        presets = [
+            (32768, "32,768 tokens (32k · recommended balance of speed & VRAM)"),
+            (65536, "65,536 tokens (64k)"),
+            (131072, "131,072 tokens (128k)"),
+            (262144, "262,144 tokens (Maximum architecture limit)"),
+            (16384, "16,384 tokens (16k)"),
+            (8192, "8,192 tokens (8k)"),
+            (4096, "4,096 tokens (Ollama default · lowest VRAM)"),
+        ]
+        valid_presets = [p for p in presets if p[0] <= max_ctx]
+        if not any(p[0] == max_ctx for p in valid_presets):
+            valid_presets.insert(0, (max_ctx, f"{max_ctx:,} tokens (Maximum architecture limit)"))
+
+        options = [f"  {desc}" for _, desc in valid_presets]
+        options.append("  Custom size...")
+        options.append(f"  Keep default ({current_ctx:,} tokens)")
+
+        title = f"Context window for {model} (Architecture supports up to {max_ctx:,} tokens)"
+        idx = arrow_menu(title, options, footer=DEFAULT_FOOTER)
+        if idx < 0:
+            return model
+
+        chosen_ctx = 0
+        if idx < len(valid_presets):
+            chosen_ctx = valid_presets[idx][0]
+        elif idx == len(valid_presets):
+            raw = prompt_text(f"Enter context window size in tokens (4096 - {max_ctx:,})").strip().lower()
+            if raw.endswith("k"):
+                try:
+                    chosen_ctx = int(float(raw[:-1]) * 1024)
+                except ValueError:
+                    chosen_ctx = 0
+            elif raw.isdigit():
+                chosen_ctx = int(raw)
+            if chosen_ctx < 1024 or chosen_ctx > max_ctx:
+                show_info_page("Invalid context size", [f"Context size must be between 1024 and {max_ctx:,} tokens."])
+                return model
+        else:
+            return model
+
+        if chosen_ctx and chosen_ctx != current_ctx:
+            print(f"\n  {CYAN}Configuring {model} with {chosen_ctx:,} tokens context in Ollama...{RESET}")
+            sys.stdout.flush()
+            configured_model, ok = provider_manager.configure_ollama_model_context(model, chosen_ctx)
+            if ok:
+                return configured_model
+    except Exception:
+        pass
+    return model
 
 
 def _update_provider_model(model: str):
@@ -3221,6 +3296,8 @@ def page_choose_model():
         model = selected
 
     if model:
+        if provider == "ollama":
+            model = _prompt_ollama_context_selection(model)
         update_dotenv("AGENT_MODEL", model)
         _update_provider_model(model)
         show_info_page('Done', [f'  ✓ Model set to: {model}'])

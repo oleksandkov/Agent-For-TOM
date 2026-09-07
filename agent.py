@@ -2373,8 +2373,9 @@ _CMD_SEPARATORS = ("&&", "||", ";", "|", ">", "<", "&", "`", "$(")
 
 def risk_for(name: str, params: Optional[dict] = None) -> str:
     """Risk tier for a specific call, not just a tool name."""
+    params = params or {}
     if name == "run_command":
-        cmd = (params or {}).get("command", "")
+        cmd = params.get("command", "")
         if any(sep in cmd for sep in _CMD_SEPARATORS):
             return "high"
         if re.search(r'\b(del|rm|rmdir|erase|move|ren|format|curl|wget)\b', cmd, re.I):
@@ -2383,7 +2384,6 @@ def risk_for(name: str, params: Optional[dict] = None) -> str:
     if name == "doc_list":
         # Listing and switching read. Starting Word, or adding a document to
         # the user's session, is a change to what is on their screen.
-        params = params or {}
         if params.get("start_app") or params.get("new_document"):
             return "medium"
         return "low"
@@ -2391,12 +2391,26 @@ def risk_for(name: str, params: Optional[dict] = None) -> str:
         # Listing tabs and switching between them reads. Starting a browser
         # spawns a detached process, which is not something to auto-approve
         # on the strength of the tool's name.
-        params = params or {}
         if params.get("start_browser"):
             return "medium"
         if params.get("new_tab"):
             return "medium"
         return "low"
+
+    # Path-based risk elevation:
+    # Operations inside PROJECT_DIR use default risk (read_file/list_files/search_code = low,
+    # edit_file/write_file = medium).
+    # Operations outside PROJECT_DIR require user confirmation in normal mode (auto/default/strict):
+    # - reading (read_file, list_files, search_code, check_progress) -> "medium"
+    # - writing/editing (write_file, edit_file) -> "high"
+    # In bypass or yolo mode, all operations are auto-approved without prompting.
+    target_path = params.get("file_path") or params.get("path")
+    if target_path and _is_outside_project(target_path):
+        if name in ("read_file", "list_files", "search_code", "check_progress"):
+            return "medium"
+        if name in ("write_file", "edit_file"):
+            return "high"
+
     return RISK_LEVELS.get(name, "high")
 
 # Patterns that are always blocked from run_command
@@ -2481,7 +2495,8 @@ def _not_found_error(path: Path) -> str:
     name = path.name
     if name and not any(c in name for c in "*?"):
         try:
-            for found in PROJECT_DIR.rglob(name):
+            search_root = path.parent if (path.parent.exists() and path.parent.is_dir() and _is_outside_project(path)) else PROJECT_DIR
+            for found in search_root.rglob(name):
                 if found.is_file():
                     suggestions.append(found)
                     if len(suggestions) >= _NOT_FOUND_SUGGESTIONS:
@@ -2490,13 +2505,14 @@ def _not_found_error(path: Path) -> str:
             pass
     if not suggestions:
         return f"Error: file not found: {path}"
+    scope = "in directory" if _is_outside_project(path) else "in the project"
     if len(suggestions) == 1:
         return (f"Error: file not found: {path}\n"
-                f"There is one file named {name} in the project: "
+                f"There is one file named {name} {scope}: "
                 f"{suggestions[0]}")
     listed = "\n".join(f"  {s}" for s in suggestions)
     return (f"Error: file not found: {path}\n"
-            f"Files named {name} in the project:\n{listed}")
+            f"Files named {name} {scope}:\n{listed}")
 
 # All user state lives under ~/.tomas (sessions, notes, memory, learned
 # skills). Locking the agent out of it does not make anything safer — it just
@@ -2508,34 +2524,37 @@ def _within(p: Path, root: Path) -> bool:
     return p == root or root in p.parents
 
 
+def _is_outside_project(path_val: Optional[Any] = None) -> bool:
+    """Check if a path points outside PROJECT_DIR and TOMAS_HOME."""
+    if not path_val:
+        return False
+    try:
+        p = _resolve(str(path_val)) if isinstance(path_val, str) else path_val.resolve()
+        return not (_within(p, PROJECT_DIR) or _within(p, TOMAS_HOME))
+    except Exception:
+        return False
+
+
 def _safe(p: Path, write: bool = False) -> bool:
-    """Project dir is read-write. ~/.tomas is read-only: it is written through
-    the typed APIs (save_memory, self_notes, session_manager) that own each
-    file's schema, never by hand."""
-    if _within(p, PROJECT_DIR):
-        return True
-    return not write and _within(p, TOMAS_HOME)
+    """Project dir and external filesystem paths are accessible.
+    External paths require user confirmation in normal mode (elevated risk),
+    and are auto-approved in bypass / yolo mode.
+    ~/.tomas is read-only: it is written through the typed APIs (save_memory,
+    self_notes, session_manager) that own each file's schema, never by hand."""
+    if write and _within(p, TOMAS_HOME):
+        return False
+    return True
 
 
 def _outside_project_error(path: Path, write: bool = False) -> str:
-    """Say which rule was hit *and where to go instead*.
-
-    Naming only the rule sent the model looking for a second forbidden
-    location: told ~/.tomas was read-only it tried the system temp directory,
-    was refused again, and spent two tool calls before landing in the project.
-    An error that names the writable scratch path ends that search in one.
-    """
+    """Say which rule was hit and where to go instead."""
     if write and _within(path, TOMAS_HOME):
         return (f"Error: {path} is under ~/.tomas, which is read-only. "
                 f"For a throwaway helper script use {SCRATCH_DIR}; for durable "
                 f"notes use save_memory or the self_notes API.")
     if write:
-        return (f"Error: path outside project: {path}. Writes are only allowed "
-                f"under {PROJECT_DIR}. For a throwaway helper script use "
-                f"{SCRATCH_DIR} — the system temp directory is not writable "
-                f"from here.")
-    return (f"Error: path outside project: {path}. "
-            f"Readable roots: {PROJECT_DIR} (read-write), {TOMAS_HOME} (read-only).")
+        return f"Error: write access not allowed to: {path}."
+    return f"Error: path not accessible: {path}."
 
 # ---------------------------------------------------------------------------
 # Tool handlers
@@ -7004,6 +7023,9 @@ def _handle_settings(arg: str) -> str:
                     f'\n  {DIM}Recorded payloads discarded.{RESET}')
         elif key == "prefill_context":
             note = f'\n  {DIM}Applies to the next new session.{RESET}'
+        elif key == "show_tokens":
+            note = (f'\n  {DIM}Token consumption, production and generation speed shown under every reply.{RESET}' if now_on else
+                    f'\n  {DIM}Token usage line hidden under replies.{RESET}')
         elif key == "advanced_diagnostics":
             # Says what changes, not that something changed. The switch is
             # invisible until a turn does something unusual, so "on" with no
@@ -7576,11 +7598,6 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
                 models = provider_manager.available_models(active.name)
             except Exception as e:
                 return f'  {RED}Could not list models: {e}{RESET}'
-            # This is the raw upstream list — the same one that told the user
-            # a dead model was there in the first place ("This model is
-            # listed but not currently being served"). Cross-referencing the
-            # observed-refusal record here means someone told "pick another
-            # with /model" is not steered right back into another dead one.
             unavailable = {}
             if active.type == "zen":
                 try:
@@ -7591,13 +7608,28 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
             if not models:
                 lines.append(f'  {DIM}The endpoint did not report a model list.{RESET}')
             else:
+                cat_map = {}
+                if active.type == "ollama":
+                    try:
+                        cat_map = {m["name"]: m for m in provider_manager.ollama_catalog()}
+                    except Exception:
+                        pass
                 for m in models:
                     marker = f'{GREEN}●{RESET}' if m == current else f'{DIM}○{RESET}'
                     flag = (f'  {YELLOW}(unavailable — refused within the '
                            f'last 24h){RESET}') if m in unavailable else ''
-                    lines.append(f'    {marker} {m}{flag}')
+                    entry = cat_map.get(m) or cat_map.get(f"{m}:latest")
+                    meta = ""
+                    if entry:
+                        max_c = entry.get("max_context", 0)
+                        cur_c = entry.get("context_window", 0)
+                        if max_c and max_c > cur_c:
+                            meta = f' {DIM}({cur_c:,} ctx · max {max_c:,}){RESET}'
+                        elif cur_c:
+                            meta = f' {DIM}({cur_c:,} ctx){RESET}'
+                    lines.append(f'    {marker} {m}{flag}{meta}')
             lines.append('')
-            lines.append(f'  {DIM}Switch with{RESET} {CYAN}/model <name>{RESET}')
+            lines.append(f'  {DIM}Switch with{RESET} {CYAN}/model <name> [ctx]{RESET}')
             return '\n'.join(lines)
 
         # ── Switch the model on the active provider, in place ──
@@ -7606,23 +7638,37 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
         if active is None:
             return (f'  {RED}No active provider — configure one first '
                     f'({RESET}{CYAN}/provider list{RESET}{RED}).{RESET}')
-        active.model = sub
+
+        sub_parts = sub.split()
+        target_model = sub_parts[0]
+        ctx_param = sub_parts[1] if len(sub_parts) > 1 else ""
+
+        if active.type == "ollama" and ctx_param:
+            max_c = 0
+            facts = provider_manager.ollama_model_facts(active)
+            if facts:
+                max_c = int(facts.get("context_window") or 0)
+            if ctx_param.lower() == "max" and max_c:
+                target_ctx = max_c
+            elif ctx_param.lower().endswith("k"):
+                try:
+                    target_ctx = int(float(ctx_param[:-1]) * 1024)
+                except ValueError:
+                    target_ctx = 0
+            elif ctx_param.isdigit():
+                target_ctx = int(ctx_param)
+            else:
+                target_ctx = 0
+
+            if target_ctx > 0:
+                print(f'  {CYAN}Configuring {target_model} with {target_ctx:,} context in Ollama...{RESET}')
+                new_name, ok = provider_manager.configure_ollama_model_context(target_model, target_ctx)
+                if ok:
+                    target_model = new_name
+
+        active.model = target_model
         provider_manager.save(active, activate_it=True)
-        # `activate()`, not a bare `apply_env("AGENT_MODEL", ...)`. The bare
-        # call only ever wrote the model name — `save()` above never touches
-        # `os.environ` at all — so if a *different* provider's `activate()`
-        # was the last one to run in this process, `ANTHROPIC_BASE_URL` and
-        # `ANTHROPIC_API_KEY` stayed pointed at it. `/model` then sent this
-        # provider's model name to that stale endpoint: an Ollama cloud model
-        # name reached OpenRouter and came back "not a valid model ID" — a
-        # provider mismatch reported as a bad model name. `activate()` is the
-        # one place that reapplies base_url/api_key/headers together with the
-        # model, which is exactly what `agent_cli.py`'s TUI already does for
-        # every other model switch.
         provider_manager.activate(active.name)
-        # Before `_refresh_context_window`, not after: that function reads the
-        # stored capabilities, and the stored capabilities still describe the
-        # model we just switched away from.
         try:
             caps = provider_manager.refresh_for_model(active)
         except Exception:
@@ -7632,9 +7678,19 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
         note = (f'  {DIM}Endpoint capabilities carried over — run{RESET} '
                 f'{CYAN}/provider probe{RESET} {DIM}to re-measure.{RESET}')
         if active.type == "ollama":
-            note = (f'  {DIM}Tool use:{RESET} {"yes" if caps.tool_use else "no"}'
-                    f'{DIM} · Vision:{RESET} {"yes" if caps.vision else "no"}')
-        return (f'  {GREEN}✓{RESET} Switched model to {BOLD}{sub}{RESET} on {active.name} '
+            facts = provider_manager.ollama_model_facts(active)
+            max_arch = facts.get("context_window", 0) if facts else 0
+            note_lines = [
+                f'  {DIM}Tool use:{RESET} {"yes" if caps.tool_use else "no"}'
+                f'{DIM} · Vision:{RESET} {"yes" if caps.vision else "no"}'
+            ]
+            if max_arch and max_arch > cw and not ctx_param:
+                note_lines.append(
+                    f'  {DIM}Note: Architecture supports up to {max_arch:,} tokens. '
+                    f'Set custom context with:{RESET} {CYAN}/model {target_model} <tokens|max>{RESET}'
+                )
+            note = '\n'.join(note_lines)
+        return (f'  {GREEN}✓{RESET} Switched model to {BOLD}{target_model}{RESET} on {active.name} '
                 f'({cw:,} token context).\n' + note)
 
     if cmd == "budget":
@@ -9460,16 +9516,21 @@ def main() -> int:
                 print(f'  {MAGENTA}{BOLD}▌ TOMAS{RESET}')
                 print(f'  {result}')
             # ── Token usage info ──
-            # Behind `advanced_diagnostics`: it is per-turn accounting, and
-            # accounting under every answer is the line that made the chat
-            # read as a machine report rather than a conversation. Nothing is
-            # lost by hiding it — `/status` asks the same question on demand,
-            # and the session file records all of it either way.
+            # Controlled by `show_tokens` (on by default) and `advanced_diagnostics`.
+            # Shows tokens consumed (input), produced (output), live speed (tok/s),
+            # session totals and context percentage under every reply.
             t = _last_turn_usage
             s = _session_tokens
-            if s["calls"] > 0 and features().enabled("advanced_diagnostics"):
-                pct = (t["input"] + t["output"]) / CONTEXT_WINDOW * 100
-                elapsed = _fmt_duration(_turn_timings[-1]) if _turn_timings else "?"
+            show_tokens_on = features().enabled("show_tokens")
+            diag_on = features().enabled("advanced_diagnostics")
+            if s["calls"] > 0 and (show_tokens_on or diag_on):
+                elapsed_s = _turn_timings[-1] if _turn_timings else 0.0
+                elapsed = _fmt_duration(elapsed_s) if elapsed_s else "?"
+                speed = f' ({t["output"] / elapsed_s:.1f} tok/s)' if (elapsed_s > 0 and t["output"] > 0) else ''
+                pct_str = ""
+                if CONTEXT_WINDOW and CONTEXT_WINDOW > 0:
+                    pct = (t["input"] + t["output"]) / CONTEXT_WINDOW * 100
+                    pct_str = f'  ·  {pct:.1f}% of {CONTEXT_WINDOW:,} ctx'
                 # Only shown when the provider actually reports it: a hardcoded
                 # "0% cached" on an endpoint that simply does not say would read
                 # as a cache that stopped working.
@@ -9478,14 +9539,8 @@ def main() -> int:
                     share = s["cached_input"] / max(1, s["input"]) * 100
                     cached = f'  ·  {s["cached_input"]:,} cached ({share:.0f}%)'
                 # The bill nobody was shown: streamed calls re-issued
-                # non-streamed to get their tool blocks. Named "duplicate"
-                # rather than folded into the total because it is the number
-                # that argues for removing the second call. `_stream_can_serve`
-                # already serves everything recoverable, so `would_have_served`
-                # is expected to read 0 now — the reason breakdown (why the
-                # remaining ones fell through) is the useful part, not a
-                # "recoverable" count that would always say zero.
-                if s.get("duplicate_input"):
+                # non-streamed to get their tool blocks.
+                if diag_on and s.get("duplicate_input"):
                     reasons = sorted(
                         (k[len("duplicate_reason_"):], v)
                         for k, v in s.items()
@@ -9494,28 +9549,18 @@ def main() -> int:
                     cached += (f'  ·  {s["duplicate_input"]:,} duplicate'
                                f' ({s.get("duplicate_calls", 0)} calls'
                                + (f': {breakdown}' if breakdown else '') + ')')
-                print(f'  {DIM}┄  {t["input"]:,} in  {t["output"]:,} out  ·  total: {s["input"]:,} in  {s["output"]:,} out{cached}  ·  {pct:.1f}% of {CONTEXT_WINDOW:,} ctx  ·  {elapsed}{RESET}')
-                # How the turn ended, in the model's own vocabulary. This is
-                # the "reached the limit" question: `max_tokens` says the
-                # reply was cut off at the output ceiling, `tool_use` that it
-                # stopped to run something, `end_turn` that it was simply
-                # done. The core has recorded it on every turn since
-                # `last_stop_reason` was added and nothing displayed it, so a
-                # turn that stopped short looked identical to one that
-                # finished.
-                d = _last_turn_diag
-                ending = d["stop_reason"] or "—"
-                calls = (f'  ·  {d["tool_calls"]} tool call'
-                         f'{"" if d["tool_calls"] == 1 else "s"}'
-                         if d["tool_calls"] else '')
-                # Only when it did not already surface as an error on screen:
-                # `ErrorOccurred` prints its own detail line above, and
-                # repeating it here would say the same thing twice in four
-                # lines.
-                why = (f'  ·  {d["error"]}'
-                       if d["error"] and not d["error"].startswith("truncated")
-                       else '')
-                print(f'  {DIM}┄  ended: {ending}{calls}{why}{RESET}')
+                print(f'  {DIM}┄  {t["input"]:,} in  {t["output"]:,} out{speed}  ·  total: {s["input"]:,} in  {s["output"]:,} out{cached}{pct_str}  ·  {elapsed}{RESET}')
+                # How the turn ended, in the model's own vocabulary.
+                if diag_on:
+                    d = _last_turn_diag
+                    ending = d["stop_reason"] or "—"
+                    calls = (f'  ·  {d["tool_calls"]} tool call'
+                             f'{"" if d["tool_calls"] == 1 else "s"}'
+                             if d["tool_calls"] else '')
+                    why = (f'  ·  {d["error"]}'
+                           if d["error"] and not d["error"].startswith("truncated")
+                           else '')
+                    print(f'  {DIM}┄  ended: {ending}{calls}{why}{RESET}')
             # ── Self-improvement analysis, after the reply so it never adds latency ──
             try:
                 self_improve.maybe_analyze_after_turn()

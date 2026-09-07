@@ -77,6 +77,9 @@ FEATURES: tuple[dict, ...] = (
     {"key": "context_controls", "label": "Context controls",
      "detail": "/clear to reset the conversation, /export to save the log",
      "default": True},
+    {"key": "show_tokens", "label": "Show token usage",
+     "detail": "tokens consumed/produced, speed and context under each reply",
+     "default": True},
     {"key": "advanced_diagnostics", "label": "Advanced diagnostics",
      "detail": "retries, limits, cache and error detail as the chat happens",
      "default": False},
@@ -114,6 +117,7 @@ class Features:
     streaming: bool = True
     status_indicator: bool = True
     context_controls: bool = True
+    show_tokens: bool = True
     advanced_diagnostics: bool = False
     debug_view: bool = False
     prefill_context: bool = False

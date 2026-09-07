@@ -1355,12 +1355,58 @@ def ollama_catalog(base_url: str = "") -> list[dict]:
         out.append({
             "name": name,
             "context_window": window,
+            "max_context": model_max,
             "exact": bool(loaded.get(name) or model_max),
             "tools": "tools" in declared,
             "vision": "vision" in declared,
             "params": details.get("parameter_size") or "",
         })
     return out
+
+
+def configure_ollama_model_context(base_model: str, context_length: int,
+                                   base_url: str = "") -> tuple[str, bool]:
+    """Create or configure an Ollama model variant with a specific `num_ctx`.
+
+    Ollama's /v1 shim ignores runtime `num_ctx` in requests and defaults to
+    4,096 unless `num_ctx` is baked into the model manifest. Calling Ollama's
+    `/api/create` with `parameters: {"num_ctx": context_length}` creates a
+    tagged model with that parameter baked in. Because Ollama reuses existing
+    blobs on disk, this operation takes < 1 second and downloads zero bytes.
+
+    Returns `(configured_model_name, success)`. If creation fails or is not
+    needed, returns `(base_model, False)`.
+    """
+    if not base_model or context_length <= 0:
+        return base_model, False
+
+    base = base_model.strip()
+    if base.endswith(":latest"):
+        base = base[:-7]
+
+    suffix = f"-{context_length // 1024}k" if context_length % 1024 == 0 else f"-{context_length}"
+    if ":" in base:
+        target_name = f"{base}{suffix}"
+    else:
+        target_name = f"{base}:{suffix.lstrip('-')}"
+
+    root = (base_url or OLLAMA_DEFAULT_URL).rstrip("/").rstrip("/v1")
+    url = f"{root}/api/create"
+    body = json.dumps({
+        "model": target_name,
+        "from": base_model,
+        "parameters": {"num_ctx": context_length},
+        "stream": False,
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+            if data.get("status") == "success":
+                return target_name, True
+    except Exception:
+        pass
+    return base_model, False
 
 
 def openrouter_catalog(api_key: str = "") -> list[dict]:
@@ -1658,7 +1704,7 @@ CATALOG_FETCHERS = {
 #: defaulting `tool_call` to True picked `groq/compound` as its best model and
 #: the round trip died on `400 "tool calling" is not supported with this
 #: model`. Five of its ten chat models answer that way.
-CANONICAL_CATALOG_KEYS = ("id", "label", "context_window", "priced", "free",
+CANONICAL_CATALOG_KEYS = ("id", "label", "context_window", "max_context", "priced", "free",
                           "tool_call", "tool_call_known", "vision")
 
 
@@ -1683,10 +1729,13 @@ def _normalise_catalog_entry(entry: dict, spec) -> dict:
     known = entry.get("tool_call_known")
     if known is None:
         known = raw_tools is not None
+    ctx = int(entry.get("context_window") or 0)
+    max_ctx = int(entry.get("max_context") or ctx)
     return {
         "id": model_id,
         "label": entry.get("label") or model_id,
-        "context_window": int(entry.get("context_window") or 0),
+        "context_window": ctx,
+        "max_context": max_ctx,
         "priced": bool(priced),
         "free": bool(free),
         "tool_call": bool(raw_tools) if raw_tools is not None else True,
