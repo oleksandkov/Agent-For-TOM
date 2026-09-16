@@ -326,8 +326,9 @@ TOMAS (Terminal Operated Modular Agent System) — a self-hosted AI coding agent
 - Which tools are *sent* is decided per turn by `select_tools()`, by relevance to the user's message — not by list order. `ALL_TOOLS` is everything discovered; the budget comes from the provider's probed `max_tools`. Tools that do not fit are named to the model via `withheld_tools_notice()`, so a gap is recoverable rather than silent.
 - MCP resources and prompts are reachable too: the `read_mcp_resource` tool (no arguments = list), plus `/mcp-resources` and `/mcp-prompt`.
 - `~/.tomas/` is readable by path tools but not writable — write through `save_memory` / `self_notes` / `session_manager`, which own those file formats (`_safe(path, write=...)`).
+- Files outside `PROJECT_DIR` are accessible across the system: reads outside project are elevated to `medium` risk and writes to `high` risk, prompting for user permission in normal modes (`auto`/`default`/`strict`) and running freely without prompts in `bypass`/`yolo` modes.
 - `run_command` always returns `[exit N — ok|FAILED]` first, decodes as UTF-8, and round-trips multi-line or nested-quote `python -c` payloads through a temp dir outside the project.
-- Tool permission modes: `auto` (auto-approve low-risk), `default` (ask all), `strict` (ask all + clear overrides), `yolo` (approve everything) — set via `/mode` or F5–F8
+- Tool permission modes: `auto` (auto-approve low-risk), `default` (ask all), `strict` (ask all + clear overrides), `yolo` (approve everything), `bypass` (approve everything + auto-continue past turn budget checkpoints) — set via `/mode` or F5–F9
 - `CLAUDE.md` (this file) is injected into every system prompt built by `agent.py`; edit it to change persistent agent behavior for this project. Full load order is in `AGENTS.md`.
 
 ## Key modules
