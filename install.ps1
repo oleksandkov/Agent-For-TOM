@@ -1,4 +1,4 @@
-<#
+ <#
 .SYNOPSIS
     TOMAS Agent Installer --- install from GitHub or local source.
 .DESCRIPTION
@@ -65,7 +65,6 @@ $LauncherBat = Join-Path $BinDir "TOMAS.bat"
 
 # -- Detect mode -------------------------------------------------------------
 $isPiped = $MyInvocation.MyCommand.Name -eq "__remote_exec__" -or
-           $MyInvocation.MyCommand.Path -eq "" -or
            [Console]::IsInputRedirected
 
 # Downloads are ~10x slower in Windows PowerShell with the progress bar on:
@@ -130,6 +129,171 @@ function Install-PlaywrightBrowser {
         else { StepInfo "Playwright browser not installed - run 'TOMAS browser' later" }
     } catch {
         StepInfo "Playwright browser not installed - run 'TOMAS browser' later"
+    }
+}
+
+function Ensure-Uv {
+    <#
+      uv speeds up python package installation 5x and provides `uvx`,
+      which is required to run 4 default MCP servers:
+      word-docs, fetch, time, pdf.
+    #>
+    $candidates = @(
+        (Join-Path $HOME ".local\bin\uv.exe"),
+        (Join-Path $HOME ".cargo\bin\uv.exe")
+    )
+    if ($env:LOCALAPPDATA) {
+        $candidates += (Join-Path $env:LOCALAPPDATA "uv\uv.exe")
+    }
+    foreach ($cand in $candidates) {
+        if (Test-Path $cand) {
+            $candDir = Split-Path -Parent $cand
+            if ($env:Path -notlike "*$candDir*") {
+                $env:Path = "$candDir;$env:Path"
+            }
+            $script:UvExe = $cand
+            return
+        }
+    }
+
+    $existing = (Get-Command "uv" -ErrorAction SilentlyContinue).Source
+    if ($existing) {
+        $script:UvExe = $existing
+        return
+    }
+
+    $want = $false
+    if (-not $NoPrompt -and -not $isPiped) {
+        Write-Host "        uv is not installed. It speeds up installs 5x and is" `
+                   -ForegroundColor Yellow
+        Write-Host "        required for 4 default MCP servers (word-docs, fetch, time, pdf)." `
+                   -ForegroundColor Yellow
+        Write-Host "        Install uv now? [y/N] " -ForegroundColor Yellow -NoNewline
+        $want = (Read-Host) -match '^[Yy]'
+    }
+
+    if (-not $want) {
+        StepInfo "Skipped uv. Pip will be used for dependencies."
+        StepInfo "4 MCP servers (word-docs, fetch, time, pdf) require uvx to run."
+        return
+    }
+
+    StepInfo "Installing uv via official installer..."
+    $prevProgress = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try {
+        $scriptContent = Invoke-RestMethod -Uri https://astral.sh/uv/install.ps1 -UseBasicParsing -ErrorAction Stop
+        Invoke-Expression $scriptContent
+    } catch {
+        $winget = Get-Command "winget" -ErrorAction SilentlyContinue
+        if ($winget) {
+            StepInfo "Trying winget for uv..."
+            & $winget.Source install --id astral-sh.uv -e --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+        }
+    }
+    $ProgressPreference = $prevProgress
+
+    foreach ($cand in $candidates) {
+        if (Test-Path $cand) {
+            $candDir = Split-Path -Parent $cand
+            if ($env:Path -notlike "*$candDir*") {
+                $env:Path = "$candDir;$env:Path"
+            }
+            $script:UvExe = $cand
+            StepOk "uv ready ($cand)"
+            return
+        }
+    }
+
+    $found = (Get-Command "uv" -ErrorAction SilentlyContinue).Source
+    if ($found) {
+        $script:UvExe = $found
+        StepOk "uv ready ($found)"
+    } else {
+        StepInfo "uv installation could not be completed automatically."
+        StepInfo "Install manually: powershell -c `"irm https://astral.sh/uv/install.ps1 | iex`""
+    }
+}
+
+function Ensure-NodeJs {
+    <#
+      Node.js provides `npx`, which is required to run 4 default MCP servers:
+      playwright, context7, sequential-thinking, excel.
+    #>
+    $candidates = @()
+    if ($env:ProgramFiles) {
+        $candidates += (Join-Path $env:ProgramFiles "nodejs\npx.cmd")
+    }
+    if (${env:ProgramFiles(x86)}) {
+        $candidates += (Join-Path ${env:ProgramFiles(x86)} "nodejs\npx.cmd")
+    }
+    if ($env:LOCALAPPDATA) {
+        $candidates += (Join-Path $env:LOCALAPPDATA "Programs\nodejs\npx.cmd")
+    }
+    if ($env:APPDATA) {
+        $candidates += (Join-Path $env:APPDATA "npm\npx.cmd")
+    }
+
+    foreach ($cand in $candidates) {
+        if (Test-Path $cand) {
+            $candDir = Split-Path -Parent $cand
+            if ($env:Path -notlike "*$candDir*") {
+                $env:Path = "$candDir;$env:Path"
+            }
+            return
+        }
+    }
+
+    if (Get-Command "npx" -ErrorAction SilentlyContinue) {
+        return
+    }
+
+    $want = $false
+    $winget = Get-Command "winget" -ErrorAction SilentlyContinue
+    if (-not $NoPrompt -and -not $isPiped) {
+        Write-Host "        Node.js (npx) is not installed. It is required for 4 default" `
+                   -ForegroundColor Yellow
+        Write-Host "        MCP servers (playwright, context7, sequential-thinking, excel)." `
+                   -ForegroundColor Yellow
+        if ($winget) {
+            Write-Host "        Install Node.js LTS via winget? [y/N] " -ForegroundColor Yellow -NoNewline
+            $want = (Read-Host) -match '^[Yy]'
+        } else {
+            StepInfo "Node.js not found. Download and install from: https://nodejs.org/"
+            return
+        }
+    }
+
+    if (-not $want) {
+        StepInfo "Skipped Node.js. 4 MCP servers will remain inactive until installed."
+        StepInfo "Install Node.js later from: https://nodejs.org/"
+        return
+    }
+
+    StepInfo "Installing Node.js LTS via winget..."
+    try {
+        & $winget.Source install --id OpenJS.NodeJS.LTS -e --accept-source-agreements --accept-package-agreements
+        $regUser = [Environment]::GetEnvironmentVariable("Path", "User")
+        $regSys  = [Environment]::GetEnvironmentVariable("Path", "Machine")
+        $env:Path = "$regUser;$regSys;$env:Path"
+        foreach ($cand in $candidates) {
+            if (Test-Path $cand) {
+                $candDir = Split-Path -Parent $cand
+                if ($env:Path -notlike "*$candDir*") {
+                    $env:Path = "$candDir;$env:Path"
+                }
+                StepOk "Node.js ready ($candDir)"
+                return
+            }
+        }
+        if (Get-Command "npx" -ErrorAction SilentlyContinue) {
+            StepOk "Node.js ready"
+        } else {
+            StepInfo "Node.js installed - restart your terminal for PATH to update."
+        }
+    } catch {
+        StepInfo "winget install failed: $_"
+        StepInfo "Install Node.js manually from: https://nodejs.org/"
     }
 }
 
@@ -274,14 +438,14 @@ if ($hasLocalSource) {
     # race for a while: a real install contained eight simulation reports
     # (`TOMAS_SIMULATION_REPORT_V4.md` and friends), `Kimi_K3_Report.docx`,
     # `hello_world.html`, `image.png`, the whole test suite, `_scratch`, the
-    # `labwork` corpus, and `nextjs-site` — none of which the agent imports or
+    # `labwork` corpus, and `nextjs-site` -- none of which the agent imports or
     # reads at runtime.
     #
     # The module list is not guesswork: it is the transitive closure of
     # `import` from `agent.py` and `agent_cli.py`. Anything not reachable from
     # an entry point cannot be needed to start one.
     #
-    # `install.ps1` is deliberately absent — `TOMAS-upgrade.cmd` fetches it
+    # `install.ps1` is deliberately absent -- `TOMAS-upgrade.cmd` fetches it
     # from GitHub, so the copy in `src` was only ever a copy.
     $runtimeModules = @(
         'agent.py', 'agent_cli.py',
@@ -318,7 +482,7 @@ if ($hasLocalSource) {
 
     # `$exclude` as one regex over a relative path, so a nested `node_modules`
     # is skipped as surely as a top-level one. Built from the same list rather
-    # than a second hand-written pattern — two lists that must agree are two
+    # than a second hand-written pattern -- two lists that must agree are two
     # lists that will not.
     # Built in two statements on purpose: `-join '|' + ')(\\|$)'` binds as
     # `-join ('|' + ')(\\|$)')`, so the separator becomes the tail of the
@@ -365,12 +529,12 @@ if ($hasLocalSource) {
             $relative = $item.FullName.Substring($sourceRoot.Length).TrimStart('\')
             # $exclude is checked at *every* level, not only the top one. It was
             # applied to `$dir.Name` alone, so a directory that is not itself
-            # excluded was descended into and everything under it copied —
+            # excluded was descended into and everything under it copied --
             # including the `node_modules` that the exclusion list names.
             #
             # Measured on this checkout: `nextjs-site` is not an excluded name,
-            # so the walk copied `nextjs-site\node_modules` — 479 MB in 15,607
-            # files — plus an 89 MB `.next` build, one Copy-Item per file, for
+            # so the walk copied `nextjs-site\node_modules` -- 479 MB in 15,607
+            # files -- plus an 89 MB `.next` build, one Copy-Item per file, for
             # a directory whose actual source is five files. That is the whole
             # of the long wait at "[3/11] Copying local source".
             if ($relative -match $excludeDirPattern) { continue }
@@ -549,22 +713,9 @@ if (-not $script:PipExe) {
     Write-Host "  [OK] pip installed in virtual environment" -ForegroundColor Green
 }
 
-# uv, when it is here, does the same work about five times faster.
-#
-# Measured on this machine against the ten packages in requirements.txt, with
-# a warm wheel cache and a fresh venv both times:
-#
-#     pip   56.8 s
-#     uv    11.0 s
-#
-# The gap is wider on a cold cache, where pip's serial resolve-then-download
-# dominates. This is the single largest saving in the install that does not
-# involve skipping something.
-#
-# Never installed on the user's behalf: an installer that silently fetches a
-# second package manager to speed itself up has made a decision that is not
-# its to make. If uv is absent, pip does the job it always did.
-$script:UvExe = (Get-Command "uv" -ErrorAction SilentlyContinue).Source
+# uv, when it is here, does the same work about five times faster and
+# provides `uvx` which powers 4 default MCP servers.
+Ensure-Uv
 if ($script:UvExe) {
     StepInfo "using uv ($script:UvExe)"
 } else {
@@ -681,6 +832,10 @@ if (-not (Test-Path $python)) {
     Write-Host "Reinstall with: powershell -c `"iex (iwr -UseBasicParsing -Uri https://raw.githubusercontent.com/oleksandkov/Agent-For-TOM/main/install.ps1)`"" -ForegroundColor Yellow
     exit 1
 }
+$localBin = Join-Path $HOME ".local\bin"
+if ((Test-Path $localBin) -and ($env:Path -notlike "*$localBin*")) {
+    $env:Path = "$localBin;$env:Path"
+}
 & $python $cli @args
 exit $LASTEXITCODE
 '@ -replace '{InstallDir}', $InstallDir
@@ -694,6 +849,7 @@ $venvBin = "Scripts"; if (Test-Path (Join-Path $VenvDir "bin")) { $venvBin = "bi
 $cmdContent = @'
 @echo off
 set "TOMAS_DIR={InstallDir}"
+if exist "%USERPROFILE%\.local\bin" set "PATH=%USERPROFILE%\.local\bin;%PATH%"
 "{InstallDir}\.venv\{VenvBin}\python.exe" "{InstallDir}\src\agent_cli.py" %*
 '@ -replace '{InstallDir}', $InstallDir -replace '\{VenvBin\}', $venvBin
 
@@ -934,6 +1090,14 @@ if ($paths -notcontains $BinDir) {
     Write-Host "  [OK] Already in PATH: $BinDir" -ForegroundColor Green
 }
 
+$localBin = Join-Path $HOME ".local\bin"
+if ((Test-Path $localBin) -and ($paths -notcontains $localBin)) {
+    $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $newPath = $localBin + ';' + $currentPath
+    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+    Write-Host "  [OK] Added $localBin to user PATH" -ForegroundColor Green
+}
+
 # Always update current session PATH to put $BinDir at the very front and filter legacy paths
 $cleanSessionPaths = $env:Path -split ';' | Where-Object { $_ -and $_ -ne $BinDir -and $_ -notlike "*Agent_for_TOM*" }
 $env:Path = "$BinDir;" + ($cleanSessionPaths -join ';')
@@ -962,7 +1126,7 @@ $uninstallContent = @'
 
        with no attempt limit. Windows will not delete a running executable, and
        a leftover TOMAS process was holding
-       `.tomas\.venv\Scripts\python.exe` — so `rmdir` removed every unlocked
+       `.tomas\.venv\Scripts\python.exe` -- so `rmdir` removed every unlocked
        file (all the user's sessions, providers and instructions) and the
        directory never disappeared. The loop then spun once a second forever in
        a console window that could not be closed, which is exactly what the
@@ -1085,6 +1249,8 @@ Write-Host "  [OK] Created uninstaller: $uninstallScript" -ForegroundColor Green
 
 # -- Run setup to install default MCPs --
 Step "Configuring default MCP servers..."
+Ensure-NodeJs
+Ensure-Uv
 try {
     & $script:PythonExe "$SrcDir\agent_cli.py" setup
     Write-Host "  [OK] Default MCPs configured" -ForegroundColor Green

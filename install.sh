@@ -67,6 +67,35 @@ if ! command -v unzip &>/dev/null; then
     fail "Required: unzip. Install it with your package manager (apt install unzip, brew install unzip, etc.)"
 fi
 
+# Check for uv (speeds up installs and powers 4 default MCPs)
+if ! command -v uv &>/dev/null && [ -f "$HOME/.local/bin/uv" ]; then
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+if ! command -v uv &>/dev/null; then
+    if [ -t 0 ]; then
+        echo -e "  ${YELLOW}uv is not installed. It speeds up installs 5x and is required for 4 default MCPs (word-docs, fetch, time, pdf).${RESET}"
+        read -r -p "  Install uv now? [y/N] " WANT_UV || WANT_UV="n"
+        if [[ "$WANT_UV" =~ ^[Yy]$ ]]; then
+            info "Installing uv..."
+            curl -LsSf https://astral.sh/uv/install.sh | sh || true
+            export PATH="$HOME/.local/bin:$PATH"
+            if command -v uv &>/dev/null; then
+                ok "uv installed successfully"
+            fi
+        else
+            info "Skipped uv. Pip will be used for dependencies."
+        fi
+    else
+        info "uv not found - install later: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    fi
+fi
+
+# Check for Node.js / npx (powers 4 default MCPs)
+if ! command -v npx &>/dev/null; then
+    warn "Node.js (npx) is not installed - required for 4 default MCPs (playwright, context7, sequential-thinking, excel)"
+    info "Install Node.js via your package manager (brew install node, apt install nodejs npm) to enable them."
+fi
+
 # ── Create directories ──
 INSTRUCTIONS_DIR="$INSTALL_DIR/instructions"
 PROJECTS_DIR="$INSTRUCTIONS_DIR/project"

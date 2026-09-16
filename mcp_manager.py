@@ -25,6 +25,54 @@ from typing import Any, Optional
 CLAUDE_CONFIG = Path.home() / ".claude.json"
 
 
+def ensure_tool_paths() -> None:
+    """Ensure common tool runner directories (uvx, npx) are present in os.environ['PATH'].
+
+    On Windows, uv installs to ~/.local/bin and Node.js often installs to
+    Program Files or %LOCALAPPDATA%/Programs/nodejs. When a process was spawned
+    before PATH was updated or in subshells, these directories may be missing from
+    os.environ['PATH'], causing stdio MCP servers (uvx, npx) to fail on initialize.
+    """
+    paths_to_add: list[str] = []
+    home = Path.home()
+    for candidate in (home / ".local" / "bin", home / ".cargo" / "bin"):
+        if candidate.is_dir():
+            cand_str = str(candidate)
+            if cand_str not in os.environ.get("PATH", "").split(os.pathsep):
+                paths_to_add.append(cand_str)
+
+    if os.name == "nt":
+        localappdata = os.environ.get("LOCALAPPDATA")
+        if localappdata:
+            uv_dir = Path(localappdata) / "uv"
+            if uv_dir.is_dir() and str(uv_dir) not in os.environ.get("PATH", "").split(os.pathsep):
+                paths_to_add.append(str(uv_dir))
+            node_user = Path(localappdata) / "Programs" / "nodejs"
+            if node_user.is_dir() and str(node_user) not in os.environ.get("PATH", "").split(os.pathsep):
+                paths_to_add.append(str(node_user))
+
+        for env_var in ("ProgramFiles", "ProgramFiles(x86)"):
+            val = os.environ.get(env_var)
+            if val:
+                nodejs = Path(val) / "nodejs"
+                if nodejs.is_dir() and str(nodejs) not in os.environ.get("PATH", "").split(os.pathsep):
+                    paths_to_add.append(str(nodejs))
+
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            npm_dir = Path(appdata) / "npm"
+            if npm_dir.is_dir() and str(npm_dir) not in os.environ.get("PATH", "").split(os.pathsep):
+                paths_to_add.append(str(npm_dir))
+
+    if paths_to_add:
+        current = os.environ.get("PATH", "")
+        os.environ["PATH"] = os.pathsep.join(paths_to_add) + (os.pathsep + current if current else "")
+
+
+# Ensure PATH on import
+ensure_tool_paths()
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Config I/O  (read/write mcpServers from claude.json)
 # ═══════════════════════════════════════════════════════════════════════
@@ -354,6 +402,7 @@ class MCPServer:
     def _connect_stdio(self) -> bool:
         if not self.command:
             return False
+        ensure_tool_paths()
         env = os.environ.copy()
         env.update({k: v for k, v in self.env.items() if isinstance(v, str)})
 

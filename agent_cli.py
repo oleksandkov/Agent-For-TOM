@@ -3789,6 +3789,106 @@ def _check_mcp_health(names, timeout: int = 45) -> dict[str, dict]:
     return results
 
 
+def _install_uv_runner() -> bool:
+    """Install Astral uv using official script or package manager."""
+    from mcp_manager import ensure_tool_paths
+    import shutil, subprocess
+
+    try:
+        if os.name == "nt":
+            ps_cmd = (
+                "$ProgressPreference = 'SilentlyContinue'; "
+                "irm https://astral.sh/uv/install.ps1 | iex"
+            )
+            res = subprocess.run(
+                ["powershell", "-ExecutionPolicy", "Bypass", "-c", ps_cmd],
+                check=False,
+            )
+            if res.returncode == 0:
+                ensure_tool_paths()
+                if shutil.which("uvx"):
+                    print(f"  {GREEN}✓{RESET} uv installed successfully")
+                    return True
+            if shutil.which("winget"):
+                res = subprocess.run(
+                    ["winget", "install", "--id", "astral-sh.uv", "-e",
+                     "--accept-source-agreements", "--accept-package-agreements"],
+                    check=False,
+                )
+                if res.returncode == 0:
+                    ensure_tool_paths()
+                    if shutil.which("uvx"):
+                        print(f"  {GREEN}✓{RESET} uv installed successfully")
+                        return True
+        else:
+            res = subprocess.run(
+                "curl -LsSf https://astral.sh/uv/install.sh | sh",
+                shell=True, check=False,
+            )
+            if res.returncode == 0:
+                ensure_tool_paths()
+                if shutil.which("uvx"):
+                    print(f"  {GREEN}✓{RESET} uv installed successfully")
+                    return True
+    except Exception as exc:
+        print(f"  {YELLOW}⚠ uv install error: {exc}{RESET}")
+    return False
+
+
+def _prompt_install_prerequisites() -> None:
+    """Check for tool runners (uvx, npx) needed by default MCPs and propose installing them."""
+    import shutil
+    from mcp_manager import ensure_tool_paths
+
+    ensure_tool_paths()
+    interactive = sys.stdin.isatty()
+
+    # ── uv / uvx ──
+    if not shutil.which("uvx"):
+        print()
+        print(f"  {YELLOW}uv (uvx) is not installed.{RESET}")
+        print(f"  {DIM}Required for 4 default MCP servers: word-docs, fetch, time, pdf.{RESET}")
+        if interactive:
+            try:
+                ans = input("  Install uv now? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = "n"
+            if ans in ("y", "yes"):
+                print(f"  {CYAN}⚙ Installing uv...{RESET}")
+                _install_uv_runner()
+                ensure_tool_paths()
+            else:
+                print(f"  {DIM}Skipped uv. Those 4 MCP servers will stay inactive.{RESET}")
+        else:
+            print(f"  {DIM}Install uv via: irm https://astral.sh/uv/install.ps1 | iex{RESET}")
+
+    # ── Node.js / npx ──
+    if not shutil.which("npx"):
+        print()
+        print(f"  {YELLOW}Node.js (npx) is not installed.{RESET}")
+        print(f"  {DIM}Required for 4 default MCP servers: playwright, context7, sequential-thinking, excel.{RESET}")
+        if interactive and os.name == "nt" and shutil.which("winget"):
+            try:
+                ans = input("  Install Node.js LTS via winget? [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = "n"
+            if ans in ("y", "yes"):
+                print(f"  {CYAN}⚙ Installing Node.js LTS via winget...{RESET}")
+                try:
+                    subprocess.run(
+                        ["winget", "install", "--id", "OpenJS.NodeJS.LTS", "-e",
+                         "--accept-source-agreements", "--accept-package-agreements"],
+                        check=False,
+                    )
+                    ensure_tool_paths()
+                except Exception as e:
+                    print(f"  {YELLOW}⚠ winget failed: {e}{RESET}")
+            else:
+                print(f"  {DIM}Skipped Node.js. Those 4 MCP servers will stay inactive.{RESET}")
+        else:
+            print(f"  {DIM}Install Node.js from {CYAN}https://nodejs.org/{RESET} {DIM}to enable those servers.{RESET}")
+
+
 def cmd_setup():
     """Install default MCP servers, verify each one actually starts, and
     configure environment.
@@ -3811,8 +3911,11 @@ def cmd_setup():
     check can tell a server that starts and answers tools/list from one
     whose command is merely spelled correctly.
     """
-    from mcp_manager import read_mcp_servers, write_mcp_server
+    from mcp_manager import ensure_tool_paths, read_mcp_servers, write_mcp_server
     import subprocess, sys
+
+    ensure_tool_paths()
+    _prompt_install_prerequisites()
 
     tomas_venv = TOMAS_DIR / ".venv"
     python_exe = tomas_venv / "Scripts" / "python.exe"
@@ -3925,12 +4028,24 @@ def cmd_setup():
     if healthy == len(DEFAULT_MCP_SERVERS):
         print(f"  {GREEN}✓ All {healthy} MCP servers verified working.{RESET}")
     else:
+        import shutil
         failed = len(DEFAULT_MCP_SERVERS) - healthy
         print(f"  {YELLOW}⚠ {healthy}/{len(DEFAULT_MCP_SERVERS)} MCP servers verified -- "
               f"{failed} failed to start.{RESET}")
-        print(f"  {DIM}This usually means Node.js (npx) or uv (uvx) is not installed / on PATH.{RESET}")
-        print(f"  {DIM}Re-run{RESET} {CYAN}TOMAS setup{RESET} {DIM}once that's fixed, or check{RESET} "
-              f"{CYAN}TOMAS mcp list{RESET}")
+        missing: list[str] = []
+        if not shutil.which("npx"):
+            missing.append("Node.js (npx) -> needed for playwright, context7, sequential-thinking, excel")
+        if not shutil.which("uvx"):
+            missing.append("uv (uvx) -> needed for word-docs, fetch, time, pdf")
+        if missing:
+            print(f"  {DIM}Missing prerequisites:{RESET}")
+            for m in missing:
+                print(f"    {YELLOW}•{RESET} {m}")
+            print(f"  {DIM}Run{RESET} {CYAN}TOMAS setup{RESET} {DIM}to install them, or check{RESET} "
+                  f"{CYAN}TOMAS mcp list{RESET}")
+        else:
+            print(f"  {DIM}First run downloads packages in background; re-check with{RESET} "
+                  f"{CYAN}TOMAS mcp list{RESET}")
 
     print()
     print(f"  {GREEN}✓ Setup complete!{RESET}")
