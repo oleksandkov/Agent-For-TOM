@@ -560,7 +560,12 @@ def _probe_models_endpoint(model: str) -> int:
     if not base_url:
         return 0
     try:
-        models_url = base_url.rstrip("/") + "/v1/models"
+        stripped = base_url.rstrip("/")
+        tail = stripped.rsplit("/", 1)[-1].lower()
+        versioned = (tail == "inference"
+                     or (tail.startswith("v") and tail[1:].isdigit()))
+        models_url = (f"{stripped}/models" if versioned
+                      else f"{stripped}/v1/models")
         req = urllib.request.Request(models_url, method="GET")
         # Use the same API key if set
         key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -6407,7 +6412,7 @@ def _try_zen_fallback(reason: str) -> str:
     try:
         import provider_manager
         active = provider_manager.get_active()
-        if active is None or active.type != "zen":
+        if active is None or active.type not in ("zen", "zen_api"):
             return ""
         import zen_catalog
         failed_model = _get_model()
@@ -7599,7 +7604,7 @@ def handle_slash_command(cmd_args: str, messages: list) -> str | None:
             except Exception as e:
                 return f'  {RED}Could not list models: {e}{RESET}'
             unavailable = {}
-            if active.type == "zen":
+            if active.type in ("zen", "zen_api"):
                 try:
                     import zen_catalog
                     unavailable = zen_catalog.unavailable()

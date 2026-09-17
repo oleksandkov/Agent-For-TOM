@@ -93,6 +93,14 @@ class ProviderSpec:
     models: str = "openai_list"
     static_models: tuple = ()
 
+    #: Full path from the host for chat completions, when the endpoint does
+    #: not follow the `/v1/...` convention. Empty means the standard join:
+    #: `{base}/chat/completions` when the base already ends in its version
+    #: path (Z.ai's `/paas/v4`, GitHub Models' `/inference`), otherwise
+    #: `{base}/v1/chat/completions`. Perplexity serves `/chat/completions`
+    #: straight off its host, so blindly inserting `/v1` 404s every call.
+    chat_path: str = ""
+
     tool_ceiling: int = 128
     #: Declared, endpoint-level quirks. Per-*model* quirks are learned from
     #: the endpoint's own 4xx and persisted into Capabilities instead — a name
@@ -183,6 +191,21 @@ SPECS: tuple = (
         free_tier=True,
         notes="Dynamic x-opencode-* headers are built per request by "
               "openai_adapter.build_from_active, not stored here.",
+    ),
+    ProviderSpec(
+        id="zen_api",
+        label="OpenCode Zen (API key)",
+        group="free",
+        base_url="https://opencode.ai/zen/v1",
+        api_key_env="OPENCODE_API_KEY",
+        key_aliases=("ZEN_API_KEY",),
+        signup_url="https://opencode.ai/docs/zen",
+        models="zen_catalog",
+        tool_ceiling=32,                 # same free-tier payload limit as zen
+        free_tier=True,
+        notes="The same gateway as OpenCode Zen, billed to your API key "
+              "instead of the anonymous free tier. The key is sent as the "
+              "Bearer token alongside the x-opencode-* headers.",
     ),
     ProviderSpec(
         id="ollama",
@@ -429,6 +452,10 @@ SPECS: tuple = (
         signup_url="https://www.perplexity.ai/settings/api",
         models="static",
         static_models=("sonar", "sonar-pro", "sonar-reasoning"),
+        # No `/v1` under the host: the chat endpoint is
+        # `https://api.perplexity.ai/chat/completions`, so the standard join
+        # would 404 every call.
+        chat_path="/chat/completions",
         # Declared, not learned: Perplexity has no tool-calling surface at
         # all, so the first call should already know rather than discovering
         # it with a 400. This is what `quirks` is for — an endpoint-level
@@ -446,6 +473,8 @@ SPECS: tuple = (
         key_aliases=("ZHIPU_API_KEY", "GLM_API_KEY"),
         signup_url="https://z.ai/manage-apikey/apikey-list",
         models="openai_list",
+        static_models=("glm-4.6", "glm-4.5", "glm-4-plus",
+                       "glm-4-air", "glm-4-flash", "glm-4"),
     ),
     ProviderSpec(
         id="moonshot",

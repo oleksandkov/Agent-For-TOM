@@ -2344,7 +2344,7 @@ def _configure_generic(spec) -> bool:
         update_dotenv(env_name, value)
 
     net_probe.invalidate()
-    catalog = provider_manager.catalog_for(spec.id, key)
+    catalog = provider_manager.catalog_for(spec.id, key, base_url)
     if catalog:
         model = _pick_model_from_catalog(spec, catalog)
         if not model:
@@ -2426,9 +2426,11 @@ def _live_catalog_rows(provider_id: str) -> list[tuple[str, str | None]]:
     import provider_manager
     active = provider_manager.get_active()
     key = active.api_key if active and active.type == provider_id else ''
+    base_url = (active.base_url if active and active.type == provider_id
+                else '')
 
     def _fetch():
-        return provider_manager.catalog_for(provider_id, key)
+        return provider_manager.catalog_for(provider_id, key, base_url)
 
     catalog = net_probe.cached(f'{provider_id}_catalog_rows', 60.0, _fetch)
     return [_catalog_row(m) for m in catalog] if catalog else []
@@ -2838,6 +2840,7 @@ def _detect_provider() -> str:
 PROVIDER_TYPE_TO_DETECT = {
     "openrouter": "openrouter",
     "zen": "zen",
+    "zen_api": "zen_api",
     "anthropic": "anthropic",
     "openai": "openai",
     "google": "google",
@@ -2861,6 +2864,7 @@ def _detect_provider_from_config() -> str:
 PROVIDER_LABELS = {
     "openrouter": "OpenRouter",
     "zen": "OpenCode Zen",
+    "zen_api": "OpenCode Zen (API key)",
     "anthropic": "Anthropic Direct",
     "openai": "OpenAI",
     "google": "Google AI",
@@ -2927,13 +2931,16 @@ def _provider_model_entries(provider: str) -> list[tuple[str, str | None]]:
                 (f'  {DIM}Check the API key under Connect / configure '
                  f'provider.{RESET}', None),
             ]
-    elif provider == "zen":
+    elif provider in ("zen", "zen_api"):
         # Live, never static — for the reason the Ollama branch below is, and
         # then some: this list *changed under the hardcoded copy* three times.
-        # Free-tier only, for now — see provider_manager.VISIBLE_PROVIDER_TYPES
-        # and Catalog.free()'s cost.input == 0 and cost.output == 0 rule.
-        # Paid models are deliberately left off this menu rather than merely
-        # de-emphasized, so nothing here can be picked by accident.
+        # Anonymous `zen` shows the free tier only (see
+        # provider_manager.VISIBLE_PROVIDER_TYPES and Catalog.free()'s
+        # cost.input == 0 and cost.output == 0 rule): paid models are
+        # deliberately left off that menu rather than merely de-emphasized,
+        # so nothing there can be picked by accident. `zen_api` bills to the
+        # user's own key, so the rest of the catalogue is offered under its
+        # own heading instead of hidden.
         import net_probe
         import zen_catalog
         cat = net_probe.cached('zen_catalog', 60.0, zen_catalog.catalog)
@@ -2949,6 +2956,16 @@ def _provider_model_entries(provider: str) -> list[tuple[str, str | None]]:
                                       'tool_call_known': True,
                                       'vision': m.vision})
                         for m in free]
+        if provider == "zen_api":
+            paid = [m for m in cat.models if not m.free]
+            if paid:
+                entries.append(('── Paid (billed to your Zen key) ──', None))
+                entries += [_catalog_row({'id': m.id,
+                                          'context_window': m.context,
+                                          'tool_call': m.tool_call,
+                                          'tool_call_known': True,
+                                          'vision': m.vision})
+                            for m in paid]
         # Only when the list is actually doubtful. A fresh cache is the normal
         # fast path, not a degraded one — warning on it would train the user to
         # ignore the warning that matters.
@@ -3052,10 +3069,21 @@ def _provider_model_entries(provider: str) -> list[tuple[str, str | None]]:
         # names below, which are OpenRouter-shaped and wrong for every direct
         # provider in that list.
         import provider_manager
-        active = provider_manager.get_active()
-        entries = _live_catalog_rows(active.type) if active else []
+        from core import provider_registry as _registry
+        spec = _registry.spec(provider)
+        target = (provider if spec is not None
+                  else (provider_manager.get_active().type
+                        if provider_manager.get_active() else ''))
+        entries = _live_catalog_rows(target) if target else []
         if entries:
             entries.insert(0, ('── Available to this key ──', None))
+        elif spec is not None and spec.static_models:
+            # The endpoint did not answer, but its model names are known —
+            # real ids for this provider, never OpenRouter-shaped guesses.
+            entries = ([('── Known models (endpoint did not answer) ──', None)]
+                       + [_catalog_row({'id': m, 'context_window': 0,
+                                        'tool_call_known': False})
+                          for m in spec.static_models])
         else:
             # Generic fallback — broad coverage, no live listing to read.
             entries = _static_rows([
@@ -3244,7 +3272,7 @@ def page_choose_model():
     # proxy builds its `/v1/models` reply out of the same hardcoded
     # `ZEN_MODELS`, so that path cost a port probe and an HTTP round trip to
     # return the stale list a second time.
-    elif provider == "zen":
+    elif provider in ("zen", "zen_api"):
         model_entries = _provider_model_entries(provider)
     else:
         model_entries = _provider_model_entries(provider)

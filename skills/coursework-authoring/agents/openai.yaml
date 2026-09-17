@@ -1,0 +1,4 @@
+interface:
+  display_name: "Coursework Authoring"
+  short_description: "Formats and verifies Ukrainian coursework"
+  default_prompt: "Use $coursework-authoring to create or audit a submission-ready course paper from the supplied requirements, samples, and draft."

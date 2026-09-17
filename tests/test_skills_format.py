@@ -317,5 +317,28 @@ class TestBundledSkillsShip(unittest.TestCase):
         self.assertGreater(sm.SKILL_DIRS.index(sm.BUNDLED_SKILLS_DIR), 0)
 
 
+class TestCourseworkSkillShips(unittest.TestCase):
+    """`skills/coursework-authoring` installs with everything else in `skills/`."""
+
+    def test_it_is_discovered_bundled_and_parses_cleanly(self):
+        skill = sm.find_skill("coursework-authoring")
+        self.assertIsNotNone(skill)
+        self.assertEqual(skill["source"], "bundled")
+        self.assertEqual(skill["problems"], [])
+        self.assertTrue(skill["triggers"])
+
+    def test_it_triggers_on_a_real_request(self):
+        matched = sm.match_skills(
+            "допоможи оформити курсову роботу, потрібен docx")
+        self.assertIn("coursework-authoring", [s["name"] for s in matched])
+
+    def test_the_files_it_links_to_exist(self):
+        base = sm.BUNDLED_SKILLS_DIR / "coursework-authoring"
+        for rel in ("SKILL.md", "agents/openai.yaml",
+                    "references/formatting.md", "references/diagrams.md",
+                    "references/verification.md"):
+            self.assertTrue((base / rel).is_file(), rel)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -520,9 +520,14 @@ class OpenAICompatAdapter:
                  extra_headers: Optional[dict] = None,
                  timeout: int = DEFAULT_TIMEOUT,
                  preserve_tool_extras: bool = False,
-                 replay_reasoning: bool = True):
+                 replay_reasoning: bool = True,
+                 chat_path: str = ""):
         self.base_url = (base_url or "").rstrip("/")
         self.api_key = api_key or ""
+        #: Full path from the host for chat completions, for endpoints that
+        #: do not follow the `/v1/...` convention (Perplexity). Empty means
+        #: the standard version-aware join in `_endpoint`.
+        self.chat_path = chat_path or ""
         self.extra_headers = dict(extra_headers or {})
         self.timeout = timeout
         #: Whether `extra_content` on a tool call is echoed back upstream.
@@ -549,8 +554,13 @@ class OpenAICompatAdapter:
 
     @property
     def _endpoint(self) -> str:
-        base = self.base_url
-        if base.endswith("/v1"):
+        base = self.base_url.rstrip("/")
+        if self.chat_path:
+            return f"{base}{self.chat_path}"
+        tail = base.rsplit("/", 1)[-1].lower()
+        versioned = (tail == "inference"
+                     or (tail.startswith("v") and tail[1:].isdigit()))
+        if versioned or base.endswith("/v1"):
             return f"{base}/chat/completions"
         return f"{base}/v1/chat/completions"
 
@@ -717,14 +727,19 @@ def build_from_active():
     # "Missing Authentication header".
     key = provider.api_key or os.environ.get("ANTHROPIC_API_KEY", "")
 
-    if provider.type == "zen":
+    if provider.type in ("zen", "zen_api"):
         # A zen provider points at the local proxy port, which only ever meant
         # "reach Zen". Go there directly and carry the headers the daemon used
-        # to add on the way through.
+        # to add on the way through. `zen_api` is the same gateway billed to
+        # the user's own key rather than the anonymous free tier.
         from zen_proxy import ZEN_API_HOST, _oc_id as _mkid, _zen_headers
         base = os.environ.get("ZEN_UPSTREAM_URL", f"https://{ZEN_API_HOST}/zen/v1")
         zen = _zen_headers(_mkid("ses"), _mkid("req"))
-        key = zen.pop("Authorization", "").replace("Bearer ", "") or key
+        header_key = zen.pop("Authorization", "").replace("Bearer ", "")
+        # A key saved on the provider outranks the ambient one; the ambient
+        # one outranks whatever else is lying around in ANTHROPIC_API_KEY.
+        # For plain `zen` the provider holds no key, so this changes nothing.
+        key = provider.api_key or header_key or key
         zen.pop("Content-Type", None)
         headers.update(zen)
     elif provider.type == "google":
@@ -742,6 +757,7 @@ def build_from_active():
     return OpenAICompatAdapter(
         base, key, headers,
         preserve_tool_extras=provider.type == "google",
+        chat_path=spec.chat_path if spec else "",
         # Read off the spec rather than matched on the type here, so adding
         # another endpoint that refuses reasoning is a one-line spec edit and
         # not a second place that has to be kept in sync with the first.

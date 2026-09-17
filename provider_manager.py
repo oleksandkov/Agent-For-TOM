@@ -469,6 +469,34 @@ def _timeout_for(provider: Provider) -> int:
             else _PROBE_TIMEOUT)
 
 
+def _base_is_versioned(base: str) -> bool:
+    """True when `base` already ends in its endpoint's version path.
+
+    Most specs end in `/v1`, but Z.ai ends in `/paas/v4` and GitHub Models in
+    `/inference`. Blindly appending `/v1/...` to one of those builds
+    `.../v4/v1/chat/completions` — a URL that answers 404 on every call.
+    """
+    tail = base.rstrip("/").rsplit("/", 1)[-1].lower()
+    return (tail == "inference"
+            or (tail.startswith("v") and tail[1:].isdigit()))
+
+
+def _openai_leaf_url(base: str, leaf: str) -> str:
+    """`base` + an OpenAI path leaf, without doubling the version segment."""
+    base = base.rstrip("/")
+    if _base_is_versioned(base):
+        return f"{base}{leaf}"
+    return f"{base}/v1{leaf}"
+
+
+def _model_listing_urls(base: str) -> list:
+    """Candidate `/models` URLs, version-aware first."""
+    base = base.rstrip("/")
+    if _base_is_versioned(base):
+        return [f"{base}/models"]
+    return [f"{base}/v1/models", f"{base}/models"]
+
+
 def _headers_for(provider: Provider) -> dict:
     headers = {"Content-Type": "application/json"}
 
@@ -481,12 +509,20 @@ def _headers_for(provider: Provider) -> dict:
     # `openai_adapter.build_from_active` already carries these on the runtime
     # path; the probe has to agree with it or the two disagree about the same
     # endpoint.
-    if provider.type == "zen":
+    if provider.type in ("zen", "zen_api"):
         try:
             from zen_proxy import _oc_id, _zen_headers
             headers.update(_zen_headers(_oc_id("ses"), _oc_id("req")))
         except Exception:
             pass
+        # A key saved on the provider outranks the ambient one: `zen_api`
+        # carries the user's OpenCode key, while `zen` has none and keeps
+        # whatever `_zen_headers` resolved (OPENCODE_API_KEY, ZEN_API_KEY,
+        # or the anonymous "public" token).
+        key = provider.api_key
+        if key:
+            token = key[7:] if key.startswith("Bearer ") else key
+            headers["Authorization"] = f"Bearer {token}"
         headers.update(provider.extra_headers or {})
         return headers
 
@@ -563,9 +599,9 @@ def list_models(provider: Provider) -> list[str]:
                 return names
         except Exception:
             pass
-    for suffix in ("/v1/models", "/models"):
+    for suffix_url in _model_listing_urls(base):
         try:
-            data = _get_json(f"{base}{suffix}", headers)
+            data = _get_json(suffix_url, headers)
             items = data if isinstance(data, list) else data.get("data", [])
             names = [m.get("id") for m in items if isinstance(m, dict) and m.get("id")]
             if names:
@@ -794,9 +830,9 @@ def _probe_context_window(provider: Provider) -> int:
     if not base or not provider.model:
         return 0
     headers = _headers_for(provider)
-    for suffix in ("/v1/models", "/models"):
+    for suffix_url in _model_listing_urls(base):
         try:
-            data = _get_json(f"{base}{suffix}", headers)
+            data = _get_json(suffix_url, headers)
         except Exception:
             continue
         items = data if isinstance(data, list) else data.get("data", [])
@@ -818,7 +854,7 @@ def _probe_context_window(provider: Provider) -> int:
     # 1,000,000, and `core.budget` sizes the tool ceiling and output reserve
     # as *shares of the window* — so the wrong window mis-sizes every section
     # of the prompt. The published catalogue does carry the number.
-    if provider.type == "zen":
+    if provider.type in ("zen", "zen_api"):
         try:
             import zen_catalog
             entry = zen_catalog.catalog().get(provider.model)
@@ -909,7 +945,7 @@ def probe_base_url(provider: Provider) -> str:
     incapable of everything.
     """
     base = (provider.base_url or "").rstrip("/")
-    if provider.type == "zen" and (not base or ":6446" in base):
+    if provider.type in ("zen", "zen_api") and (not base or ":6446" in base):
         try:
             from zen_proxy import ZEN_API_HOST
         except Exception:
@@ -929,7 +965,10 @@ def probe_base_url(provider: Provider) -> str:
 def _completions_url(provider: Provider) -> str:
     base = probe_base_url(provider)
     if provider.speaks_openai_wire:
-        return f"{base}/chat/completions" if base.endswith("/v1") else f"{base}/v1/chat/completions"
+        spec = registry.spec(provider.type)
+        if spec is not None and spec.chat_path:
+            return f"{base}{spec.chat_path}"
+        return _openai_leaf_url(base, "/chat/completions")
     return f"{base}/v1/messages"
 
 
@@ -1046,7 +1085,8 @@ def _tool_support_is_unknown(provider: Provider) -> bool:
     new to learn and a probe would only cost latency.
     """
     try:
-        for entry in catalog_for(provider.type):
+        for entry in catalog_for(provider.type, provider.api_key,
+                                 provider.base_url):
             if entry["id"] == provider.model:
                 return not entry["tool_call_known"]
     except Exception:
@@ -1744,21 +1784,41 @@ def _normalise_catalog_entry(entry: dict, spec) -> dict:
     }
 
 
-def catalog_for(provider_id: str, api_key: str = "") -> list[dict]:
+def catalog_for(provider_id: str, api_key: str = "",
+                base_url: str = "") -> list[dict]:
     """The model catalogue for one provider id, in CANONICAL_CATALOG_KEYS.
 
     Never raises: a menu being drawn must not die because an endpoint is
     down. An empty list is the caller's cue to say so — which is a gap the
     user can see, rather than a traceback.
+
+    `api_key`/`base_url` are the key and endpoint being configured, not the
+    active provider's: the generic `openai_list` listing is read off the
+    *target* endpoint, so configuring Z.ai while Anthropic is active lists
+    Z.ai's models rather than Anthropic's (or nothing at all).
     """
     spec = registry.spec(provider_id)
     if spec is None:
         return []
-    fetcher = CATALOG_FETCHERS.get(spec.models)
-    if fetcher is None:
-        return []
     try:
-        raw = fetcher(api_key) or []
+        if spec.models == "openai_list":
+            env = ({spec.api_key_env: api_key}
+                   if api_key and spec.api_key_env else {})
+            target = Provider(
+                name=spec.label, type=spec.id,
+                base_url=base_url or spec.base_url,
+                api_key_env=spec.api_key_env or "ANTHROPIC_API_KEY",
+                env=env)
+            raw = [{"name": m, "label": m, "context_window": 0}
+                   for m in list_models(target)]
+        elif spec.models == "static":
+            raw = [{"name": m, "label": m, "context_window": 0}
+                   for m in spec.static_models]
+        else:
+            fetcher = CATALOG_FETCHERS.get(spec.models)
+            if fetcher is None:
+                return []
+            raw = fetcher(api_key) or []
     except Exception:
         return []
     return [_normalise_catalog_entry(e, spec) for e in raw
