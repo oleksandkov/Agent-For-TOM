@@ -2317,6 +2317,11 @@ def _configure_generic(spec) -> bool:
             key = prompt_text(f'Enter {spec.label} API key{hint}')
         if not key:
             return False
+    # Pasted keys arrive with stray whitespace (a trailing space 401s every
+    # call), so it is stripped once, here, before it is saved or probed.
+    key = key.strip()
+    if spec.needs_key and not key:
+        return False
 
     base_url = spec.base_url
     if spec.base_url_editable:
@@ -2339,6 +2344,16 @@ def _configure_generic(spec) -> bool:
     provider = provider_manager.Provider(
         name=spec.label, type=spec.id, base_url=base_url,
         api_key_env=spec.api_key_env or 'ANTHROPIC_API_KEY', env=env)
+
+    # A rejected key must fail here, with the signup URL on screen — not two
+    # menus later as an empty model list and a 401 on the first turn.
+    refusal = provider_manager.check_key(provider)
+    if refusal:
+        show_info_page(f'⚠ {spec.label}', [
+            f'  {YELLOW}{refusal}{RESET}',
+            '',
+            f'  {DIM}Get one at {spec.signup_url}{RESET}'])
+        return False
 
     for env_name, value in env.items():
         update_dotenv(env_name, value)
@@ -2857,7 +2872,18 @@ def _detect_provider_from_config() -> str:
     if active:
         provider_info = config.get("providers", {}).get(active, {})
         ptype = provider_info.get("type", "")
-        return PROVIDER_TYPE_TO_DETECT.get(ptype, "other")
+        if ptype in PROVIDER_TYPE_TO_DETECT:
+            return PROVIDER_TYPE_TO_DETECT[ptype]
+        # Any registry-known type is itself — the literal above only covers
+        # the oldest providers, and an unlisted one (e.g. nvidia) fell
+        # through to "other", which mislabeled the model menu "(Generic)".
+        try:
+            from core import provider_registry as _reg
+            if _reg.spec(ptype) is not None:
+                return ptype
+        except Exception:
+            pass
+        return "other"
     return "other"
 
 
@@ -3155,8 +3181,7 @@ def _show_filtered_model_menu(model_entries, label, current, initial_query=None)
             model = _prompt_ollama_context_selection(model)
         update_dotenv("AGENT_MODEL", model)
         # Also update saved provider config if available
-        _update_provider_model(model)
-        show_info_page('Done', [f'  ✓ Model set to: {model}'])
+        _announce_model_switch(model)
 
 
 def _prompt_ollama_context_selection(model: str) -> str:
@@ -3227,7 +3252,7 @@ def _prompt_ollama_context_selection(model: str) -> str:
     return model
 
 
-def _update_provider_model(model: str):
+def _update_provider_model(model: str) -> int | None:
     """Update the model in the stored provider config, if any.
 
     The stored capabilities describe the model being replaced, so they are
@@ -3235,20 +3260,45 @@ def _update_provider_model(model: str):
     `provider_manager.refresh_for_model`. A failure here is not fatal: the
     model switch itself has already been written, and stale capabilities
     degrade a feature where a raised exception would lose the switch.
+
+    Returns the re-identified context window, or None when the new model's
+    window could not be established (a zero `probed_at` means neither the
+    listing nor the catalogue answered — inheriting the previous model's
+    number would be the silent wrong answer).
     """
     config = _load_providers_config()
     active = config.get("active")
     if not (active and active in config.get("providers", {})):
-        return
+        return None
     config["providers"][active]["model"] = model
     _save_providers_config(config)
     try:
         import provider_manager
         provider = provider_manager.get(active)
         if provider is not None:
-            provider_manager.refresh_for_model(provider)
+            caps = provider_manager.refresh_for_model(provider)
+            if caps.probed_at and caps.context_window:
+                return int(caps.context_window)
     except Exception:
         pass
+    return None
+
+
+def _announce_model_switch(model: str) -> None:
+    """Persist a switch and report the window the session will run on.
+
+    One writer for the Done page so every picker — full list, search, custom
+    name, OpenRouter fetch — confirms the same thing: the model, and the
+    context window re-identified for it just now.
+    """
+    window = _update_provider_model(model)
+    if window:
+        show_info_page('Done', [f'  ✓ Model set to: {model}',
+                                f'  Context window: {window:,} tokens'])
+    else:
+        show_info_page('Done', [f'  ✓ Model set to: {model}',
+                                f'  {YELLOW}Context window unknown — '
+                                f'running on defaults.{RESET}'])
 
 
 def page_choose_model():
@@ -3257,7 +3307,14 @@ def page_choose_model():
     # Fallback: if env-var detection returns 'other', check saved config
     if provider == "other":
         provider = _detect_provider_from_config()
-    label = PROVIDER_LABELS.get(provider, "Generic")
+    label = PROVIDER_LABELS.get(provider)
+    if label is None:
+        try:
+            from core import provider_registry as _reg
+            _spec = _reg.spec(provider)
+            label = _spec.label if _spec is not None else "Generic"
+        except Exception:
+            label = "Generic"
 
     # For OpenRouter: auto-fetch all models from API, fall back to static list
     if provider == "openrouter":
@@ -3327,8 +3384,7 @@ def page_choose_model():
         if provider == "ollama":
             model = _prompt_ollama_context_selection(model)
         update_dotenv("AGENT_MODEL", model)
-        _update_provider_model(model)
-        show_info_page('Done', [f'  ✓ Model set to: {model}'])
+        _announce_model_switch(model)
 
 
 def _format_openrouter_entries(
@@ -3406,7 +3462,7 @@ def _fetch_openrouter_models():
     model = values[idx]
     if model:
         update_dotenv("AGENT_MODEL", model)
-        show_info_page('Done', [f'  ✓ Model set to: {model}'])
+        _announce_model_switch(model)
 
 
 def _ensure_api_configured() -> bool:

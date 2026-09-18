@@ -6735,7 +6735,7 @@ def _numbered_menu_fallback(title: str, items: list[str], footer: str = "") -> i
 
 
 def _arrow_menu(title: str, items: list[str], footer: str = "",
-                erase_on_exit: bool = False) -> int:
+                erase_on_exit: bool = False, max_visible: int = 14) -> int:
     """A minimal arrow-key picker for slash-command menus (e.g. /config).
 
     Deliberately not `agent_cli.arrow_menu` — that lives in the TUI
@@ -6745,6 +6745,13 @@ def _arrow_menu(title: str, items: list[str], footer: str = "",
     exact same two-byte codes msvcrt reports for arrow keys, '\\xe0'/'\\x00'
     prefix then 'H'/'P', rather than a second decoding of the same keys).
     Returns the selected index, or -1 on Esc/cancel.
+
+    Only a viewport is ever drawn: the /config model list runs to hundreds
+    of OpenRouter rows, and drawing all of them per keypress both scrolled
+    the menu off screen and made each step cost a full 400-row repaint, so
+    the list looked frozen and nothing in it could be picked.
+    Keys: ↑↓ move, PgUp/PgDn/Home/End, `/` filters, digits jump,
+    Enter selects, Esc/←/q cancels.
     """
     if not items:
         return -1
@@ -6772,6 +6779,73 @@ def _arrow_menu(title: str, items: list[str], footer: str = "",
     selected = 0
     last_rows = 0
 
+    from text_display import strip_ansi, term_lines
+    rows_available = max(4, term_lines() - 5)
+    if max_visible:
+        rows_available = min(rows_available, max(4, max_visible))
+
+    # Action rows stay on screen while filtering: losing '◀ Back' inside a
+    # filter leaves no way out but Esc, which also drops the filter.
+    PINNED = ('◀', '✎')
+    query = ''
+    filtering = False
+
+    def matches(i: int) -> bool:
+        text = (items[i] or '')
+        if text.lstrip().startswith(PINNED):
+            return True
+        return query in strip_ansi(text).lower()
+
+    shown = list(range(len(items)))
+    stops = list(shown)
+
+    def refilter():
+        """Recompute the visible rows after the query changed."""
+        nonlocal shown, stops, selected
+        shown = ([i for i in range(len(items)) if matches(i)] if query
+                 else list(range(len(items))))
+        stops = shown
+        if stops and selected not in stops:
+            selected = stops[0]
+
+    def window() -> list[int]:
+        """The slice of `shown` that fits in the row budget, around `selected`."""
+        if not shown:
+            return []
+        try:
+            pos = shown.index(selected)
+        except ValueError:
+            pos = 0
+        start = pos
+        used = _drawn_rows(items[shown[pos]])
+        end = pos + 1
+        # Grow forwards first, then backwards, so the selection stays put
+        # instead of jumping to the top of the viewport on every keypress.
+        while end < len(shown):
+            cost = _drawn_rows(items[shown[end]])
+            if used + cost > rows_available:
+                break
+            used += cost
+            end += 1
+        while start > 0:
+            cost = _drawn_rows(items[shown[start - 1]])
+            if used + cost > rows_available:
+                break
+            used += cost
+            start -= 1
+        return shown[start:end]
+
+    def move(step: int):
+        """Advance the cursor by `step` rows, wrapping at the ends."""
+        nonlocal selected
+        if not stops:
+            return
+        try:
+            pos = stops.index(selected)
+        except ValueError:
+            pos = 0
+        selected = stops[(pos + step) % len(stops)]
+
     def draw() -> int:
         rows = 0
         # An empty title draws no row at all. `ask_user_question` prints the
@@ -6782,16 +6856,23 @@ def _arrow_menu(title: str, items: list[str], footer: str = "",
             line = f'  {BOLD}{title}{RESET}'
             sys.stdout.write(RETURN + CLEAR_LINE + line + '\n')
             rows += _drawn_rows(line)
-        for i, label in enumerate(items):
+        view = window()
+        for i in view:
             marker = f'{GREEN}▶{RESET} ' if i == selected else '  '
-            body = f'{BOLD}{label}{RESET}' if i == selected else label
+            body = f'{BOLD}{items[i]}{RESET}' if i == selected else items[i]
             line = f'  {marker}{body}'
             sys.stdout.write(RETURN + CLEAR_LINE + line + '\n')
             # Physical rows, not one per item: a wrapped label made the rewind
             # below land mid-menu and erase the rest. See `_drawn_rows`.
             rows += _drawn_rows(line)
-        foot = footer or '↑↓ move · Enter select · Esc cancel'
-        line = f'  {DIM}{foot}{RESET}'
+        if filtering:
+            base = f'/{query}{DIM}  ({len(stops)} match){RESET}'
+        else:
+            base = footer or '↑↓ move · Enter select · Esc cancel'
+            if len(view) < len(shown):
+                here = (stops.index(selected) + 1) if selected in stops else 0
+                base += f'  [{here}/{len(stops)}]'
+        line = f'  {DIM}{base}{RESET}'
         sys.stdout.write(RETURN + CLEAR_LINE + line + '\n')
         rows += _drawn_rows(line)
         return rows
@@ -6816,22 +6897,63 @@ def _arrow_menu(title: str, items: list[str], footer: str = "",
             if ch in ('\xe0', '\x00'):
                 # Extended-key prefix: arrows report 'H' (up) / 'P' (down)
                 # for the byte that follows, same as the main prompt reader.
+                # 'I'/'Q' are PgUp/PgDn, 'G'/'O' Home/End on the same prefix.
                 ext = msvcrt.getwch()
                 if ext == 'H':
-                    selected = (selected - 1) % len(items)
+                    move(-1)
                     redraw()
                 elif ext == 'P':
-                    selected = (selected + 1) % len(items)
+                    move(1)
+                    redraw()
+                elif ext == 'I':
+                    move(-max(1, len(window()) - 1))
+                    redraw()
+                elif ext == 'Q':
+                    move(max(1, len(window()) - 1))
+                    redraw()
+                elif ext == 'G':
+                    if stops:
+                        selected = stops[0]
+                    redraw()
+                elif ext == 'O':
+                    if stops:
+                        selected = stops[-1]
                     redraw()
                 continue
+            if filtering and ch not in ('\r', '\x1b', '\xe0', '\x00'):
+                if ch == '\x08':
+                    query = query[:-1]
+                elif isinstance(ch, str) and len(ch) == 1 and ch.isprintable():
+                    query += ch.lower()
+                else:
+                    continue
+                refilter()
+                redraw()
+                continue
             if ch == '\r':
+                if filtering:
+                    filtering = False
+                    refilter()
+                    redraw()
                 return selected
-            if ch in ('\x1b', 'q', 'Q'):
+            if ch == '\x1b':
+                if filtering or query:
+                    filtering, query = False, ''
+                    refilter()
+                    redraw()
+                    continue
                 return -1
-            if ch.isdigit() and ch != '0':
+            if ch in ('q', 'Q'):
+                return -1
+            if ch == '/':
+                filtering, query = True, ''
+                refilter()
+                redraw()
+            elif ch.isdigit() and ch != '0':
                 n = int(ch)
-                if n <= len(items):
-                    return n - 1
+                if n <= len(stops):
+                    selected = stops[n - 1]
+                    redraw()
     finally:
         # Leaving the list on screen is right for /config, where the next
         # thing printed is the result of the choice. It is wrong when the

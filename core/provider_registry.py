@@ -407,7 +407,7 @@ SPECS: tuple = (
         api_key_env="NVIDIA_API_KEY",
         key_hint="nvapi-…",
         signup_url="https://build.nvidia.com",
-        models="openai_list",
+        models="nvidia_catalog",
         free_tier=True,
     ),
     ProviderSpec(

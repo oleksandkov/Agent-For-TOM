@@ -1075,23 +1075,47 @@ def probe_and_persist(provider: Provider) -> Capabilities:
     return provider.capabilities
 
 
-def _tool_support_is_unknown(provider: Provider) -> bool:
-    """True when this provider's catalogue cannot say whether the model
-    accepts tools — so the answer has to be measured rather than carried.
+def check_key(provider: Provider) -> Optional[str]:
+    """None when the endpoint accepts this key; a reason when it rejects it.
 
-    False when the catalogue does say (OpenRouter publishes
-    `supported_parameters`, Zen and Ollama publish a capability list), and
-    false when there is no catalogue at all, because then there is nothing
-    new to learn and a probe would only cost latency.
+    Only a 401/403 is conclusive. Anything else — offline, a 404 from a
+    versioned base, a 5xx — returns None so setup never blocks on a sick
+    network or a listing path quirk. A rejected key, though, must fail here
+    and not two menus later: saving it means the model list comes back empty
+    (or guessed), the session starts, and the first turn dies with the exact
+    401 this user pasted — "suddenly not responding" with a saved cause.
     """
+    spec = registry.spec(provider.type)
+    if spec is None or not spec.needs_key or not provider.api_key:
+        return None
+    base = probe_base_url(provider)
+    if not base:
+        return None
+    for url in _model_listing_urls(base):
+        try:
+            _get_json(url, _headers_for(provider))
+            return None
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                return (f"{spec.label} rejected this key (HTTP {e.code}). "
+                        f"Generate a fresh one — pasted keys with a missing "
+                        f"character or a trailing space fail exactly this way.")
+            continue
+        except Exception:
+            return None
+    return None
+
+
+def _catalog_entry_for(provider: Provider) -> dict:
+    """The normalised catalogue row for this provider's model, or {}."""
     try:
         for entry in catalog_for(provider.type, provider.api_key,
                                  provider.base_url):
-            if entry["id"] == provider.model:
-                return not entry["tool_call_known"]
+            if entry.get("id") == provider.model:
+                return entry
     except Exception:
         pass
-    return False
+    return {}
 
 
 def refresh_for_model(provider: Provider) -> Capabilities:
@@ -1116,12 +1140,25 @@ def refresh_for_model(provider: Provider) -> Capabilities:
     else:
         fresh = Capabilities(**old.to_dict())
         window = _probe_context_window(provider)
+        entry = _catalog_entry_for(provider)
+        if not window:
+            # The thin `/v1/models` listing carries no window (NVIDIA, and
+            # every `openai_list` endpoint), so a switch used to inherit the
+            # previous model's number — the session then ran a 1M model on a
+            # 200k budget. The enriched catalogue (curated table + automatic
+            # cross-match) is the second opinion; the old number stays the
+            # last resort, never the answer.
+            window = int(entry.get("context_window") or 0)
         # No answer means no measurement. Clearing `probed_at` is what lets
         # `resolve_context_window` fall through to its known-value table
         # instead of trusting a number measured for a different model.
         fresh.context_window = window or old.context_window
         fresh.probed_at = time.time() if window else 0.0
 
+        if entry.get("tool_call_known"):
+            fresh.tool_use = bool(entry.get("tool_call", False))
+            fresh.parallel_tool_calls = fresh.tool_use
+            fresh.vision = bool(entry.get("vision", False))
         # Tool support belongs to the *model* wherever the catalogue cannot
         # establish it, so carrying the previous model's answer is the same
         # mistake as carrying its context window. Groq is the case: its
@@ -1131,7 +1168,7 @@ def refresh_for_model(provider: Provider) -> Capabilities:
         # groq/compound would otherwise keep tool_use=True and fail the first
         # turn. One probe, and only when the catalogue has already said it
         # does not know.
-        if _tool_support_is_unknown(provider):
+        elif entry and not entry.get("tool_call_known", False):
             fresh.tool_use = _probe_feature(provider, with_tools=True)
             fresh.parallel_tool_calls = fresh.tool_use
     fresh.max_tools = old.max_tools
@@ -1668,6 +1705,225 @@ def huggingface_catalog(api_key: str = "") -> list[dict]:
     return out
 
 
+#: Id substrings that are never a chat model on NIM. Matched conservatively:
+#: only families whose ids cannot be a chat-completions model. A vision-
+#: language chat model (e.g. `...-vl`, `...-vision-instruct`) is still chat
+#: and is kept — filtered by modality would be better, but this listing
+#: publishes no modalities, only ids.
+_NVIDIA_NON_CHAT_MARKERS = (
+    "embed",
+    "rerank",
+    "retrieve",
+    "whisper",
+    "parakeet",
+    "canary",
+    "tts",
+    "diffusion",
+    "flux",
+    "stable-diffusion",
+    "text-to-image",
+    "diariz",
+    "framepainter",
+)
+
+#: Published context windows for NIM-hosted chat models, by exact id.
+#: Exact ids only — never prefix-matched, per the module docstring: a new
+#: revision (`-v2`, `-0711`) must show `? ctx` rather than inherit a number
+#: measured for a different checkpoint. Sources: the vendor model card or
+#: build.nvidia.com model page for that exact id. Anything absent here
+#: reports 0 and the picker renders it unknown instead of guessed.
+_NVIDIA_KNOWN_WINDOWS = {
+    "z-ai/glm-5.3": 1_000_000,
+    "z-ai/glm-5.3-flash": 1_048_576,
+    "meta/llama-3.1-8b-instruct": 131_072,
+    "meta/llama-3.1-70b-instruct": 131_072,
+    "meta/llama-3.1-405b-instruct": 131_072,
+    "meta/llama-3.3-70b-instruct": 131_072,
+    "meta/llama-4-maverick-17b-128e-instruct": 1_048_576,
+    "meta/llama-4-scout-17b-16e-instruct": 1_048_576,
+    "openai/gpt-oss-120b": 131_072,
+    "openai/gpt-oss-20b": 131_072,
+    "mistralai/mistral-large-2-instruct": 131_072,
+    "mistralai/mistral-small-24b-instruct-2501": 131_072,
+    "nvidia/llama-3.1-nemotron-70b-instruct": 131_072,
+    "nvidia/nemotron-nano-12b-v2-vl": 131_072,
+    "deepseek-ai/deepseek-r1": 163_840,
+    "deepseek-ai/deepseek-v3.1": 163_840,
+    "qwen/qwen3-235b-a22b": 262_144,
+    "qwen/qwen3-32b": 262_144,
+    "moonshotai/kimi-k2-instruct": 262_144,
+    "google/gemma-3-27b-it": 131_072,
+    "01-ai/yi-large": 32_768,
+    "ai21labs/jamba-1.5-large-instruct": 256_000,
+    "bigcode/starcoder2-15b": 16_384,
+    "databricks/dbrx-instruct": 32_768,
+    "google/codegemma-1.1-7b": 8_192,
+}
+
+#: NIM chat models that take images, by exact id. Same exactness rule as
+#: the window table: an unlisted model reports no vision rather than a guess,
+#: because sending an image to a text-only model is a hard 400.
+_NVIDIA_VISION_IDS = frozenset({
+    "z-ai/glm-5.3",
+    "z-ai/glm-5.3-flash",
+    "nvidia/vila",
+    "meta/llama-3.2-11b-vision-instruct",
+    "meta/llama-3.2-90b-vision-instruct",
+    "meta/llama-4-maverick-17b-128e-instruct",
+    "meta/llama-4-scout-17b-16e-instruct",
+    "mistralai/mistral-small-3.1-24b-instruct-2503",
+    "nvidia/nemotron-nano-12b-v2-vl",
+    "qwen/qwen2.5-vl-32b-instruct",
+    "google/gemma-3-27b-it",
+})
+
+
+#: Cache for the public OpenRouter model index (see below). One process-wide
+#: entry with a TTL: the menu redraws often and the upstream list changes
+#: rarely. A failed refresh keeps serving the stale index rather than
+#: blanking every enriched row back to `? ctx`.
+_OPENROUTER_INDEX_TTL = 3600.0
+_openrouter_index_cache: dict = {"at": 0.0, "index": {}}
+
+
+def _normalise_model_id(model_id: str) -> str:
+    """The checkpoint name, comparable across venues.
+
+    NIM and OpenRouter prefix the same checkpoint differently —
+    `meta/llama-3.3-70b-instruct` vs `meta-llama/llama-3.3-70b-instruct` — so
+    the org prefix is dropped and only the name after the last `/` is kept,
+    lowercased with every non-alphanumeric stripped (`llama-3.3` vs
+    `llama-3_3` still meet). Two different checkpoints still normalise
+    differently, so a match is a real match and not a coincidence.
+    """
+    name = model_id.rsplit("/", 1)[-1]
+    return "".join(c for c in name.lower() if c.isalnum())
+
+
+def _openrouter_window_index() -> dict:
+    """Public OpenRouter catalogue as `{normalised_id: entry}`, cached.
+
+    No key needed — the listing is public, so enrichment works before a key
+    is entered. Each entry carries `context_window`, `tool_call` and
+    `vision` read off `context_length`, `supported_parameters` and the
+    architecture's input modalities: published figures, never guesses.
+    """
+    now = time.time()
+    if (now - _openrouter_index_cache["at"] < _OPENROUTER_INDEX_TTL
+            and _openrouter_index_cache["index"]):
+        return _openrouter_index_cache["index"]
+    try:
+        raw = openrouter_catalog()
+    except Exception:
+        raw = []
+    index: dict = {}
+    collisions: set = set()
+    for entry in raw:
+        model_id = entry.get("id") or ""
+        if not model_id:
+            continue
+        norm = _normalise_model_id(model_id)
+        if norm in index:
+            # Two upstream ids normalise alike — ambiguous, so neither is
+            # trusted. Honest unknown beats a coin toss between windows.
+            collisions.add(norm)
+            index.pop(norm, None)
+            continue
+        if norm in collisions:
+            continue
+        index[norm] = entry
+    if index:
+        _openrouter_index_cache["at"] = now
+        _openrouter_index_cache["index"] = index
+    return _openrouter_index_cache["index"]
+
+
+def nvidia_catalog(api_key: str = "") -> list[dict]:
+    """Every chat model this NVIDIA key can call right now, with real windows.
+
+    `integrate.api.nvidia.com/v1/models` answers with bare `{id}` entries —
+    no window, no capability flags — so the picker showed `? ctx` and `tools
+    unknown` for all ~85 rows (the screenshot in the issue), and a chat model
+    sat next to embedding and reranking models that can never drive the agent.
+
+    The live listing is read first because it is also the availability answer:
+    a model that is not listed for this key is not offered, so picking from
+    this list cannot land on a model that goes silent in a new session. Each
+    listed id is then enriched automatically:
+
+    1. the curated table below (exact ids, published figures — wins), then
+    2. the public OpenRouter catalogue, matched on normalised spelling
+       (`meta/llama-…` vs `meta-llama/llama-…`), which publishes
+       `context_length`, `supported_parameters` and input modalities per
+       model — window, tool support and vision read off, not guessed.
+
+    Anything still unlisted stays `0`, which the picker renders as `? ctx`
+    rather than as an invented number.
+
+    Tool support stays `tool_call_known=False` unless OpenRouter identifies
+    the checkpoint: NIM's listing publishes no tool field, and assuming
+    support is how `groq/compound` got picked and died on `400 "tool
+    calling" is not supported`. Selecting a model probes it
+    (`refresh_for_model`) and persists the answer, so the unknown is settled
+    by measurement before the first turn.
+    """
+    key = api_key or os.environ.get("NVIDIA_API_KEY", "")
+    if not key:
+        return []
+    spec = registry.spec("nvidia")
+    headers = {"Content-Type": "application/json",
+               "Authorization": f"Bearer {key}"}
+    if spec:
+        headers.update(spec.extra_headers)
+    base = spec.base_url if spec else "https://integrate.api.nvidia.com/v1"
+    try:
+        data = _get_json(f"{base}/models", headers, timeout=_PROBE_TIMEOUT)
+    except Exception:
+        return []
+
+    out: list[dict] = []
+    items = data if isinstance(data, list) else data.get("data", [])
+    auto = _openrouter_window_index()
+    for entry in items or []:
+        if not isinstance(entry, dict):
+            continue
+        model_id = entry.get("id")
+        if not model_id:
+            continue
+        lowered = model_id.lower()
+        # Embedding, reranking, speech and image models expose no chat
+        # completions surface — offering one as an agent model is an entry
+        # that fails on use, the same defect `google_model_catalog` filters
+        # via `generateContent` and `groq_catalog` via output modalities.
+        if any(m in lowered for m in _NVIDIA_NON_CHAT_MARKERS):
+            continue
+        window = _NVIDIA_KNOWN_WINDOWS.get(model_id, 0)
+        vision = model_id in _NVIDIA_VISION_IDS
+        tool_call: bool | None = None
+        match = auto.get(_normalise_model_id(model_id))
+        if match is not None:
+            if not window:
+                window = int(match.get("context_window") or 0)
+            vision = vision or bool(match.get("vision", False))
+            if match.get("tool_call_known", True):
+                tool_call = bool(match.get("tool_call", False))
+        out.append({
+            "id": model_id,
+            "name": model_id,
+            "label": model_id,
+            "context_window": window,
+            "vision": vision,
+            # No tool field on the NIM listing itself — see docstring. When
+            # OpenRouter unambiguously identifies the same checkpoint its
+            # published tool flag is carried; otherwise unknown, settled by
+            # measurement on select (`refresh_for_model`).
+            "tool_call": tool_call if tool_call is not None else True,
+            "tool_call_known": tool_call is not None,
+        })
+    out.sort(key=lambda m: (-m["context_window"], m["id"]))
+    return out
+
+
 def zen_model_catalog(api_key: str = "") -> list[dict]:
     """`zen_catalog` in the shape every other fetcher returns."""
     try:
@@ -1721,6 +1977,7 @@ CATALOG_FETCHERS = {
     "google_catalog": google_model_catalog,
     "groq_catalog": groq_catalog,
     "huggingface_catalog": huggingface_catalog,
+    "nvidia_catalog": nvidia_catalog,
     "openrouter_catalog": openrouter_catalog,
     "ollama_catalog": _ollama_list_catalog,
 }
